@@ -1,0 +1,13 @@
+# Build output
+build
+
+# Editor and debugger debris. Not *.txt: the vector files are .txt-adjacent
+# and a blanket ignore would hide a fixture.
+*.gdb
+
+# Doxygen
+docs
+
+# Python
+**/__pycache__
+*.pyc

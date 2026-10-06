@@ -1,0 +1,7 @@
+Name: Ghoti.io TLS(BRANCH)
+Description: TLS 1.3 handshake core: key schedule, handshake messages, client role
+Version: (VERSION)
+URL: https://github.com/Ghoti-io/tls
+Libs: -L(PC_LIB_DIR) -l(SUITE)-(PROJECT)(BRANCH)
+CFlags: -I(PC_INCLUDE_DIR)
+Requires: (REQUIRES)
