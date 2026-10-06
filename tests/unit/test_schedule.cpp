@@ -14,7 +14,8 @@
 using gtlstest::Bytes;
 using gtlstest::Vec;
 
-namespace {
+/* Named, not anonymous: see test_negative.cpp. */
+namespace scheduletest {
 
 struct Trace {
   const char * file;
@@ -30,7 +31,9 @@ Bytes empty_hash() {
   return out;
 }
 
-}  // namespace
+}  // namespace scheduletest
+
+using namespace scheduletest;
 
 class ScheduleTrace : public ::testing::TestWithParam<Trace> {};
 

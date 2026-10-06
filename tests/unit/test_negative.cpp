@@ -19,7 +19,11 @@
 
 using namespace gtlstest;
 
-namespace {
+/* A named namespace: gtest instantiates a test class over Case, and a type in
+ * an anonymous namespace as a template argument of a class with external
+ * linkage is -Wsubobject-linkage on some compilers (mingw's GCC), which
+ * -Werror turns into an error. */
+namespace negtest {
 
 void expect_failed_and_wiped(World & w, GTLS_Result want, unsigned alert) {
   EXPECT_TRUE(gtls_conn_is_failed(w.conn));
@@ -93,7 +97,9 @@ struct Case {
   unsigned alert;
 };
 
-}  // namespace
+}  // namespace negtest
+
+using namespace negtest;
 
 /* ------------------------------------------------- the certificate checks */
 
