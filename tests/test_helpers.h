@@ -18,7 +18,7 @@
 
 /* The internal headers are C and have no extern "C" of their own. */
 extern "C" {
-#include "../src/schedule/schedule_internal.h"
+#include "../src/client/client_internal.h"
 #include "../src/core/core_internal.h"
 }
 
@@ -101,6 +101,47 @@ inline Bytes cat(const Bytes & a, const Bytes & b) {
   out.insert(out.end(), b.begin(), b.end());
   return out;
 }
+
+/** A random source that returns scripted chunks, then fails the test. */
+struct ScriptedRandom {
+  std::deque<Bytes> chunks;
+  int draws = 0;
+  static GTLS_Result fn(void * user, void * out, size_t n) {
+    ScriptedRandom * self = static_cast<ScriptedRandom *>(user);
+    self->draws++;
+    if (self->chunks.empty()) {
+      ADD_FAILURE() << "random drawn with nothing scripted";
+      return GTLS_ERR_IO;
+    }
+    Bytes chunk = self->chunks.front();
+    self->chunks.pop_front();
+    EXPECT_EQ(chunk.size(), n);
+    if (chunk.size() != n) {
+      return GTLS_ERR_IO;
+    }
+    std::memcpy(out, chunk.data(), n);
+    return GTLS_OK;
+  }
+};
+
+/** A chain verdict that is whatever the test says, counted. */
+struct FixedVerdict {
+  GTLS_Result result = GTLS_OK;
+  int calls = 0;
+  static GTLS_Result fn(void * user, const GTLS_Conn *, const GTLS_CertificateMsg *,
+      int64_t) {
+    FixedVerdict * self = static_cast<FixedVerdict *>(user);
+    self->calls++;
+    return self->result;
+  }
+};
+
+/** An empty trust store, for the tests that supply their own verdict. */
+struct EmptyTrust {
+  GCERT_TrustStore * store = nullptr;
+  EmptyTrust() { EXPECT_EQ(gcert_trust_new(nullptr, nullptr, &store), GCERT_OK); }
+  ~EmptyTrust() { gcert_trust_free(store); }
+};
 
 } /* namespace gtlstest */
 

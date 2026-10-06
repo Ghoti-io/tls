@@ -34,6 +34,8 @@
 #define GHOTI_IO_GTLS_TLS_H
 
 #include <ghoti.io/tls/allocator.h>
+#include <ghoti.io/tls/conn.h>
+#include <ghoti.io/tls/context.h>
 #include <ghoti.io/tls/core.h>
 #include <ghoti.io/tls/macros.h>
 #include <ghoti.io/tls/schedule.h>
