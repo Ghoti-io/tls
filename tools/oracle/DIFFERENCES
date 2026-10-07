@@ -1,0 +1,13 @@
+# Declared differences between this library and OpenSSL, one per line:
+#   <case name> <TAB> <what differs>
+# A difference that is not here fails `make check-interop`; one that is here
+# and no longer happens fails it too (a list that describes nothing is how a
+# rule gets dropped without anyone deciding to). A case declares itself in
+# tools/oracle/interop.py with `declared=`.
+#
+# None today. The first population found OpenSSL and this library agreeing on
+# every combination, including the refusals: both send no_application_protocol
+# when the two ALPN lists have nothing in common (RFC 7301 section 3.2), both
+# refuse an old version with protocol_version and a missing scheme with
+# handshake_failure. The mechanism stays, because the next stack or the next
+# OpenSSL may not agree.

@@ -385,7 +385,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 
 .PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-stamps check-aliasing
 .PHONY: check-secret check-foundation check-ct check-fuzz-ub check-harden check-depfiles
-.PHONY: check-analyzer analyze
+.PHONY: check-analyzer analyze check-interop interop-plants
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 .PHONY: fuzz fuzz-clean
@@ -559,6 +559,22 @@ analyze: ## GCC's -fanalyzer over src/, slower than check-analyzer
 		printf 'analyze: -fanalyzer is clean over every source\n'; \
 	fi; \
 	exit $$status
+
+####################################################################
+# Interop: OpenSSL in a container, both roles
+####################################################################
+# Not part of `make test`: it needs a container engine and the OpenSSL image
+# that libs/certificate builds (`make oracle-build` there). It fails, rather
+# than skipping, when it cannot reach the reference. PREFIX must be given: the
+# planted builds are made in scratch copies against it.
+
+check-interop: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Run the OpenSSL interop population, both roles
+	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION)
+
+interop-plants: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Plant a defect, one at a time, and require the interop cases to fail
+	@status=0; for p in record-nonce key-update-label server-cv-label client-finished; do \
+		LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION) --plant $$p || status=1; \
+	done; exit $$status
 
 ####################################################################
 # Constant-time gate
