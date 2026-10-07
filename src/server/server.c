@@ -1,0 +1,877 @@
+/*
+ * SPDX-License-Identifier: LGPL-3.0-only
+ *
+ * Copyright (C) 2026 Corey Pennycuff
+ *
+ * This file is part of Ghoti.io TLS.
+ *
+ * Ghoti.io TLS is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * Ghoti.io TLS is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * @file server.c
+ *
+ * The server's side of the TLS 1.3 handshake: the ClientHello is read and
+ * judged, an identity, a suite, a group, a signature scheme and an ALPN
+ * protocol are chosen, and the whole flight (ServerHello through Finished)
+ * is built, signed and queued. RFC 8446 sections 4 and 7 and appendix A.2.
+ *
+ * Every failure goes through gtls_conn_fail(), as the client's do, so none
+ * leaves a secret behind. The server sends no CertificateRequest and no
+ * NewSessionTicket, and refuses PSK, early data and anything that does not
+ * offer TLS 1.3 with the alert that says so.
+ */
+
+#include <ghoti.io/tls/macros.h>
+
+#include <ghoti.io/tls/conn.h>
+
+#include "../core/core_internal.h"
+#include "../client/client_internal.h"
+
+#include <ghoti.io/cutil/allocator.h>
+#include <ghoti.io/security/secret.h>
+
+#include <string.h>
+
+/* ----------------------------------------------------------------- creation */
+
+GTLS_Result gtls_conn_new_server(const GTLS_Context * context, GTLS_Conn ** out) {
+  if (context == NULL || out == NULL || context->role != GTLS_ROLE_SERVER) {
+    return GTLS_ERR_INVALID;
+  }
+  return gtls_conn_alloc(context, out);
+}
+
+GTLS_Result gtls_server_start(GTLS_Conn * c) {
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  if (c->state != GTLS_STATE_NEW) {
+    return GTLS_ERR_INVALID;
+  }
+  c->state = GTLS_STATE_S_WAIT_CH;
+  return GTLS_OK;
+}
+
+void gtls_conn_set_server_hooks(GTLS_Conn * c, GTLS_SignFn sign_fn,
+    void * sign_user, const unsigned char * const * chain,
+    const size_t * chain_len, size_t chain_count, unsigned scheme,
+    const unsigned char * ee_prefix, size_t ee_prefix_len) {
+  c->sign_fn = sign_fn;
+  c->sign_user = sign_user;
+  c->seam_chain = chain;
+  c->seam_chain_len = chain_len;
+  c->seam_chain_count = chain_count;
+  c->seam_scheme = scheme;
+  c->seam_ee_prefix = ee_prefix;
+  c->seam_ee_prefix_len = ee_prefix_len;
+}
+
+/* ------------------------------------------------------------ what was chosen */
+
+static unsigned char lower(unsigned char ch) {
+  return ch >= 'A' && ch <= 'Z' ? (unsigned char)(ch + ('a' - 'A')) : ch;
+}
+
+/** Equal, ignoring ASCII case. Names are public, so this may branch. */
+static int names_equal(const unsigned char * a, const unsigned char * b, size_t n) {
+  size_t i;
+
+  for (i = 0; i < n; i++) {
+    if (lower(a[i]) != lower(b[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/**
+ * Does the identity's name @p pat serve @p host. A leading "*." stands for
+ * exactly one label, as in a certificate (RFC 9525 section 6.3).
+ */
+static int name_serves(const unsigned char * pat, size_t plen,
+    const unsigned char * host, size_t hlen) {
+  size_t i;
+
+  if (plen > 2u && pat[0] == '*' && pat[1] == '.') {
+    for (i = 0; i < hlen && host[i] != '.'; i++) {
+    }
+    if (i == 0 || i >= hlen) {
+      return 0;
+    }
+    return plen - 1u == hlen - i && names_equal(pat + 1, host + i, plen - 1u);
+  }
+  return plen == hlen && names_equal(pat, host, plen);
+}
+
+static int has_u16(const uint16_t * list, size_t n, unsigned v) {
+  size_t i;
+
+  for (i = 0; i < n; i++) {
+    if (list[i] == v) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/** What a ClientHello offers, read once. Views into the message. */
+typedef struct Offer {
+  GTLS_ClientHello ch;
+  uint16_t groups[GTLS_CH_LIST_MAX];
+  size_t group_count;
+  uint16_t sigs[GTLS_CH_LIST_MAX];
+  size_t sig_count;
+  GTLS_ClientShare shares[GTLS_CH_SHARES_MAX];
+  size_t share_count;
+  GTLS_Name alpn[GTLS_CH_NAMES_MAX];
+  size_t alpn_count;
+  int has_alpn;
+  GTLS_Name host;
+} Offer;
+
+static GTLS_Result refuse_extension(GTLS_Conn * c) {
+  return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNSUPPORTED_EXTENSION);
+}
+
+static GTLS_Result missing(GTLS_Conn * c) {
+  return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
+}
+
+/**
+ * Read and judge a ClientHello: the version, the extensions that must be
+ * there, the ones this server refuses, and the shape of each one it reads.
+ * Nothing is chosen yet.
+ */
+static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len, Offer * o) {
+  const GTLS_Ext * e;
+  const GTLS_ClientHello * ch = &o->ch;
+  GTLS_Result result;
+  int tls13 = 0;
+  size_t i;
+
+  memset(o, 0, sizeof *o);
+  result = gtls_msg_parse_client_hello(msg + 4, msg_len - 4u, &c->limits, &o->ch);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  if (ch->compression_len != 1u || ch->compression[0] != 0) {
+    return gtls_conn_illegal(c);
+  }
+  /* A hello that does not offer TLS 1.3 is a 1.2 (or older) client. */
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_SUPPORTED_VERSIONS);
+  if (e == NULL) {
+    return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);
+  }
+  result = gtls_msg_parse_ch_versions(e, &tls13);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  if (!tls13) {
+    return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);
+  }
+  /* PSK, and early data which only a PSK can carry, are not offered by this
+   * server. The checks RFC 8446 section 4.2.11 makes of the offer come first,
+   * so a malformed one is called that and not merely unsupported. */
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_PRE_SHARED_KEY);
+  if (e != NULL) {
+    int dhe = 0;
+    const GTLS_Ext * modes = gtls_msg_find_ext(ch->exts, ch->ext_count,
+        GTLS_EXT_PSK_KEY_EXCHANGE_MODES);
+
+    if (ch->exts[ch->ext_count - 1u].type != GTLS_EXT_PRE_SHARED_KEY) {
+      return gtls_conn_illegal(c);
+    }
+    if (modes == NULL) {
+      return missing(c);
+    }
+    result = gtls_msg_parse_ch_psk_modes(modes, &dhe);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail_parse(c, result);
+    }
+    return refuse_extension(c);
+  }
+  if (gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_EARLY_DATA) != NULL) {
+    return refuse_extension(c);
+  }
+  /* The only cookie this server could be sent is one it issued, and it
+   * issues none. */
+  if (gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_COOKIE) != NULL) {
+    return gtls_conn_illegal(c);
+  }
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_SUPPORTED_GROUPS);
+  if (e == NULL) {
+    return missing(c);
+  }
+  result = gtls_msg_parse_ch_u16_list(e, o->groups, GTLS_CH_LIST_MAX,
+      &o->group_count);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_SIGNATURE_ALGORITHMS);
+  if (e == NULL) {
+    return missing(c);
+  }
+  result = gtls_msg_parse_ch_u16_list(e, o->sigs, GTLS_CH_LIST_MAX, &o->sig_count);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_KEY_SHARE);
+  if (e == NULL) {
+    return missing(c);
+  }
+  result = gtls_msg_parse_ch_key_shares(e, o->shares, &o->share_count);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  for (i = 0; i < o->share_count; i++) {
+    /* RFC 8446 section 4.2.8: a share for a group not listed is illegal. */
+    if (!has_u16(o->groups, o->group_count, o->shares[i].group)) {
+      return gtls_conn_illegal(c);
+    }
+  }
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_SERVER_NAME);
+  if (e != NULL) {
+    result = gtls_msg_parse_ch_server_name(e, &o->host);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail_parse(c, result);
+    }
+    for (i = 0; i < o->host.len; i++) {
+      if (o->host.p[i] == 0 || o->host.p[i] > 0x7fu) {
+        return gtls_conn_illegal(c);
+      }
+    }
+    if (o->host.len > 255u) {
+      return gtls_conn_illegal(c);
+    }
+  }
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_ALPN);
+  if (e != NULL) {
+    result = gtls_msg_parse_ch_alpn(e, o->alpn, &o->alpn_count);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail_parse(c, result);
+    }
+    o->has_alpn = 1;
+  }
+  return GTLS_OK;
+}
+
+/**
+ * The second ClientHello must be the first, changed only where RFC 8446
+ * section 4.1.2 allows: the key_share, the padding, and an early_data or a
+ * cookie neither of which this server accepts. Anything else is
+ * illegal_parameter.
+ */
+static GTLS_Result check_retry(GTLS_Conn * c, const Offer * o) {
+  GTLS_ClientHello first;
+  GTLS_Limits l = gtls_conn_own_limits(c);
+  size_t i;
+
+  if (gtls_msg_parse_client_hello(c->hello.data + 4, c->hello.len - 4u, &l,
+          &first) != GTLS_OK) {
+    return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  if (first.legacy_version != o->ch.legacy_version ||
+      gsec_equal(first.random, o->ch.random, 32) != GSEC_OK ||
+      first.session_id_len != o->ch.session_id_len ||
+      gsec_equal(first.session_id, o->ch.session_id, first.session_id_len) != GSEC_OK ||
+      first.suites_len != o->ch.suites_len ||
+      gsec_equal(first.suites, o->ch.suites, first.suites_len) != GSEC_OK ||
+      first.compression_len != o->ch.compression_len ||
+      gsec_equal(first.compression, o->ch.compression, first.compression_len) != GSEC_OK) {
+    return gtls_conn_illegal(c);
+  }
+  for (i = 0; i < first.ext_count; i++) {
+    const GTLS_Ext * a = &first.exts[i];
+    const GTLS_Ext * b;
+
+    if (a->type == GTLS_EXT_KEY_SHARE || a->type == GTLS_EXT_PADDING) {
+      continue;
+    }
+    b = gtls_msg_find_ext(o->ch.exts, o->ch.ext_count, a->type);
+    if (b == NULL || a->len != b->len || gsec_equal(a->data, b->data, a->len) != GSEC_OK) {
+      return gtls_conn_illegal(c);
+    }
+  }
+  for (i = 0; i < o->ch.ext_count; i++) {
+    const GTLS_Ext * b = &o->ch.exts[i];
+
+    if (b->type == GTLS_EXT_KEY_SHARE || b->type == GTLS_EXT_PADDING) {
+      continue;
+    }
+    if (gtls_msg_find_ext(first.exts, first.ext_count, b->type) == NULL) {
+      return gtls_conn_illegal(c);
+    }
+  }
+  return GTLS_OK;
+}
+
+static GTLS_Result copy_sni(GTLS_Conn * c, const GTLS_Name * host) {
+  unsigned char * copy = NULL;
+
+  if (host->len != 0) {
+    copy = gcu_allocator_malloc(c->allocator, host->len);
+    if (copy == NULL) {
+      return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
+    }
+    memcpy(copy, host->p, host->len);
+  }
+  gcu_allocator_free(c->allocator, c->client_sni);
+  c->client_sni = copy;
+  c->client_sni_len = host->len;
+  return GTLS_OK;
+}
+
+/**
+ * Choose what the connection will use from what the client offered:
+ * the identity (by SNI, else the default), the suite, the group, the
+ * signature scheme and the ALPN protocol. @p group and @p share come out; a
+ * NULL @p share means no share fits and a HelloRetryRequest is needed.
+ */
+static GTLS_Result choose(GTLS_Conn * c, const Offer * o, int second,
+    GTLS_Group * group, const GTLS_ClientShare ** share) {
+  const GTLS_Context * x = c->context;
+  const GTLS_ServerIdentity * id;
+  size_t i;
+  size_t j;
+  size_t k;
+
+  /* The identity. */
+  c->identity_index = x->default_identity;
+  c->sni_matched = 0;
+  if (o->host.len != 0) {
+    for (i = 0; i < x->identity_count && !c->sni_matched; i++) {
+      size_t off = 0;
+
+      for (j = 0; j < x->identities[i].name_count; j++) {
+        if (name_serves(x->identities[i].names + off, x->identities[i].name_len[j],
+                o->host.p, o->host.len)) {
+          c->identity_index = i;
+          c->sni_matched = 1;
+          break;
+        }
+        off += x->identities[i].name_len[j];
+      }
+    }
+  }
+  id = &x->identities[c->identity_index];
+
+  /* The suite: the server's preference among the client's. */
+  c->suite = GTLS_SUITE_NONE;
+  for (i = 0; i < x->suite_count && c->suite == GTLS_SUITE_NONE; i++) {
+    for (j = 0; j + 1u < o->ch.suites_len; j += 2u) {
+      if ((((unsigned)o->ch.suites[j] << 8) | o->ch.suites[j + 1u]) ==
+          (unsigned)x->suites[i]) {
+        c->suite = x->suites[i];
+        break;
+      }
+    }
+  }
+  if (c->suite == GTLS_SUITE_NONE) {
+    return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);
+  }
+
+  /* The group. A share the client already sent saves a round trip, so a
+   * group with a share is chosen over a more preferred one without. */
+  *group = GTLS_GROUP_NONE;
+  *share = NULL;
+  if (second) {
+    if (o->share_count == 0) {
+      /* The retry would need another retry, which RFC 8446 does not allow. */
+      return gtls_conn_unexpected(c);
+    }
+    if (o->share_count != 1u || o->shares[0].group != (unsigned)c->hrr_group) {
+      return gtls_conn_illegal(c);
+    }
+    *group = c->hrr_group;
+    *share = &o->shares[0];
+  } else {
+    for (i = 0; i < x->group_count && *share == NULL; i++) {
+      if (!has_u16(o->groups, o->group_count, (unsigned)x->groups[i])) {
+        continue;
+      }
+      for (k = 0; k < o->share_count; k++) {
+        if (o->shares[k].group == (unsigned)x->groups[i]) {
+          *group = x->groups[i];
+          *share = &o->shares[k];
+          break;
+        }
+      }
+    }
+    for (i = 0; i < x->group_count && *group == GTLS_GROUP_NONE; i++) {
+      if (has_u16(o->groups, o->group_count, (unsigned)x->groups[i])) {
+        *group = x->groups[i];
+      }
+    }
+    if (*group == GTLS_GROUP_NONE) {
+      return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);
+    }
+  }
+
+  /* The signature scheme: the first of the server's own that TLS 1.3 allows
+   * in CertificateVerify, that the client listed, and that the key signs. */
+  c->scheme = 0;
+  if (c->seam_scheme != 0) {
+    c->scheme = c->seam_scheme;
+  } else {
+    for (i = 0; i < x->sig_alg_count; i++) {
+      unsigned s = (unsigned)x->sig_algs[i];
+
+      if (gtls_cv_scheme_ok(s) && has_u16(o->sigs, o->sig_count, s) &&
+          gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)) {
+        c->scheme = s;
+        break;
+      }
+    }
+  }
+  if (c->scheme == 0) {
+    return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);
+  }
+
+  /* ALPN: the first of the server's list that the client offered. Both
+   * lists present and no overlap is fatal (RFC 7301 section 3.2); a client
+   * that offered none, or a server with none, gets none. */
+  c->alpn_selected_len = 0;
+  if (x->alpn_len != 0 && o->has_alpn) {
+    size_t off = 0;
+
+    while (off < x->alpn_len && c->alpn_selected_len == 0) {
+      size_t n = x->alpn[off];
+
+      for (k = 0; k < o->alpn_count; k++) {
+        if (o->alpn[k].len == n && gsec_equal(o->alpn[k].p, x->alpn + off + 1u, n) == GSEC_OK) {
+          memcpy(c->alpn_selected, x->alpn + off + 1u, n);
+          c->alpn_selected_len = n;
+          break;
+        }
+      }
+      off += 1u + n;
+    }
+    if (c->alpn_selected_len == 0) {
+      return gtls_conn_fail(c, GTLS_ERR_ALPN, GTLS_ALERT_NO_APPLICATION_PROTOCOL);
+    }
+  }
+  return GTLS_OK;
+}
+
+/* ---------------------------------------------------------------- the flight */
+
+/** Queue a built message at @p epoch and absorb it into the transcript. */
+static GTLS_Result emit(GTLS_Conn * c, GTLS_Epoch epoch, GTLS_Buf * m) {
+  GTLS_Result result = m->err;
+
+  if (result == GTLS_OK) {
+    result = gtls_transcript_update(&c->sec.transcript, m->data, m->len);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_conn_queue(c, epoch, m->data, m->len);
+    if (result != GTLS_OK) {
+      return result; /* queue() has failed the connection */
+    }
+  }
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  return GTLS_OK;
+}
+
+static GTLS_Result sign_cv(GTLS_Conn * c, const unsigned char * content,
+    size_t n, unsigned char * sig, size_t * sig_len) {
+  GTLS_Result result;
+
+  if (c->sign_fn != NULL) {
+    return c->sign_fn(c->sign_user, c, c->scheme, content, n, sig, GCERT_SIG_MAX,
+        sig_len);
+  }
+  switch (gcert_key_sign(c->context->identities[c->identity_index].key,
+      (GCERT_SigScheme)c->scheme, content, n, sig, GCERT_SIG_MAX, sig_len)) {
+    case GCERT_OK:
+      result = GTLS_OK;
+      break;
+    case GCERT_ERR_IO:
+      result = GTLS_ERR_IO;
+      break;
+    case GCERT_ERR_OOM:
+      result = GTLS_ERR_OOM;
+      break;
+    default:
+      result = GTLS_ERR_INTERNAL;
+      break;
+  }
+  return result;
+}
+
+/**
+ * ServerHello, then the encrypted flight: EncryptedExtensions, Certificate,
+ * CertificateVerify, Finished. Leaves the connection waiting for the
+ * client's Finished, with the application secrets derived.
+ */
+static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
+    const GTLS_ClientShare * share) {
+  const GTLS_Context * x = c->context;
+  const GTLS_ServerIdentity * id = &x->identities[c->identity_index];
+  GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
+  size_t hlen = gtls_hash_len(hash);
+  GTLS_ServerHelloParams sp;
+  GTLS_KeyShare mine;
+  GTLS_EeParams ee;
+  GTLS_Buf m;
+  unsigned char ecdhe[GTLS_KX_MAX];
+  size_t ecdhe_len = 0;
+  unsigned char th[GTLS_HASH_MAX];
+  unsigned char verify[GTLS_HASH_MAX];
+  unsigned char content[GTLS_CV_CONTENT_MAX];
+  unsigned char sig[GCERT_SIG_MAX];
+  size_t sig_len = 0;
+  size_t n;
+  const unsigned char * ptr[GTLS_CERT_MAX];
+  size_t lens[GTLS_CERT_MAX];
+  const unsigned char * const * chain_ptr;
+  const size_t * chain_len;
+  size_t chain_count;
+  size_t off = 0;
+  size_t i;
+  GTLS_Result result;
+
+  memset(&sp, 0, sizeof sp);
+  memset(&mine, 0, sizeof mine);
+  memset(ptr, 0, sizeof ptr);
+  memset(lens, 0, sizeof lens);
+  c->group = group;
+  result = gtls_conn_draw(c, sp.random, 32);
+  if (result == GTLS_OK) {
+    result = gtls_conn_gen_share(c, group, &mine);
+  }
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  result = gtls_conn_shared_secret(c, group, share->kx, share->kx_len, ecdhe,
+      &ecdhe_len);
+  if (result != GTLS_OK) {
+    (void)gsec_wipe(ecdhe, sizeof ecdhe);
+    return gtls_conn_illegal(c); /* a point that is not on the curve, or too small */
+  }
+  sp.session_id = o->ch.session_id;
+  sp.session_id_len = o->ch.session_id_len;
+  sp.suite = (unsigned)c->suite;
+  sp.group = (unsigned)group;
+  sp.key_exchange = mine.pub;
+  sp.key_exchange_len = mine.pub_len;
+  gtls_buf_init(&m, c->allocator, 4096u);
+  result = gtls_msg_build_server_hello(&sp, &m);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_INITIAL, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    (void)gsec_wipe(ecdhe, sizeof ecdhe);
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result == GTLS_OK) {
+    result = gtls_schedule_early(&c->sec.schedule, hash);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_schedule_handshake(&c->sec.schedule, ecdhe, ecdhe_len, th);
+  }
+  (void)gsec_wipe(ecdhe, sizeof ecdhe);
+  gtls_conn_wipe_kx(c);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+
+  /* EncryptedExtensions. */
+  memset(&ee, 0, sizeof ee);
+  ee.prefix = c->seam_ee_prefix;
+  ee.prefix_len = c->seam_ee_prefix_len;
+  c->sni_acknowledged = c->client_sni_len != 0 && (c->sni_matched || c->seam_chain != NULL);
+  ee.ack_server_name = c->sni_acknowledged;
+  ee.alpn = c->alpn_selected_len != 0 ? c->alpn_selected : NULL;
+  ee.alpn_len = c->alpn_selected_len;
+  gtls_buf_init(&m, c->allocator, c->limits.max_output_bytes);
+  result = gtls_msg_build_encrypted_extensions(&ee, &m);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+
+  /* Certificate. */
+  if (c->seam_chain != NULL) {
+    chain_ptr = c->seam_chain;
+    chain_len = c->seam_chain_len;
+    chain_count = c->seam_chain_count;
+  } else {
+    for (i = 0; i < id->chain_count; i++) {
+      ptr[i] = id->chain + off;
+      lens[i] = id->chain_len[i];
+      off += id->chain_len[i];
+    }
+    chain_ptr = ptr;
+    chain_len = lens;
+    chain_count = id->chain_count;
+  }
+  gtls_buf_init(&m, c->allocator, c->limits.max_output_bytes);
+  result = gtls_msg_build_certificate(chain_ptr, chain_len, chain_count, &m);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+
+  /* CertificateVerify, over the transcript through Certificate. */
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  n = gtls_cv_content(1, th, hlen, content);
+  result = sign_cv(c, content, n, sig, &sig_len);
+  (void)gsec_wipe(content, sizeof content);
+  if (result != GTLS_OK) {
+    (void)gsec_wipe(sig, sizeof sig);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  gtls_buf_init(&m, c->allocator, 4096u);
+  result = gtls_msg_build_certificate_verify(c->scheme, sig, sig_len, &m);
+  (void)gsec_wipe(sig, sizeof sig);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+
+  /* Finished, over the transcript through CertificateVerify. */
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result == GTLS_OK) {
+    result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, th, verify);
+  }
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  gtls_buf_init(&m, c->allocator, 4096u);
+  result = gtls_msg_build_finished(verify, hlen, &m);
+  (void)gsec_wipe(verify, sizeof verify);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+
+  /* The application secrets come from the transcript through this Finished. */
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result == GTLS_OK) {
+    result = gtls_schedule_master(&c->sec.schedule, th);
+  }
+  (void)gsec_wipe(th, sizeof th);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->state = GTLS_STATE_S_WAIT_FIN;
+  return GTLS_OK;
+}
+
+static GTLS_Result send_retry(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len, const Offer * o, GTLS_Group group) {
+  GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
+  GTLS_ServerHelloParams sp;
+  GTLS_Buf m;
+  GTLS_Result result;
+
+  memset(&sp, 0, sizeof sp);
+  sp.is_hrr = 1;
+  sp.session_id = o->ch.session_id;
+  sp.session_id_len = o->ch.session_id_len;
+  sp.suite = (unsigned)c->suite;
+  sp.group = (unsigned)group;
+  result = gtls_buf_append(&c->hello, msg, msg_len);
+  if (result == GTLS_OK) {
+    result = gtls_transcript_init(&c->sec.transcript);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_transcript_select(&c->sec.transcript, hash);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_transcript_restart(&c->sec.transcript, hash);
+  }
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  gtls_buf_init(&m, c->allocator, 4096u);
+  result = gtls_msg_build_server_hello(&sp, &m);
+  if (result == GTLS_OK) {
+    result = emit(c, GTLS_EPOCH_INITIAL, &m);
+  }
+  gtls_buf_free(&m);
+  if (result != GTLS_OK) {
+    return c->state == GTLS_STATE_FAILED ? result
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->retried = 1;
+  c->hrr_group = group;
+  c->state = GTLS_STATE_S_WAIT_CH2;
+  return GTLS_OK;
+}
+
+static GTLS_Result on_client_hello(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len) {
+  const int second = c->state == GTLS_STATE_S_WAIT_CH2;
+  Offer o;
+  GTLS_Group group = GTLS_GROUP_NONE;
+  const GTLS_ClientShare * share = NULL;
+  GTLS_Result result;
+
+  result = read_offer(c, msg, msg_len, &o);
+  if (result != GTLS_OK) {
+    return result;
+  }
+  if (second) {
+    result = check_retry(c, &o);
+    if (result != GTLS_OK) {
+      return result;
+    }
+  }
+  result = copy_sni(c, &o.host);
+  if (result != GTLS_OK) {
+    return result;
+  }
+  memcpy(c->session_id, o.ch.session_id, o.ch.session_id_len);
+  c->session_id_len = o.ch.session_id_len;
+  result = choose(c, &o, second, &group, &share);
+  if (result != GTLS_OK) {
+    return result;
+  }
+  if (share == NULL) {
+    return send_retry(c, msg, msg_len, &o, group);
+  }
+  if (second) {
+    result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
+  } else {
+    result = gtls_transcript_init(&c->sec.transcript);
+    if (result == GTLS_OK) {
+      result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
+    }
+    if (result == GTLS_OK) {
+      result = gtls_transcript_select(&c->sec.transcript,
+          gtls_suite_hash((uint32_t)c->suite));
+    }
+  }
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  return send_flight(c, &o, group, share);
+}
+
+static GTLS_Result on_client_finished(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len) {
+  GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
+  size_t hlen = gtls_hash_len(hash);
+  const unsigned char * got = NULL;
+  unsigned char th[GTLS_HASH_MAX];
+  GTLS_Result result;
+
+  result = gtls_msg_parse_finished(msg + 4, msg_len - 4u, hlen, &got);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result == GTLS_OK) {
+    result = gtls_finished_check(hash, c->sec.schedule.c_hs, th, got, hlen);
+  }
+  (void)gsec_wipe(th, sizeof th);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, result == GTLS_ERR_FINISHED
+        ? GTLS_ALERT_DECRYPT_ERROR : GTLS_ALERT_INTERNAL_ERROR);
+  }
+  result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->state = GTLS_STATE_CONNECTED;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_server_on_message(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len, int64_t now) {
+  unsigned type = msg[0];
+
+  (void)now;
+  switch (c->state) {
+    case GTLS_STATE_S_WAIT_CH:
+    case GTLS_STATE_S_WAIT_CH2:
+      if (type != GTLS_HS_CLIENT_HELLO) {
+        return gtls_conn_unexpected(c);
+      }
+      return on_client_hello(c, msg, msg_len);
+    case GTLS_STATE_S_WAIT_FIN:
+      if (type != GTLS_HS_FINISHED) {
+        return gtls_conn_unexpected(c);
+      }
+      return on_client_finished(c, msg, msg_len);
+    default:
+      break;
+  }
+  return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+}
+
+/* ---------------------------------------------------------------- accessors */
+
+GTLS_Result gtls_conn_server_name(const GTLS_Conn * c, const unsigned char ** name,
+    size_t * len) {
+  if (c == NULL || name == NULL || len == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  if (c->role != GTLS_ROLE_SERVER) {
+    return GTLS_ERR_INVALID;
+  }
+  *name = c->client_sni;
+  *len = c->client_sni_len;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_conn_identity(const GTLS_Conn * c, size_t * index) {
+  if (c == NULL || index == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  if (c->role != GTLS_ROLE_SERVER) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state != GTLS_STATE_S_WAIT_FIN && c->state != GTLS_STATE_CONNECTED) {
+    return GTLS_ERR_INVALID; /* not chosen yet */
+  }
+  *index = c->identity_index;
+  return GTLS_OK;
+}

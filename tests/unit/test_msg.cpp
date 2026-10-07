@@ -888,6 +888,442 @@ TEST(Reader, VectorBoundsAndNoReadPastTheEnd) {
   EXPECT_EQ(gtls_reader_left(&r), 2u) << "a failed read consumes nothing";
 }
 
+/* ------------------------------------------- ClientHello, as a server reads it */
+
+namespace {
+
+GTLS_Ext mk(unsigned type, const Bytes & data) {
+  GTLS_Ext e;
+  e.type = static_cast<uint16_t>(type);
+  e.data = data.data();
+  e.len = data.size();
+  return e;
+}
+
+Bytes list16(const std::vector<unsigned> & v) {
+  Bytes inner;
+  for (unsigned x : v) put16(inner, x);
+  Bytes out;
+  put16(out, inner.size());
+  put(out, inner);
+  return out;
+}
+
+}  // namespace
+
+TEST(ClientHelloParsers, SupportedVersions) {
+  Bytes ok = {6, 3, 4, 3, 3, 3, 2};
+  int has = -1;
+  GTLS_Ext e = mk(GTLS_EXT_SUPPORTED_VERSIONS, ok);
+  ASSERT_EQ(gtls_msg_parse_ch_versions(&e, &has), GTLS_OK);
+  EXPECT_EQ(has, 1);
+  Bytes no = {4, 3, 3, 3, 2};
+  e = mk(GTLS_EXT_SUPPORTED_VERSIONS, no);
+  ASSERT_EQ(gtls_msg_parse_ch_versions(&e, &has), GTLS_OK);
+  EXPECT_EQ(has, 0);
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{1, 3}, Bytes{3, 3, 4, 3}, Bytes{4, 3, 4},
+           Bytes{2, 3, 4, 0}, Bytes{255, 3}}) {
+    e = mk(GTLS_EXT_SUPPORTED_VERSIONS, bad);
+    has = 5;
+    EXPECT_EQ(gtls_msg_parse_ch_versions(&e, &has), GTLS_ERR_CORRUPT) << to_hex(bad);
+    EXPECT_EQ(has, 5) << "written only on success";
+  }
+}
+
+TEST(ClientHelloParsers, U16Lists) {
+  uint16_t out[GTLS_CH_LIST_MAX];
+  size_t n = 0;
+  Bytes ok = list16({0x001d, 0x0017, 0x0018});
+  GTLS_Ext e = mk(GTLS_EXT_SUPPORTED_GROUPS, ok);
+  ASSERT_EQ(gtls_msg_parse_ch_u16_list(&e, out, GTLS_CH_LIST_MAX, &n), GTLS_OK);
+  ASSERT_EQ(n, 3u);
+  EXPECT_EQ(out[0], 0x001d);
+  EXPECT_EQ(out[2], 0x0018);
+  /* a smaller destination keeps what fits and says how many that is */
+  ASSERT_EQ(gtls_msg_parse_ch_u16_list(&e, out, 2, &n), GTLS_OK);
+  EXPECT_EQ(n, 2u);
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{0, 0}, Bytes{0, 1, 0}, Bytes{0, 3, 0, 1, 0},
+           Bytes{0, 4, 0, 1, 0}, Bytes{0, 2, 0, 1, 9}}) {
+    e = mk(GTLS_EXT_SUPPORTED_GROUPS, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_u16_list(&e, out, GTLS_CH_LIST_MAX, &n), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+  std::vector<unsigned> many(GTLS_CH_LIST_MAX + 1, 7);
+  Bytes big = list16(many);
+  e = mk(GTLS_EXT_SUPPORTED_GROUPS, big);
+  EXPECT_EQ(gtls_msg_parse_ch_u16_list(&e, out, GTLS_CH_LIST_MAX, &n), GTLS_ERR_LIMIT);
+  many.pop_back();
+  big = list16(many);
+  e = mk(GTLS_EXT_SUPPORTED_GROUPS, big);
+  EXPECT_EQ(gtls_msg_parse_ch_u16_list(&e, out, GTLS_CH_LIST_MAX, &n), GTLS_OK);
+  EXPECT_EQ(n, static_cast<size_t>(GTLS_CH_LIST_MAX));
+}
+
+TEST(ClientHelloParsers, KeyShares) {
+  GTLS_ClientShare out[GTLS_CH_SHARES_MAX];
+  size_t n = 0;
+  Bytes body;
+  put16(body, 0x001d);
+  put16(body, 3);
+  put(body, Bytes{1, 2, 3});
+  put16(body, 0x0017);
+  put16(body, 1);
+  put(body, Bytes{9});
+  Bytes ext_data;
+  put16(ext_data, body.size());
+  put(ext_data, body);
+  GTLS_Ext e = mk(GTLS_EXT_KEY_SHARE, ext_data);
+  ASSERT_EQ(gtls_msg_parse_ch_key_shares(&e, out, &n), GTLS_OK);
+  ASSERT_EQ(n, 2u);
+  EXPECT_EQ(out[0].group, 0x001du);
+  EXPECT_EQ(out[0].kx_len, 3u);
+  EXPECT_EQ(out[0].kx, ext_data.data() + 6);
+  EXPECT_EQ(out[1].group, 0x0017u);
+  /* an empty list is a request for a retry, and is fine */
+  Bytes empty = {0, 0};
+  e = mk(GTLS_EXT_KEY_SHARE, empty);
+  ASSERT_EQ(gtls_msg_parse_ch_key_shares(&e, out, &n), GTLS_OK);
+  EXPECT_EQ(n, 0u);
+  /* two for one group */
+  Bytes dup;
+  for (int i = 0; i < 2; i++) {
+    put16(dup, 0x001d);
+    put16(dup, 1);
+    dup.push_back(5);
+  }
+  Bytes dup_ext;
+  put16(dup_ext, dup.size());
+  put(dup_ext, dup);
+  e = mk(GTLS_EXT_KEY_SHARE, dup_ext);
+  EXPECT_EQ(gtls_msg_parse_ch_key_shares(&e, out, &n), GTLS_ERR_PROTOCOL);
+  /* truncated, an empty share, trailing bytes */
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{0, 5, 0, 29, 0, 2, 0}, Bytes{0, 4, 0, 29, 0, 0},
+           Bytes{0, 2, 0, 29}, Bytes{0, 0, 7}}) {
+    e = mk(GTLS_EXT_KEY_SHARE, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_key_shares(&e, out, &n), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+  Bytes many;
+  for (unsigned i = 0; i <= GTLS_CH_SHARES_MAX; i++) {
+    put16(many, 0x2a00 + i);
+    put16(many, 1);
+    many.push_back(1);
+  }
+  Bytes many_ext;
+  put16(many_ext, many.size());
+  put(many_ext, many);
+  e = mk(GTLS_EXT_KEY_SHARE, many_ext);
+  EXPECT_EQ(gtls_msg_parse_ch_key_shares(&e, out, &n), GTLS_ERR_LIMIT);
+}
+
+TEST(ClientHelloParsers, Alpn) {
+  GTLS_Name out[GTLS_CH_NAMES_MAX];
+  size_t n = 0;
+  Bytes names = {2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+  Bytes ext_data;
+  put16(ext_data, names.size());
+  put(ext_data, names);
+  GTLS_Ext e = mk(GTLS_EXT_ALPN, ext_data);
+  ASSERT_EQ(gtls_msg_parse_ch_alpn(&e, out, &n), GTLS_OK);
+  ASSERT_EQ(n, 2u);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(out[0].p), out[0].len), "h2");
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(out[1].p), out[1].len), "http/1.1");
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{0, 0}, Bytes{0, 1, 0}, Bytes{0, 2, 0, 5},
+           Bytes{0, 3, 2, 'h', '2', 7}, Bytes{0, 2, 1, 'h', 'x'}}) {
+    e = mk(GTLS_EXT_ALPN, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_alpn(&e, out, &n), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+  Bytes lots;
+  for (unsigned i = 0; i <= GTLS_CH_NAMES_MAX; i++) {
+    lots.push_back(1);
+    lots.push_back('a');
+  }
+  Bytes lots_ext;
+  put16(lots_ext, lots.size());
+  put(lots_ext, lots);
+  e = mk(GTLS_EXT_ALPN, lots_ext);
+  EXPECT_EQ(gtls_msg_parse_ch_alpn(&e, out, &n), GTLS_ERR_LIMIT);
+}
+
+TEST(ClientHelloParsers, ServerName) {
+  GTLS_Name host;
+  Bytes entry = {0, 0, 3, 'a', '.', 'b'};
+  Bytes ext_data;
+  put16(ext_data, entry.size());
+  put(ext_data, entry);
+  GTLS_Ext e = mk(GTLS_EXT_SERVER_NAME, ext_data);
+  ASSERT_EQ(gtls_msg_parse_ch_server_name(&e, &host), GTLS_OK);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(host.p), host.len), "a.b");
+  /* a list of another type only has no host name */
+  Bytes other = {0, 4, 7, 0, 1, 'x'};
+  e = mk(GTLS_EXT_SERVER_NAME, other);
+  ASSERT_EQ(gtls_msg_parse_ch_server_name(&e, &host), GTLS_OK);
+  EXPECT_EQ(host.len, 0u);
+  /* two host names */
+  Bytes two = {0, 12, 0, 0, 1, 'a', 0, 0, 1, 'b'};
+  two[1] = 8;
+  e = mk(GTLS_EXT_SERVER_NAME, two);
+  EXPECT_EQ(gtls_msg_parse_ch_server_name(&e, &host), GTLS_ERR_PROTOCOL);
+  /* an other type before the host name is skipped */
+  Bytes mixed = {0, 8, 5, 0, 1, 'z', 0, 0, 1, 'q'};
+  e = mk(GTLS_EXT_SERVER_NAME, mixed);
+  ASSERT_EQ(gtls_msg_parse_ch_server_name(&e, &host), GTLS_OK);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(host.p), host.len), "q");
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{0, 0}, Bytes{0, 3, 0, 0, 0}, Bytes{0, 4, 0, 0, 1},
+           Bytes{0, 4, 0, 0, 1, 'a', 9}, Bytes{0, 3, 0, 0, 0, 0}}) {
+    e = mk(GTLS_EXT_SERVER_NAME, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_server_name(&e, &host), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+}
+
+TEST(ClientHelloParsers, CookieAndPskModes) {
+  GTLS_Name c;
+  Bytes ok = {0, 3, 7, 8, 9};
+  GTLS_Ext e = mk(GTLS_EXT_COOKIE, ok);
+  ASSERT_EQ(gtls_msg_parse_ch_cookie(&e, &c), GTLS_OK);
+  EXPECT_EQ(c.len, 3u);
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{0, 0}, Bytes{0, 3, 1, 2}, Bytes{0, 1, 1, 1}}) {
+    e = mk(GTLS_EXT_COOKIE, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_cookie(&e, &c), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+  int dhe = -1;
+  Bytes modes = {2, 0, 1};
+  e = mk(GTLS_EXT_PSK_KEY_EXCHANGE_MODES, modes);
+  ASSERT_EQ(gtls_msg_parse_ch_psk_modes(&e, &dhe), GTLS_OK);
+  EXPECT_EQ(dhe, 1);
+  Bytes ke_only = {1, 0};
+  e = mk(GTLS_EXT_PSK_KEY_EXCHANGE_MODES, ke_only);
+  ASSERT_EQ(gtls_msg_parse_ch_psk_modes(&e, &dhe), GTLS_OK);
+  EXPECT_EQ(dhe, 0);
+  for (const Bytes & bad : {Bytes{}, Bytes{0}, Bytes{2, 1}, Bytes{1, 1, 1}}) {
+    e = mk(GTLS_EXT_PSK_KEY_EXCHANGE_MODES, bad);
+    EXPECT_EQ(gtls_msg_parse_ch_psk_modes(&e, &dhe), GTLS_ERR_CORRUPT) << to_hex(bad);
+  }
+}
+
+TEST(ClientHelloParsers, TheCompressionMethodsAreAView) {
+  GTLS_Limits l = limits();
+  GTLS_HelloParams hp = params();
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 1 << 16);
+  ASSERT_EQ(gtls_msg_build_client_hello(&hp, &b), GTLS_OK);
+  GTLS_ClientHello h;
+  ASSERT_EQ(gtls_msg_parse_client_hello(b.data + 4, b.len - 4, &l, &h), GTLS_OK);
+  ASSERT_EQ(h.compression_len, 1u);
+  EXPECT_EQ(h.compression[0], 0);
+  gtls_buf_free(&b);
+}
+
+/* ----------------------------------------------------- what a server builds */
+
+TEST(ServerBuilders, ServerHelloParsesBackToWhatWentIn) {
+  GTLS_ServerHelloParams p;
+  std::memset(&p, 0, sizeof p);
+  for (int i = 0; i < 32; i++) p.random[i] = static_cast<unsigned char>(0x40 + i);
+  Bytes sid(32, 9), kx(32, 7);
+  p.session_id = sid.data();
+  p.session_id_len = sid.size();
+  p.suite = 0x1302;
+  p.group = 0x001d;
+  p.key_exchange = kx.data();
+  p.key_exchange_len = kx.size();
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_OK);
+  EXPECT_EQ(b.data[0], GTLS_HS_SERVER_HELLO);
+  EXPECT_EQ(static_cast<size_t>((b.data[1] << 16) | (b.data[2] << 8) | b.data[3]), b.len - 4);
+  GTLS_Limits l = limits();
+  GTLS_ServerHello sh;
+  ASSERT_EQ(gtls_msg_parse_server_hello(b.data + 4, b.len - 4, &l, &sh), GTLS_OK);
+  EXPECT_FALSE(sh.is_hrr);
+  EXPECT_EQ(sh.legacy_version, 0x0303u);
+  EXPECT_EQ(Bytes(sh.random, sh.random + 32), Bytes(p.random, p.random + 32));
+  EXPECT_EQ(Bytes(sh.session_id, sh.session_id + sh.session_id_len), sid);
+  EXPECT_EQ(sh.suite, 0x1302u);
+  EXPECT_EQ(sh.compression, 0u);
+  EXPECT_EQ(sh.selected_version, 0x0304u);
+  EXPECT_EQ(sh.group, 0x001du);
+  EXPECT_EQ(Bytes(sh.key_exchange, sh.key_exchange + sh.key_exchange_len), kx);
+  EXPECT_EQ(sh.flags, GTLS_SH_FLAG_VERSION | GTLS_SH_FLAG_KEY_SHARE);
+  gtls_buf_free(&b);
+}
+
+TEST(ServerBuilders, ARetryRequestHasTheFixedRandomAndAGroupAndAnOptionalCookie) {
+  GTLS_ServerHelloParams p;
+  std::memset(&p, 0, sizeof p);
+  Bytes sid(32, 9), cookie(40, 3);
+  p.is_hrr = 1;
+  p.session_id = sid.data();
+  p.session_id_len = 32;
+  p.suite = 0x1301;
+  p.group = 0x0017;
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_OK);
+  GTLS_Limits l = limits();
+  GTLS_ServerHello sh;
+  ASSERT_EQ(gtls_msg_parse_server_hello(b.data + 4, b.len - 4, &l, &sh), GTLS_OK);
+  EXPECT_TRUE(sh.is_hrr);
+  EXPECT_TRUE(gtls_msg_is_hrr_random(sh.random));
+  EXPECT_EQ(sh.group, 0x0017u);
+  EXPECT_EQ(sh.flags, GTLS_SH_FLAG_VERSION | GTLS_SH_FLAG_KEY_SHARE);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  p.cookie = cookie.data();
+  p.cookie_len = cookie.size();
+  ASSERT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_OK);
+  ASSERT_EQ(gtls_msg_parse_server_hello(b.data + 4, b.len - 4, &l, &sh), GTLS_OK);
+  EXPECT_EQ(Bytes(sh.cookie, sh.cookie + sh.cookie_len), cookie);
+  gtls_buf_free(&b);
+  /* what is not allowed */
+  gtls_buf_init(&b, nullptr, 4096);
+  p.session_id_len = 33;
+  EXPECT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_ERR_INVALID);
+  p.session_id_len = 32;
+  p.is_hrr = 0;
+  EXPECT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_ERR_INVALID) << "a ServerHello with no share";
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 20);
+  p.is_hrr = 1;
+  EXPECT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_ERR_LIMIT) << "a full buffer is a limit";
+  gtls_buf_free(&b);
+}
+
+TEST(ServerBuilders, EncryptedExtensions) {
+  GTLS_Limits l = limits();
+  GTLS_EncryptedExtensions ee;
+  GTLS_EeParams p;
+  std::memset(&p, 0, sizeof p);
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_encrypted_extensions(&p, &b), GTLS_OK);
+  EXPECT_EQ(Bytes(b.data, b.data + b.len), (Bytes{8, 0, 0, 2, 0, 0})) << "an empty block";
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  const unsigned char h2[2] = {'h', '2'};
+  p.alpn = h2;
+  p.alpn_len = 2;
+  p.ack_server_name = 1;
+  ASSERT_EQ(gtls_msg_build_encrypted_extensions(&p, &b), GTLS_OK);
+  ASSERT_EQ(gtls_msg_parse_encrypted_extensions(b.data + 4, b.len - 4, &l, &ee), GTLS_OK);
+  EXPECT_TRUE(ee.has_alpn);
+  EXPECT_EQ(std::string(reinterpret_cast<const char *>(ee.alpn), ee.alpn_len), "h2");
+  EXPECT_TRUE(ee.has_server_name);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  Bytes prefix = ext(0x7a7a, Bytes{1, 2});
+  p.prefix = prefix.data();
+  p.prefix_len = prefix.size();
+  p.alpn_len = 0;
+  p.alpn = nullptr;
+  p.ack_server_name = 0;
+  ASSERT_EQ(gtls_msg_build_encrypted_extensions(&p, &b), GTLS_OK);
+  ASSERT_EQ(gtls_msg_parse_encrypted_extensions(b.data + 4, b.len - 4, &l, &ee), GTLS_OK);
+  ASSERT_EQ(ee.ext_count, 1u);
+  EXPECT_EQ(ee.exts[0].type, 0x7a7a);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  p.alpn_len = 256;
+  p.alpn = h2;
+  EXPECT_EQ(gtls_msg_build_encrypted_extensions(&p, &b), GTLS_ERR_INVALID);
+  gtls_buf_free(&b);
+}
+
+TEST(ServerBuilders, CertificateAndCertificateVerifyAndFinished) {
+  GTLS_Limits l = limits();
+  Bytes a(300, 0xaa), c(10, 0xcc);
+  const unsigned char * der[2] = {a.data(), c.data()};
+  size_t lens[2] = {a.size(), c.size()};
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_certificate(der, lens, 2, &b), GTLS_OK);
+  GTLS_CertificateMsg cert;
+  ASSERT_EQ(gtls_msg_parse_certificate(b.data + 4, b.len - 4, &l, &cert), GTLS_OK);
+  EXPECT_EQ(cert.context_len, 0u);
+  ASSERT_EQ(cert.count, 2u);
+  EXPECT_EQ(Bytes(cert.der[0], cert.der[0] + cert.der_len[0]), a);
+  EXPECT_EQ(Bytes(cert.der[1], cert.der[1] + cert.der_len[1]), c);
+  EXPECT_FALSE(cert.has_entry_extensions);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  EXPECT_EQ(gtls_msg_build_certificate(der, lens, 0, &b), GTLS_ERR_INVALID);
+  lens[1] = 0;
+  EXPECT_EQ(gtls_msg_build_certificate(der, lens, 2, &b), GTLS_ERR_INVALID);
+  gtls_buf_free(&b);
+
+  Bytes sig(64, 0x5a);
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_certificate_verify(0x0807, sig.data(), sig.size(), &b), GTLS_OK);
+  GTLS_CertificateVerifyMsg cv;
+  ASSERT_EQ(gtls_msg_parse_certificate_verify(b.data + 4, b.len - 4, &l, &cv), GTLS_OK);
+  EXPECT_EQ(cv.scheme, 0x0807u);
+  EXPECT_EQ(Bytes(cv.signature, cv.signature + cv.signature_len), sig);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  EXPECT_EQ(gtls_msg_build_certificate_verify(0x0807, sig.data(), 0, &b), GTLS_ERR_INVALID);
+  EXPECT_EQ(gtls_msg_build_certificate_verify(0x0807, nullptr, 4, &b), GTLS_ERR_INVALID);
+  gtls_buf_free(&b);
+
+  Bytes verify(32, 0x33);
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_finished(verify.data(), verify.size(), &b), GTLS_OK);
+  EXPECT_EQ(Bytes(b.data, b.data + 4), (Bytes{20, 0, 0, 32}));
+  const unsigned char * got = nullptr;
+  ASSERT_EQ(gtls_msg_parse_finished(b.data + 4, b.len - 4, 32, &got), GTLS_OK);
+  EXPECT_EQ(got, b.data + 4);
+  EXPECT_EQ(gtls_msg_parse_finished(b.data + 4, b.len - 4, 48, &got), GTLS_ERR_CORRUPT);
+  EXPECT_EQ(gtls_msg_parse_finished(b.data + 4, 31, 32, &got), GTLS_ERR_CORRUPT);
+  EXPECT_EQ(gtls_msg_parse_finished(b.data + 4, 0, 0, &got), GTLS_ERR_CORRUPT);
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 4096);
+  EXPECT_EQ(gtls_msg_build_finished(verify.data(), 49, &b), GTLS_ERR_INVALID);
+  EXPECT_EQ(gtls_msg_build_finished(verify.data(), 0, &b), GTLS_ERR_INVALID);
+  gtls_buf_free(&b);
+}
+
+TEST(ServerBuilders, KeyUpdate) {
+  GTLS_Buf b;
+  for (unsigned req : {0u, 1u}) {
+    gtls_buf_init(&b, nullptr, 64);
+    ASSERT_EQ(gtls_msg_build_key_update(req, &b), GTLS_OK);
+    EXPECT_EQ(Bytes(b.data, b.data + b.len), (Bytes{24, 0, 0, 1, static_cast<unsigned char>(req)}));
+    unsigned got = 9;
+    ASSERT_EQ(gtls_msg_parse_key_update(b.data + 4, 1, &got), GTLS_OK);
+    EXPECT_EQ(got, req);
+    gtls_buf_free(&b);
+  }
+  gtls_buf_init(&b, nullptr, 64);
+  EXPECT_EQ(gtls_msg_build_key_update(2, &b), GTLS_ERR_INVALID);
+  gtls_buf_free(&b);
+  unsigned got = 9;
+  const unsigned char two[1] = {2};
+  EXPECT_EQ(gtls_msg_parse_key_update(two, 1, &got), GTLS_ERR_PROTOCOL);
+  EXPECT_EQ(gtls_msg_parse_key_update(two, 0, &got), GTLS_ERR_CORRUPT);
+  EXPECT_EQ(gtls_msg_parse_key_update(two, 2, &got), GTLS_ERR_CORRUPT);
+  EXPECT_EQ(got, 9u);
+}
+
+TEST(ServerBuilders, ABuiltMessageIsCutAtEveryLengthAndNeverParsesShort) {
+  GTLS_ServerHelloParams p;
+  std::memset(&p, 0, sizeof p);
+  Bytes kx(32, 7);
+  p.session_id_len = 0;
+  p.suite = 0x1301;
+  p.group = 0x001d;
+  p.key_exchange = kx.data();
+  p.key_exchange_len = 32;
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 4096);
+  ASSERT_EQ(gtls_msg_build_server_hello(&p, &b), GTLS_OK);
+  GTLS_Limits l = limits();
+  for (size_t n = 0; n < b.len - 4; n++) {
+    GTLS_ServerHello sh;
+    if (n == 38) {
+      continue; /* a ServerHello with no extensions at all parses: it is the client that refuses it */
+    }
+    EXPECT_NE(gtls_msg_parse_server_hello(b.data + 4, n, &l, &sh), GTLS_OK) << n;
+  }
+  gtls_buf_free(&b);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

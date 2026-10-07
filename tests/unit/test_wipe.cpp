@@ -10,7 +10,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include "sim.h"
+#include "loop.h"
 
 #include <algorithm>
 
@@ -220,6 +220,175 @@ TEST(Wipe, NoSecretReachesAFreedBlockForP256P384AndSha384) {
     EXPECT_EQ(watch.found, 0) << "group " << c.group << " suite " << c.suite;
     EXPECT_EQ(alloc.live, 0);
   }
+}
+
+/* ------------------------------------------------- the server and the record layer */
+
+namespace {
+
+/** Every secret a connection holds that the test can name: the schedule, the record keys, and the traffic secrets. */
+std::vector<Bytes> secrets_of(const GTLS_Conn * c) {
+  std::vector<Bytes> out;
+  const GTLS_Schedule & k = c->sec.schedule;
+  const size_t h = k.hlen;
+  if (h == 0) {
+    return out;
+  }
+  for (const unsigned char * p : {k.handshake, k.master, k.c_hs, k.s_hs, k.c_ap, k.s_ap}) {
+    out.push_back(Bytes(p, p + h));
+  }
+  if (c->sec.wr.active) {
+    out.push_back(Bytes(c->sec.wr.key, c->sec.wr.key + gtls_suite_key_len(c->sec.wr.suite)));
+    out.push_back(Bytes(c->sec.wr_secret, c->sec.wr_secret + h));
+  }
+  if (c->sec.rd.active) {
+    out.push_back(Bytes(c->sec.rd.key, c->sec.rd.key + gtls_suite_key_len(c->sec.rd.suite)));
+    out.push_back(Bytes(c->sec.rd_secret, c->sec.rd_secret + h));
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST(WipeStream, NoSecretOfEitherEndReachesAFreedBlock) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  for (bool retry : {false, true}) {
+    TestAlloc alloc;
+    Watch watch;
+    {
+      Pair p(*cred);
+      p.allocator = &alloc.a;
+      GTLS_Group want = GTLS_GROUP_SECP256R1;
+      if (retry) {
+        p.scfg.groups = &want;
+        p.scfg.group_count = 1;
+      }
+      ASSERT_EQ(p.build(), GTLS_OK);
+      ScriptedRandom crnd, srnd;
+      const Bytes cpriv(32, 0x71), spriv(32, 0x72);
+      crnd.chunks = {Bytes(32, 0x61), cpriv, cpriv};
+      srnd.chunks = {Bytes(32, 0x62), spriv, spriv};
+      /* the connections were started by build(): redraw with scripted keys */
+      gtls_conn_free(p.c.conn);
+      gtls_conn_free(p.s.conn);
+      p.c.conn = nullptr;
+      p.s.conn = nullptr;
+      ASSERT_EQ(gtls_conn_new(p.c.ctx, p.host.data(), p.host.size(), &p.c.conn), GTLS_OK);
+      ASSERT_EQ(gtls_conn_new_server(p.s.ctx, &p.s.conn), GTLS_OK);
+      gtls_conn_set_hooks(p.c.conn, ScriptedRandom::fn, &crnd, nullptr, nullptr);
+      gtls_conn_set_hooks(p.s.conn, ScriptedRandom::fn, &srnd, nullptr, nullptr);
+      ASSERT_EQ(gtls_conn_start(p.c.conn), GTLS_OK);
+      ASSERT_EQ(gtls_conn_start(p.s.conn), GTLS_OK);
+      p.run();
+      ASSERT_TRUE(p.connected());
+      p.send_all(p.c, p.s, pattern(3000, 1));
+      ASSERT_EQ(gtls_conn_key_update(p.c.conn, 1), GTLS_OK);
+      p.send_all(p.s, p.c, pattern(3000, 2));
+      for (const Bytes & k : secrets_of(p.c.conn)) watch.secrets.push_back(k);
+      for (const Bytes & k : secrets_of(p.s.conn)) watch.secrets.push_back(k);
+      if (!retry) {
+        watch.secrets.push_back(cpriv);
+        watch.secrets.push_back(spriv);
+      }
+      watch.install(alloc);
+      EXPECT_GE(watch.secrets.size(), 20u);
+      const unsigned char * raw = reinterpret_cast<const unsigned char *>(p.s.conn);
+      EXPECT_TRUE(contains(raw, sizeof(GTLS_Conn), Bytes(p.s.conn->sec.wr.key, p.s.conn->sec.wr.key + 16)))
+          << "the scan looks for something that was there";
+    }
+    EXPECT_EQ(watch.found, 0) << (retry ? "retry" : "plain");
+    EXPECT_EQ(alloc.live, 0);
+  }
+}
+
+TEST(WipeStream, AServerThatFailsAtAnyStageHoldsNothingAfterwards) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  /* stage 0: no ALPN overlap; 1: a refused ClientHello; 2: a tampered Finished;
+   * 3: a truncated stream after the handshake; 4: a record that does not authenticate */
+  for (int stage = 0; stage < 5; stage++) {
+    TestAlloc alloc;
+    Watch watch;
+    {
+      Pair p(*cred);
+      p.allocator = &alloc.a;
+      if (stage == 0) {
+        p.salpn = {"h2"};
+        p.calpn = {"spdy"};
+      }
+      ASSERT_EQ(p.build(), GTLS_OK);
+      p.auto_read = true;
+      if (stage == 1) {
+        Bytes bad = {22, 3, 3, 0, 4, 1, 0, 0, 0};
+        size_t used = 0;
+        EXPECT_NE(gtls_conn_stream_feed(p.s.conn, bad.data(), bad.size(), kNow, &used), GTLS_OK);
+      } else if (stage == 2) {
+        Bytes ch = stream_out(p.c.conn);
+        gtls_conn_stream_consume(p.c.conn, ch.size());
+        size_t used = 0;
+        ASSERT_EQ(gtls_conn_stream_feed(p.s.conn, ch.data(), ch.size(), kNow, &used), GTLS_OK);
+        for (const Bytes & s : secrets_of(p.s.conn)) watch.secrets.push_back(s);
+        Bytes junk(5 + 53, 0x42);
+        junk[0] = 23;
+        junk[1] = 3;
+        junk[2] = 3;
+        junk[3] = 0;
+        junk[4] = 53;
+        EXPECT_EQ(gtls_conn_stream_feed(p.s.conn, junk.data(), junk.size(), kNow, &used), GTLS_ERR_MISMATCH);
+      } else {
+        p.run();
+        if (stage == 0) {
+          EXPECT_TRUE(gtls_conn_is_failed(p.s.conn));
+        } else {
+          ASSERT_TRUE(p.connected());
+          for (const Bytes & s : secrets_of(p.s.conn)) watch.secrets.push_back(s);
+          for (const Bytes & s : secrets_of(p.c.conn)) watch.secrets.push_back(s);
+          if (stage == 3) {
+            EXPECT_EQ(gtls_conn_stream_eof(p.s.conn), GTLS_ERR_TRUNCATED);
+          } else {
+            Bytes junk(5 + 30, 0x42);
+            junk[0] = 23;
+            junk[1] = 3;
+            junk[2] = 3;
+            junk[3] = 0;
+            junk[4] = 30;
+            size_t used = 0;
+            EXPECT_EQ(gtls_conn_stream_feed(p.s.conn, junk.data(), junk.size(), kNow, &used), GTLS_ERR_MISMATCH);
+            EXPECT_TRUE(gtls_conn_secrets_are_wiped(p.s.conn));
+          }
+        }
+      }
+      EXPECT_TRUE(gtls_conn_is_failed(p.s.conn)) << stage;
+      EXPECT_TRUE(gtls_conn_secrets_are_wiped(p.s.conn)) << stage;
+      watch.install(alloc);
+    }
+    EXPECT_EQ(watch.found, 0) << "stage " << stage;
+    EXPECT_EQ(alloc.live, 0) << "stage " << stage;
+  }
+}
+
+TEST(WipeStream, PlaintextNotYetReadIsGoneAfterAFailureToo) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  TestAlloc alloc;
+  Watch watch;
+  watch.secrets = {Bytes(64, 0x5e)};
+  {
+    Pair p(*cred);
+    p.allocator = &alloc.a;
+    ASSERT_EQ(p.build(), GTLS_OK);
+    p.run();
+    ASSERT_TRUE(p.connected());
+    p.auto_read = false;
+    size_t w = 0;
+    ASSERT_EQ(gtls_conn_write(p.c.conn, watch.secrets[0].data(), 64, &w), GTLS_OK);
+    p.run();
+    ASSERT_GT(p.s.conn->app_in.len, 0u) << "it is waiting to be read";
+    EXPECT_EQ(gtls_conn_stream_eof(p.s.conn), GTLS_ERR_TRUNCATED);
+    unsigned char b[64];
+    size_t n = 1;
+    EXPECT_EQ(gtls_conn_read(p.s.conn, b, 64, &n), GTLS_ERR_FAILED) << "a failed connection discards what it held";
+    watch.install(alloc);
+  }
+  EXPECT_EQ(watch.found, 0);
 }
 
 int main(int argc, char ** argv) {

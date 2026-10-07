@@ -1,0 +1,7 @@
+Copied unchanged from libs/certificate/tests/data/certs (made by that library's
+tools/make-fixtures.sh and tools/make-key-fixtures.sh): for each of rsa, p256,
+p384 and ed, a self-signed CA (<k>-ca.der), a leaf it signed (<k>-leaf.der) and
+the leaf's private key as PKCS#8 (<k>-leaf.pkcs8). Valid 2020-01-01 to
+2030-01-01. The leaves name rsa.example.com, www.example.com (p256),
+p384.example.com and ed.example.com, and carry no extendedKeyUsage.
+The interop gate gives the same files to OpenSSL (tools/oracle).

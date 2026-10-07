@@ -77,6 +77,11 @@ typedef enum {
   GTLS_ERR_CERT_PURPOSE,       ///< The leaf's extendedKeyUsage does not permit serverAuth.
   GTLS_ERR_CERT_INVALID,       ///< A path to an anchor exists and policy refused it, or a signature on it failed.
   GTLS_ERR_FAILED,             ///< The connection has already failed; see ::gtls_conn_failure.
+  GTLS_ERR_TRUNCATED,          ///< The stream ended without a close_notify: the peer may have been cut off.
+  GTLS_ERR_CLOSED,             ///< The stream ended cleanly (close_notify), or this end has closed it; nothing more will come or go.
+  GTLS_ERR_ALERT,              ///< The peer sent a fatal alert; see ::gtls_conn_peer_alert.
+  GTLS_ERR_NO_COMMON,          ///< The server found no suite, group or signature scheme both ends accept.
+  GTLS_ERR_ALPN,               ///< Both ends have ALPN lists and no protocol is in both.
   GTLS_RESULT_COUNT
 } GTLS_Result;
 
@@ -104,6 +109,7 @@ GTLS_API const char * gtls_result_string(GTLS_Result result);
 #define GTLS_ALERT_CERTIFICATE_UNKNOWN 46u
 #define GTLS_ALERT_ILLEGAL_PARAMETER 47u
 #define GTLS_ALERT_UNKNOWN_CA 48u
+#define GTLS_ALERT_USER_CANCELED 90u
 #define GTLS_ALERT_DECODE_ERROR 50u
 #define GTLS_ALERT_DECRYPT_ERROR 51u
 #define GTLS_ALERT_PROTOCOL_VERSION 70u
@@ -153,6 +159,28 @@ typedef struct GTLS_Limits {
   uint32_t max_tickets;
   /** Most bytes of output a connection holds unconsumed, per epoch. Default 65536. */
   uint32_t max_output_bytes;
+  /**
+   * Largest ClientHello a server accepts, body only. Default 16384, which is
+   * more than any browser sends (a post-quantum key share is about 1.2 KiB).
+   */
+  uint32_t max_client_hello;
+  /**
+   * Records one key protects before the sending side must update it (a
+   * KeyUpdate is sent by itself when the next record would reach the cap).
+   * RFC 8446 section 5.5 puts the AES-GCM limit at 2^24.5 full records.
+   * Default 2^24.
+   */
+  uint32_t max_records_per_key;
+  /** Most bytes of zero padding accepted inside one received record. Default 16384. */
+  uint32_t max_record_padding;
+  /**
+   * Most bytes of decrypted application data a connection holds unread. When
+   * the buffer is full ::gtls_conn_stream_feed stops taking bytes until the
+   * caller reads. Default 65536.
+   */
+  uint32_t max_app_buffer;
+  /** Most KeyUpdate messages one connection accepts. Default 65536. */
+  uint32_t max_key_updates;
 } GTLS_Limits;
 
 /**

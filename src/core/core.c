@@ -76,6 +76,16 @@ const char * gtls_result_string(GTLS_Result result) {
       return "Certificate chain refused";
     case GTLS_ERR_FAILED:
       return "Connection has failed";
+    case GTLS_ERR_TRUNCATED:
+      return "Stream ended without close_notify";
+    case GTLS_ERR_CLOSED:
+      return "Stream closed";
+    case GTLS_ERR_ALERT:
+      return "Peer sent a fatal alert";
+    case GTLS_ERR_NO_COMMON:
+      return "No suite, group or signature scheme in common";
+    case GTLS_ERR_ALPN:
+      return "No application protocol in common";
     case GTLS_RESULT_COUNT:
       break;
   }
@@ -97,6 +107,11 @@ void gtls_limits_default(GTLS_Limits * limits) {
   limits->max_cookie_bytes = 1024u;
   limits->max_tickets = 16u;
   limits->max_output_bytes = 65536u;
+  limits->max_client_hello = 16384u;
+  limits->max_records_per_key = 1u << 24;
+  limits->max_record_padding = 16384u;
+  limits->max_app_buffer = 65536u;
+  limits->max_key_updates = 65536u;
 }
 
 void gtls_limits_resolve(const GTLS_Limits * in, GTLS_Limits * out) {
@@ -122,5 +137,10 @@ void gtls_limits_resolve(const GTLS_Limits * in, GTLS_Limits * out) {
   GTLS_RESOLVE(max_cookie_bytes)
   GTLS_RESOLVE(max_tickets)
   GTLS_RESOLVE(max_output_bytes)
+  GTLS_RESOLVE(max_client_hello)
+  GTLS_RESOLVE(max_records_per_key)
+  GTLS_RESOLVE(max_record_padding)
+  GTLS_RESOLVE(max_app_buffer)
+  GTLS_RESOLVE(max_key_updates)
 #undef GTLS_RESOLVE
 }

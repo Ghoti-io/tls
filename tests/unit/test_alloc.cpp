@@ -12,7 +12,7 @@
  * Copyright 2026 by Corey Pennycuff
  */
 
-#include "sim.h"
+#include "loop.h"
 
 using namespace gtlstest;
 
@@ -102,6 +102,118 @@ INSTANTIATE_TEST_SUITE_P(Flows, AllocationSweep,
       return std::string(std::get<0>(info.param) ? "Retry" : "Plain") +
           (std::get<1>(info.param) ? "Alpn" : "NoAlpn");
     });
+
+/* The same, for the server role, the record layer and everything the stream
+ * interface allocates: both contexts (one with identities), both
+ * connections, the handshake, data both ways, a key update, and a close. */
+
+namespace {
+
+struct StreamRun {
+  GTLS_Result create = GTLS_OK;   /* what a creation call returned, if one failed */
+  bool both_connected = false;
+  bool any_oom = false;           /* a connection failed for lack of memory */
+  bool clean = false;             /* everything that was asked for happened */
+};
+
+StreamRun stream_with_failure_at(long n, TestAlloc & alloc, Cred & cred, bool retry) {
+  StreamRun out;
+  alloc.count = 0;
+  alloc.fail_at = n;
+  Pair p(cred);
+  p.allocator = &alloc.a;
+  p.calpn = {"h2"};
+  p.salpn = {"h2", "http/1.1"};
+  GTLS_Group want = GTLS_GROUP_SECP256R1;
+  if (retry) {
+    p.scfg.groups = &want;
+    p.scfg.group_count = 1;
+  }
+  out.create = p.build();
+  if (out.create != GTLS_OK) {
+    return out;
+  }
+  p.run();
+  out.both_connected = p.connected();
+  size_t w = 0;
+  if (out.both_connected) {
+    Bytes data = pattern(40000, 3);
+    GTLS_Result r1 = gtls_conn_write(p.c.conn, data.data(), data.size(), &w);
+    p.run();
+    GTLS_Result r2 = gtls_conn_write(p.s.conn, data.data(), 500, &w);
+    GTLS_Result r3 = gtls_conn_key_update(p.s.conn, 1);
+    p.run();
+    GTLS_Result r4 = gtls_conn_close(p.c.conn);
+    p.run();
+    out.clean = r1 == GTLS_OK && r2 == GTLS_OK && r3 == GTLS_OK && r4 == GTLS_OK &&
+        p.s.got.size() == data.size() && p.c.got.size() == 500 && gtls_conn_peer_closed(p.s.conn);
+  }
+  for (GTLS_Conn * c : {p.c.conn, p.s.conn}) {
+    if (gtls_conn_is_failed(c)) {
+      out.any_oom |= gtls_conn_failure(c) == GTLS_ERR_OOM;
+      EXPECT_TRUE(gtls_conn_secrets_are_wiped(c)) << "failure at allocation " << n;
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+class StreamAllocationSweep : public ::testing::TestWithParam<bool> {};
+
+TEST_P(StreamAllocationSweep, FailingEachAllocationLeaksNothingAndIsNeverSilent) {
+  const bool retry = GetParam();
+  std::unique_ptr<Cred> cred = ed_cred();
+  TestAlloc probe;
+  StreamRun clean = stream_with_failure_at(-1, probe, *cred, retry);
+  ASSERT_EQ(clean.create, GTLS_OK);
+  ASSERT_TRUE(clean.clean);
+  EXPECT_EQ(probe.live, 0) << "the clean run frees everything";
+  const long total = probe.count;
+  ASSERT_GT(total, 20);
+  ASSERT_LT(total, 600);
+  for (long n = 0; n < total; n++) {
+    TestAlloc alloc;
+    StreamRun r = stream_with_failure_at(n, alloc, *cred, retry);
+    EXPECT_EQ(alloc.live, 0) << "allocation " << n << " of " << total << " leaked";
+    /* Either a call said out-of-memory, or a connection failed for it. The
+     * one way to be silent is to have run clean over a failed allocation. */
+    EXPECT_FALSE(r.clean) << "allocation " << n << " failed and nothing noticed";
+    if (r.create != GTLS_OK) {
+      EXPECT_EQ(r.create, GTLS_ERR_OOM) << n;
+    } else {
+      EXPECT_TRUE(r.any_oom || !r.both_connected || !r.clean) << n;
+    }
+  }
+  TestAlloc past;
+  StreamRun after = stream_with_failure_at(total, past, *cred, retry);
+  EXPECT_TRUE(after.clean);
+  EXPECT_EQ(past.live, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Flows, StreamAllocationSweep, ::testing::Bool(),
+    [](const ::testing::TestParamInfo<bool> & info) { return info.param ? "Retry" : "Plain"; });
+
+TEST(StreamAllocationSweepControl, AServerContextThatFailsPartwayLeavesNothing) {
+  std::unique_ptr<Cred> a = ed_cred("a.test");
+  std::unique_ptr<Cred> b = ed_cred("b.test");
+  TestAlloc probe;
+  Pair probe_pair(std::vector<Cred *>{a.get(), b.get()});
+  probe_pair.allocator = &probe.a;
+  ASSERT_EQ(probe_pair.build(), GTLS_OK);
+  const long total = probe.count;
+  for (long n = 0; n < total; n++) {
+    TestAlloc alloc;
+    {
+      Pair p(std::vector<Cred *>{a.get(), b.get()});
+      p.allocator = &alloc.a;
+      alloc.fail_at = n;
+      GTLS_Result r = p.build();
+      EXPECT_EQ(r, GTLS_ERR_OOM) << n;
+    }
+    EXPECT_EQ(alloc.live, 0) << "allocation " << n << " of " << total;
+  }
+}
 
 /* The sweep above counts allocations through the context's allocator. A
  * control for the sweep itself: an allocator that fails and a leak that the

@@ -34,6 +34,40 @@
 #include "../core/core_internal.h"
 #include "client_internal.h"
 
+#include <string.h>
+
+/** Schemes TLS 1.3 allows in a CertificateVerify: no PKCS#1, no SHA-1. */
+int gtls_cv_scheme_ok(unsigned scheme) {
+  switch (scheme) {
+    case GCERT_SIG_RSA_PSS_SHA256:
+    case GCERT_SIG_RSA_PSS_SHA384:
+    case GCERT_SIG_RSA_PSS_SHA512:
+    case GCERT_SIG_ECDSA_P256_SHA256:
+    case GCERT_SIG_ECDSA_P384_SHA384:
+    case GCERT_SIG_ED25519:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+size_t gtls_cv_content(int server, const void * th, size_t hlen,
+    unsigned char * out) {
+  static const char server_label[] = "TLS 1.3, server CertificateVerify";
+  static const char client_label[] = "TLS 1.3, client CertificateVerify";
+  const char * label = server ? server_label : client_label;
+  size_t n = 0;
+
+  /* RFC 8446 section 4.4.3: 64 spaces, a context string, a zero byte, and
+   * the transcript hash through Certificate. */
+  memset(out, 0x20, 64);
+  n = 64;
+  memcpy(out + n, label, sizeof server_label); /* includes the zero byte */
+  n += sizeof server_label;
+  memcpy(out + n, th, hlen);
+  return n + hlen;
+}
+
 GTLS_Result gtls_verify_chain(void * user, const GTLS_Conn * conn,
     const GTLS_CertificateMsg * certificate, int64_t unix_time) {
   GCERT_X509 leaf;

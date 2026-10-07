@@ -86,6 +86,121 @@ static int group_known(unsigned v) {
       v == GTLS_GROUP_SECP384R1;
 }
 
+static void free_identity(const GTLS_Allocator * allocator, GTLS_ServerIdentity * id) {
+  gcu_allocator_free(allocator, id->chain);
+  gcu_allocator_free(allocator, id->chain_len);
+  gcu_allocator_free(allocator, id->names);
+  gcu_allocator_free(allocator, id->name_len);
+  memset(id, 0, sizeof *id);
+}
+
+/** Copy one identity into the context, checking what can be checked now. */
+static GTLS_Result build_identity(const GTLS_Context * x, const GTLS_Identity * in,
+    GTLS_ServerIdentity * out) {
+  const GTLS_Allocator * allocator = x->allocator;
+  GCERT_X509 leaf;
+  size_t total = 0;
+  size_t msg;
+  size_t name_bytes = 0;
+  size_t off = 0;
+  size_t i;
+
+  memset(out, 0, sizeof *out);
+  if (in->chain == NULL || in->chain_lens == NULL || in->chain_count == 0 ||
+      in->chain_count > GTLS_CERT_MAX || in->key == NULL ||
+      (in->names == NULL && in->name_count != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  for (i = 0; i < in->chain_count; i++) {
+    if (in->chain[i] == NULL || in->chain_lens[i] == 0 ||
+        in->chain_lens[i] > 0xffffffu - total) {
+      return GTLS_ERR_INVALID;
+    }
+    total += in->chain_lens[i];
+  }
+  /* The Certificate message, and room beside it for the rest of the flight,
+   * has to fit the queue a connection holds. */
+  msg = 8u + 5u * in->chain_count + total;
+  if (msg + 1024u > x->limits.max_output_bytes) {
+    return GTLS_ERR_LIMIT;
+  }
+  for (i = 0; i < in->name_count; i++) {
+    size_t n;
+    size_t k;
+
+    if (in->names[i] == NULL) {
+      return GTLS_ERR_INVALID;
+    }
+    n = strlen(in->names[i]);
+    if (n == 0 || n > 255u) {
+      return GTLS_ERR_INVALID;
+    }
+    for (k = 0; k < n; k++) {
+      if ((unsigned char)in->names[i][k] > 0x7fu) {
+        return GTLS_ERR_INVALID;
+      }
+    }
+    name_bytes += n;
+  }
+  out->chain = gcu_allocator_malloc(allocator, total);
+  out->chain_len = gcu_allocator_malloc(allocator, in->chain_count * sizeof *out->chain_len);
+  out->names = in->name_count != 0 ? gcu_allocator_malloc(allocator, name_bytes) : NULL;
+  out->name_len = in->name_count != 0
+      ? gcu_allocator_malloc(allocator, in->name_count * sizeof *out->name_len) : NULL;
+  if (out->chain == NULL || out->chain_len == NULL ||
+      (in->name_count != 0 && (out->names == NULL || out->name_len == NULL))) {
+    free_identity(allocator, out);
+    return GTLS_ERR_OOM;
+  }
+  for (i = 0; i < in->chain_count; i++) {
+    memcpy(out->chain + off, in->chain[i], in->chain_lens[i]);
+    out->chain_len[i] = in->chain_lens[i];
+    off += in->chain_lens[i];
+  }
+  out->chain_count = in->chain_count;
+  out->chain_bytes = total;
+  off = 0;
+  for (i = 0; i < in->name_count; i++) {
+    size_t n = strlen(in->names[i]);
+    size_t k;
+
+    for (k = 0; k < n; k++) {
+      unsigned char ch = (unsigned char)in->names[i][k];
+
+      out->names[off + k] = ch >= 'A' && ch <= 'Z' ? (unsigned char)(ch + ('a' - 'A')) : ch;
+    }
+    out->name_len[i] = n;
+    off += n;
+  }
+  out->name_count = in->name_count;
+  out->key = in->key;
+  out->key_kind = gcert_key_kind(in->key);
+  if (gcert_x509_parse(out->chain, out->chain_len[0], &leaf) != GCERT_OK ||
+      gcert_key_matches(in->key, &leaf) != GCERT_OK) {
+    free_identity(allocator, out);
+    return GTLS_ERR_INVALID;
+  }
+  return GTLS_OK;
+}
+
+static GTLS_Result build_identities(GTLS_Context * x, const GTLS_Identity * list,
+    size_t count) {
+  size_t i;
+  GTLS_Result result = GTLS_OK;
+
+  x->identities = gcu_allocator_calloc(x->allocator, count, sizeof *x->identities);
+  if (x->identities == NULL) {
+    return GTLS_ERR_OOM;
+  }
+  for (i = 0; i < count && result == GTLS_OK; i++) {
+    result = build_identity(x, &list[i], &x->identities[i]);
+    if (result == GTLS_OK) {
+      x->identity_count = i + 1u;
+    }
+  }
+  return result;
+}
+
 GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
     const GTLS_ContextConfig * config, GTLS_Context ** out) {
   GTLS_Context * c;
@@ -98,10 +213,7 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   if (allocator == NULL) {
     allocator = gtls_allocator_default();
   }
-  if (config->role == GTLS_ROLE_SERVER) {
-    return GTLS_ERR_UNSUPPORTED;
-  }
-  if (config->role != GTLS_ROLE_CLIENT) {
+  if (config->role != GTLS_ROLE_CLIENT && config->role != GTLS_ROLE_SERVER) {
     return GTLS_ERR_INVALID;
   }
   if (config->versions == 0 ||
@@ -111,14 +223,36 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   if (config->versions != GTLS_VERSION_TLS13) {
     return GTLS_ERR_UNSUPPORTED;
   }
-  if (config->chain != NULL || config->chain_lens != NULL ||
-      config->chain_count != 0 || config->key != NULL || config->psk != NULL ||
-      config->psk_len != 0 || config->psk_identity != NULL ||
+  if (config->psk != NULL || config->psk_len != 0 || config->psk_identity != NULL ||
       config->psk_identity_len != 0) {
     return GTLS_ERR_UNSUPPORTED;
   }
-  if (config->trust == NULL) {
-    return GTLS_ERR_INVALID;
+  if (config->role == GTLS_ROLE_CLIENT) {
+    /* A chain and key on a client are client authentication, which is not
+     * built; identities are a server's. */
+    if (config->chain != NULL || config->chain_lens != NULL ||
+        config->chain_count != 0 || config->key != NULL) {
+      return GTLS_ERR_UNSUPPORTED;
+    }
+    if (config->identities != NULL || config->identity_count != 0 ||
+        config->default_identity != 0) {
+      return GTLS_ERR_INVALID;
+    }
+    if (config->trust == NULL) {
+      return GTLS_ERR_INVALID;
+    }
+  } else {
+    int single = config->chain != NULL || config->chain_lens != NULL ||
+        config->chain_count != 0 || config->key != NULL;
+
+    if ((config->identities == NULL) != (config->identity_count == 0) ||
+        (single && config->identity_count != 0) ||
+        (!single && config->identity_count == 0)) {
+      return GTLS_ERR_INVALID;
+    }
+    if (config->default_identity >= (single ? 1u : config->identity_count)) {
+      return GTLS_ERR_INVALID;
+    }
   }
   if ((config->alpn == NULL && config->alpn_count != 0) ||
       (config->suites == NULL && config->suite_count != 0) ||
@@ -133,6 +267,7 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
     return GTLS_ERR_OOM;
   }
   c->allocator = allocator;
+  c->default_identity = config->default_identity;
   c->role = config->role;
   c->versions = config->versions;
   c->trust = config->trust;
@@ -231,6 +366,27 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
     memcpy(c->alpn + c->alpn_len, config->alpn[i], n);
     c->alpn_len += n;
   }
+  if (config->role == GTLS_ROLE_SERVER) {
+    GTLS_Identity one;
+    const GTLS_Identity * list = config->identities;
+    size_t count = config->identity_count;
+    GTLS_Result result;
+
+    if (list == NULL) {
+      memset(&one, 0, sizeof one);
+      one.chain = config->chain;
+      one.chain_lens = config->chain_lens;
+      one.chain_count = config->chain_count;
+      one.key = config->key;
+      list = &one;
+      count = 1;
+    }
+    result = build_identities(c, list, count);
+    if (result != GTLS_OK) {
+      gtls_context_free(c);
+      return result;
+    }
+  }
   *out = c;
   return GTLS_OK;
 
@@ -242,7 +398,12 @@ invalid:
 void gtls_context_free(GTLS_Context * context) {
   if (context != NULL) {
     const GTLS_Allocator * allocator = context->allocator;
+    size_t i;
 
+    for (i = 0; i < context->identity_count; i++) {
+      free_identity(allocator, &context->identities[i]);
+    }
+    gcu_allocator_free(allocator, context->identities);
     (void)gsec_wipe(context, sizeof *context);
     gcu_allocator_free(allocator, context);
   }

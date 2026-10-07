@@ -23,11 +23,14 @@
  *
  * Umbrella header for the Ghoti.io TLS library.
  *
- * The TLS 1.3 handshake core: handshake messages in and out (never records),
- * the key schedule, the transcript, HelloRetryRequest, and the traffic
- * secrets by epoch. Client role, server authentication only. Records, the
- * server role, client authentication, TLS 1.2, resumption and early data are
- * later pieces. See documentation/design.md.
+ * TLS 1.3 as a state machine over buffers: the handshake in both roles (the
+ * client authenticates the server; the server presents an identity chosen by
+ * SNI, selects ALPN, and retries with a HelloRetryRequest), the key schedule,
+ * the traffic secrets by epoch for a caller that carries messages itself
+ * (QUIC), and the record layer over a byte stream with key update,
+ * close_notify and a truncation check for a caller that carries a stream.
+ * Client authentication, TLS 1.2, resumption and early data are later pieces.
+ * See documentation/design.md.
  */
 
 #ifndef GHOTI_IO_GTLS_TLS_H
@@ -38,6 +41,7 @@
 #include <ghoti.io/tls/context.h>
 #include <ghoti.io/tls/core.h>
 #include <ghoti.io/tls/macros.h>
+#include <ghoti.io/tls/record.h>
 #include <ghoti.io/tls/schedule.h>
 #include <ghoti.io/tls/selftest.h>
 

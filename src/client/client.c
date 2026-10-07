@@ -25,7 +25,7 @@
  * reassembly, and what each state does with the message it is waiting for.
  * RFC 8446 sections 4 and 7 and appendix A.1.
  *
- * Every failure goes through fail(), which records the reason and the alert,
+ * Every failure goes through gtls_conn_fail(), which records the reason and the alert,
  * wipes the secrets, and makes the connection terminal, so no failure leaves
  * a secret behind. A handshake that succeeds keeps its secrets until the
  * connection is freed or fails.
@@ -71,7 +71,7 @@ static const unsigned char p384_order[48] = {
  * message would let a small cap break the connection's memory of what it
  * offered.
  */
-static GTLS_Limits own_limits(const GTLS_Conn * c) {
+GTLS_Limits gtls_conn_own_limits(const GTLS_Conn * c) {
   GTLS_Limits l = c->limits;
 
   l.max_extensions = GTLS_EXT_MAX;
@@ -84,38 +84,80 @@ static void wipe_secrets(GTLS_Conn * c) {
   (void)gsec_wipe(&c->sec, sizeof c->sec);
 }
 
-static GTLS_Result fail(GTLS_Conn * c, GTLS_Result result, unsigned alert) {
+GTLS_Result gtls_conn_fail(GTLS_Conn * c, GTLS_Result result, unsigned alert) {
   if (c->state != GTLS_STATE_FAILED) {
+    /* The alert is sealed under the keys the peer has been sent, which are
+     * wiped just below: it has to be built first. */
+    if (c->mode == GTLS_MODE_STREAM && alert != GTLS_ALERT_NONE) {
+      gtls_stream_send_alert(c, 2u, alert);
+    }
     c->state = GTLS_STATE_FAILED;
     c->failure = result;
     c->alert = alert;
     wipe_secrets(c);
+    if (c->app_in.data != NULL) {
+      (void)gsec_wipe(c->app_in.data, c->app_in.cap);
+    }
+    c->app_in.len = 0;
   }
   return result;
 }
 
 /** Failure of a parser or a buffer, with the alert its result calls for. */
-static GTLS_Result fail_parse(GTLS_Conn * c, GTLS_Result result) {
+GTLS_Result gtls_conn_fail_parse(GTLS_Conn * c, GTLS_Result result) {
   switch (result) {
     case GTLS_ERR_CORRUPT:
     case GTLS_ERR_LIMIT:
-      return fail(c, result, GTLS_ALERT_DECODE_ERROR);
+      return gtls_conn_fail(c, result, GTLS_ALERT_DECODE_ERROR);
     case GTLS_ERR_PROTOCOL:
-      return fail(c, result, GTLS_ALERT_ILLEGAL_PARAMETER);
+      return gtls_conn_fail(c, result, GTLS_ALERT_ILLEGAL_PARAMETER);
     default:
-      return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
 }
 
-static GTLS_Result illegal(GTLS_Conn * c) {
-  return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_ILLEGAL_PARAMETER);
+GTLS_Result gtls_conn_illegal(GTLS_Conn * c) {
+  return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_ILLEGAL_PARAMETER);
 }
 
-static GTLS_Result unexpected(GTLS_Conn * c) {
-  return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+GTLS_Result gtls_conn_unexpected(GTLS_Conn * c) {
+  return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
 }
 
 /* ------------------------------------------------------------------ object */
+
+GTLS_Result gtls_conn_alloc(const GTLS_Context * context, GTLS_Conn ** out) {
+  GTLS_Conn * c;
+  const GTLS_Allocator * allocator = context->allocator;
+  size_t i;
+
+  c = gcu_allocator_calloc(allocator, 1, sizeof *c);
+  if (c == NULL) {
+    return GTLS_ERR_OOM;
+  }
+  c->context = context;
+  c->allocator = allocator;
+  c->role = context->role;
+  c->state = GTLS_STATE_NEW;
+  c->limits = context->limits;
+  c->random_fn = NULL;
+  gtls_buf_init(&c->in, allocator, (size_t)c->limits.max_handshake_message + 4u);
+  gtls_buf_init(&c->hello, allocator, GTLS_HELLO_MAX);
+  for (i = 0; i < GTLS_EPOCH_COUNT; i++) {
+    gtls_buf_init(&c->out[i], allocator, c->limits.max_output_bytes);
+  }
+  gtls_buf_init(&c->rbuf, allocator, GTLS_RECORD_HEADER + GTLS_RECORD_CIPHER_MAX);
+  /* Room for what a flush of a full handshake queue can add, besides the
+   * application data, which stops at max_output_bytes. */
+  gtls_buf_init(&c->wire, allocator,
+      2u * (size_t)c->limits.max_output_bytes + 4096u);
+  gtls_buf_init(&c->app_in, allocator,
+      c->limits.max_app_buffer > GTLS_RECORD_PLAIN_MAX
+          ? c->limits.max_app_buffer
+          : GTLS_RECORD_PLAIN_MAX);
+  *out = c;
+  return GTLS_OK;
+}
 
 GTLS_Result gtls_conn_new(const GTLS_Context * context, const char * host,
     size_t host_len, GTLS_Conn ** out) {
@@ -123,6 +165,7 @@ GTLS_Result gtls_conn_new(const GTLS_Context * context, const char * host,
   unsigned char ip[16];
   size_t ip_len = 0;
   const GTLS_Allocator * allocator;
+  GTLS_Result result;
 
   size_t i;
 
@@ -141,36 +184,22 @@ GTLS_Result gtls_conn_new(const GTLS_Context * context, const char * host,
     return GTLS_ERR_INVALID;
   }
   if (context->role != GTLS_ROLE_CLIENT) {
-    return GTLS_ERR_UNSUPPORTED;
+    return GTLS_ERR_INVALID;
   }
   allocator = context->allocator;
-  c = gcu_allocator_calloc(allocator, 1, sizeof *c);
-  if (c == NULL) {
-    return GTLS_ERR_OOM;
+  result = gtls_conn_alloc(context, &c);
+  if (result != GTLS_OK) {
+    return result;
   }
   c->host = gcu_allocator_malloc(allocator, host_len);
   if (c->host == NULL) {
-    gcu_allocator_free(allocator, c);
+    gtls_conn_free(c);
     return GTLS_ERR_OOM;
   }
   memcpy(c->host, host, host_len);
   c->host_len = host_len;
   c->host_is_ip = gcert_ip_parse(host, host_len, ip, &ip_len) == GCERT_OK;
   (void)gsec_wipe(ip, sizeof ip);
-  c->context = context;
-  c->allocator = allocator;
-  c->state = GTLS_STATE_NEW;
-  c->limits = context->limits;
-  c->random_fn = NULL;
-  gtls_buf_init(&c->in, allocator, (size_t)c->limits.max_handshake_message + 4u);
-  gtls_buf_init(&c->hello, allocator, GTLS_HELLO_MAX);
-  {
-    size_t i;
-
-    for (i = 0; i < GTLS_EPOCH_COUNT; i++) {
-      gtls_buf_init(&c->out[i], allocator, c->limits.max_output_bytes);
-    }
-  }
   *out = c;
   return GTLS_OK;
 }
@@ -189,8 +218,10 @@ void gtls_conn_free(GTLS_Conn * c) {
   for (i = 0; i < GTLS_EPOCH_COUNT; i++) {
     gtls_buf_free(&c->out[i]);
   }
+  gtls_stream_free(c);
   gcu_allocator_free(allocator, c->host);
   gcu_allocator_free(allocator, c->leaf);
+  gcu_allocator_free(allocator, c->client_sni);
   (void)gsec_wipe(c, sizeof *c);
   gcu_allocator_free(allocator, c);
 }
@@ -203,7 +234,7 @@ void gtls_conn_set_hooks(GTLS_Conn * c, GTLS_RandomFn random_fn,
   c->chain_user = chain_user;
 }
 
-static GTLS_Result draw(GTLS_Conn * c, void * out, size_t n) {
+GTLS_Result gtls_conn_draw(GTLS_Conn * c, void * out, size_t n) {
   if (c->random_fn != NULL) {
     return c->random_fn(c->random_user, out, n);
   }
@@ -213,7 +244,7 @@ static GTLS_Result draw(GTLS_Conn * c, void * out, size_t n) {
 /* ------------------------------------------------------ what was offered */
 
 static GTLS_Result hello_view(const GTLS_Conn * c, GTLS_ClientHello * v) {
-  GTLS_Limits l = own_limits(c);
+  GTLS_Limits l = gtls_conn_own_limits(c);
 
   if (c->hello.len < 4u) {
     return GTLS_ERR_INTERNAL;
@@ -323,13 +354,13 @@ static int scalar_in_range(const unsigned char * s, const unsigned char * n,
   return (int)(borrow & (((acc | (0u - acc)) >> 31) & 1u));
 }
 
-static void wipe_kx(GTLS_Conn * c) {
+void gtls_conn_wipe_kx(GTLS_Conn * c) {
   (void)gsec_wipe(c->sec.x25519, sizeof c->sec.x25519);
   (void)gsec_wipe(c->sec.p256, sizeof c->sec.p256);
   (void)gsec_wipe(c->sec.p384, sizeof c->sec.p384);
 }
 
-static GTLS_Result gen_share(GTLS_Conn * c, GTLS_Group group,
+GTLS_Result gtls_conn_gen_share(GTLS_Conn * c, GTLS_Group group,
     GTLS_KeyShare * share) {
   unsigned char * priv;
   const unsigned char * order;
@@ -337,7 +368,7 @@ static GTLS_Result gen_share(GTLS_Conn * c, GTLS_Group group,
   unsigned attempt;
   GTLS_Result result = GTLS_OK;
 
-  wipe_kx(c);
+  gtls_conn_wipe_kx(c);
   memset(share, 0, sizeof *share);
   share->group = (uint16_t)group;
   switch (group) {
@@ -360,9 +391,9 @@ static GTLS_Result gen_share(GTLS_Conn * c, GTLS_Group group,
       return GTLS_ERR_INVALID;
   }
   for (attempt = 0; attempt < 8u; attempt++) {
-    result = draw(c, priv, plen);
+    result = gtls_conn_draw(c, priv, plen);
     if (result != GTLS_OK) {
-      wipe_kx(c);
+      gtls_conn_wipe_kx(c);
       return result;
     }
     if (order == NULL || scalar_in_range(priv, order, plen)) {
@@ -387,7 +418,7 @@ static GTLS_Result gen_share(GTLS_Conn * c, GTLS_Group group,
     share->pub_len = 97;
   }
   if (result != GTLS_OK) {
-    wipe_kx(c);
+    gtls_conn_wipe_kx(c);
   }
   return result;
 }
@@ -396,7 +427,7 @@ static GTLS_Result gen_share(GTLS_Conn * c, GTLS_Group group,
  * The shared secret with the server's share. A bad point or a small-order
  * one is the peer's fault and says so.
  */
-static GTLS_Result shared_secret(GTLS_Conn * c, GTLS_Group group,
+GTLS_Result gtls_conn_shared_secret(GTLS_Conn * c, GTLS_Group group,
     const unsigned char * kx, size_t kx_len, unsigned char * out,
     size_t * out_len) {
   GSEC_Result r;
@@ -431,13 +462,13 @@ static GTLS_Result shared_secret(GTLS_Conn * c, GTLS_Group group,
 
 /* ------------------------------------------------------------------ output */
 
-static GTLS_Result queue(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
+GTLS_Result gtls_conn_queue(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     size_t n) {
   GTLS_Result result = gtls_buf_append(&c->out[epoch], data, n);
 
   if (result != GTLS_OK) {
     /* The cap is ours (max_output_bytes), not something the peer sent. */
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   return GTLS_OK;
 }
@@ -452,10 +483,10 @@ static GTLS_Result begin_handshake(GTLS_Conn * c) {
         c->hello.len);
   }
   if (result == GTLS_OK) {
-    result = queue(c, GTLS_EPOCH_INITIAL, c->hello.data, c->hello.len);
+    result = gtls_conn_queue(c, GTLS_EPOCH_INITIAL, c->hello.data, c->hello.len);
   }
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_WAIT_SH;
   return GTLS_OK;
@@ -468,6 +499,9 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   if (c == NULL) {
     return GTLS_ERR_INVALID;
   }
+  if (c->role == GTLS_ROLE_SERVER) {
+    return gtls_server_start(c);
+  }
   if (c->state == GTLS_STATE_FAILED) {
     return GTLS_ERR_FAILED;
   }
@@ -475,18 +509,18 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
     return GTLS_ERR_INVALID;
   }
   memset(&p, 0, sizeof p);
-  result = draw(c, p.random, 32);
+  result = gtls_conn_draw(c, p.random, 32);
   if (result == GTLS_OK && c->context->middlebox_compat) {
-    result = draw(c, p.session_id, 32);
+    result = gtls_conn_draw(c, p.session_id, 32);
     p.session_id_len = 32;
   }
   if (result == GTLS_OK) {
     c->share_group = c->context->groups[0];
-    result = gen_share(c, c->share_group, &p.share);
+    result = gtls_conn_gen_share(c, c->share_group, &p.share);
   }
   if (result != GTLS_OK) {
     (void)gsec_wipe(&p, sizeof p);
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   p.suites = c->context->suites;
   p.suite_count = c->context->suite_count;
@@ -503,7 +537,7 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   result = gtls_msg_build_client_hello(&p, &c->hello);
   (void)gsec_wipe(&p, sizeof p);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   return begin_handshake(c);
 }
@@ -513,7 +547,8 @@ GTLS_Result gtls_conn_start_raw(GTLS_Conn * c, const void * hello,
   GTLS_ClientHello v;
   GTLS_Result result;
 
-  if (c == NULL || hello == NULL || x25519_private == NULL || hello_len < 4u) {
+  if (c == NULL || hello == NULL || x25519_private == NULL || hello_len < 4u ||
+      c->role != GTLS_ROLE_CLIENT) {
     return GTLS_ERR_INVALID;
   }
   if (c->state == GTLS_STATE_FAILED) {
@@ -527,7 +562,7 @@ GTLS_Result gtls_conn_start_raw(GTLS_Conn * c, const void * hello,
     result = hello_view(c, &v);
   }
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   memcpy(c->session_id, v.session_id, v.session_id_len);
   c->session_id_len = v.session_id_len;
@@ -549,10 +584,10 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
   int ours = 0;
 
   if (c->state == GTLS_STATE_WAIT_SH2) {
-    return unexpected(c); /* a second HelloRetryRequest */
+    return gtls_conn_unexpected(c); /* a second HelloRetryRequest */
   }
   if ((sh->flags & (GTLS_SH_FLAG_KEY_SHARE | GTLS_SH_FLAG_COOKIE)) == 0) {
-    return illegal(c); /* it asks for nothing: the retry would be identical */
+    return gtls_conn_illegal(c); /* it asks for nothing: the retry would be identical */
   }
   if ((sh->flags & GTLS_SH_FLAG_KEY_SHARE) != 0) {
     for (i = 0; i < c->context->group_count; i++) {
@@ -562,7 +597,7 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
     }
     if (!ours || !offered_u16(c, GTLS_EXT_SUPPORTED_GROUPS, sh->group) ||
         sh->group == (unsigned)c->share_group) {
-      return illegal(c);
+      return gtls_conn_illegal(c);
     }
   }
   result = gtls_transcript_select(&c->sec.transcript, hash);
@@ -573,19 +608,19 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
     result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   }
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   if ((sh->flags & GTLS_SH_FLAG_KEY_SHARE) != 0) {
-    result = gen_share(c, (GTLS_Group)sh->group, &share);
+    result = gtls_conn_gen_share(c, (GTLS_Group)sh->group, &share);
     if (result != GTLS_OK) {
-      return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
     }
     sp = &share;
     c->share_group = (GTLS_Group)sh->group;
   }
   gtls_buf_init(&h2, c->allocator, GTLS_HELLO_MAX);
   {
-    GTLS_Limits l = own_limits(c);
+    GTLS_Limits l = gtls_conn_own_limits(c);
 
     result = gtls_msg_retry_client_hello(c->hello.data, c->hello.len, sp,
         (sh->flags & GTLS_SH_FLAG_COOKIE) != 0 ? sh->cookie : NULL,
@@ -595,14 +630,14 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
     result = gtls_transcript_update(&c->sec.transcript, h2.data, h2.len);
   }
   if (result == GTLS_OK) {
-    result = queue(c, GTLS_EPOCH_INITIAL, h2.data, h2.len);
+    result = gtls_conn_queue(c, GTLS_EPOCH_INITIAL, h2.data, h2.len);
   }
   gtls_buf_free(&h2);
   (void)gsec_wipe(&share, sizeof share);
   if (result != GTLS_OK) {
     return c->state == GTLS_STATE_FAILED
         ? result
-        : fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->suite = (GTLS_Suite)sh->suite;
   c->hrr_group = c->share_group;
@@ -625,51 +660,51 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   /* Before anything else is believed: a sentinel here means a 1.2 server
    * answered a 1.3 offer because someone made it say so. */
   if (len >= 34u && gtls_msg_downgrade_sentinel(body + 2) != 0) {
-    return fail(c, GTLS_ERR_DOWNGRADE, GTLS_ALERT_ILLEGAL_PARAMETER);
+    return gtls_conn_fail(c, GTLS_ERR_DOWNGRADE, GTLS_ALERT_ILLEGAL_PARAMETER);
   }
   result = gtls_msg_parse_server_hello(body, len, &c->limits, &sh);
   if (result != GTLS_OK) {
-    return fail_parse(c, result);
+    return gtls_conn_fail_parse(c, result);
   }
   if (sh.legacy_version != 0x0303u || sh.compression != 0 ||
       sh.session_id_len != c->session_id_len ||
       gsec_equal(sh.session_id, c->session_id, sh.session_id_len) != GSEC_OK) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if ((sh.flags & GTLS_SH_FLAG_VERSION) == 0) {
     /* No supported_versions: a server that speaks something older. */
-    return fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);
+    return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);
   }
   if (sh.selected_version != 0x0304u) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if ((sh.flags & (GTLS_SH_FLAG_PSK | GTLS_SH_FLAG_UNKNOWN)) != 0 ||
       (!sh.is_hrr && (sh.flags & GTLS_SH_FLAG_COOKIE) != 0)) {
-    return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
+    return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
   }
   if (!gtls_suite_valid(sh.suite) || !offered_suite(c, sh.suite)) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if (sh.is_hrr) {
     return on_hrr(c, &sh, msg, msg_len);
   }
   if (c->retried && sh.suite != (unsigned)c->suite) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if ((sh.flags & GTLS_SH_FLAG_KEY_SHARE) == 0) {
-    return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
+    return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
   }
   if (sh.group != (unsigned)c->share_group) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   hash = gtls_suite_hash(sh.suite);
   c->suite = (GTLS_Suite)sh.suite;
   c->group = (GTLS_Group)sh.group;
-  result = shared_secret(c, c->group, sh.key_exchange, sh.key_exchange_len,
+  result = gtls_conn_shared_secret(c, c->group, sh.key_exchange, sh.key_exchange_len,
       ecdhe, &ecdhe_len);
   if (result != GTLS_OK) {
     (void)gsec_wipe(ecdhe, sizeof ecdhe);
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if (!c->retried) {
     result = gtls_transcript_select(&c->sec.transcript, hash);
@@ -688,9 +723,9 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   }
   (void)gsec_wipe(ecdhe, sizeof ecdhe);
   (void)gsec_wipe(th, sizeof th);
-  wipe_kx(c);
+  gtls_conn_wipe_kx(c);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_WAIT_EE;
   return GTLS_OK;
@@ -724,7 +759,7 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
   result = gtls_msg_parse_encrypted_extensions(msg + 4, msg_len - 4u,
       &c->limits, &ee);
   if (result != GTLS_OK) {
-    return fail_parse(c, result);
+    return gtls_conn_fail_parse(c, result);
   }
   for (i = 0; i < ee.ext_count; i++) {
     unsigned type = ee.exts[i].type;
@@ -733,12 +768,12 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
      * supported_groups, which a server may send on its own. */
     if (!ee_allowed(type) ||
         (type != GTLS_EXT_SUPPORTED_GROUPS && !offered_ext(c, type))) {
-      return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
+      return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
     }
   }
   if (ee.has_alpn) {
     if (!offered_alpn(c, ee.alpn, ee.alpn_len)) {
-      return illegal(c);
+      return gtls_conn_illegal(c);
     }
     memcpy(c->alpn_selected, ee.alpn, ee.alpn_len);
     c->alpn_selected_len = ee.alpn_len;
@@ -746,7 +781,7 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
   c->sni_acknowledged = ee.has_server_name;
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_WAIT_CERT;
   return GTLS_OK;
@@ -776,19 +811,19 @@ static GTLS_Result on_certificate(GTLS_Conn * c, const unsigned char * msg,
   result = gtls_msg_parse_certificate(msg + 4, msg_len - 4u, &c->limits,
       &cert);
   if (result != GTLS_OK) {
-    return fail_parse(c, result);
+    return gtls_conn_fail_parse(c, result);
   }
   if (cert.context_len != 0) {
-    return illegal(c); /* only a CertificateRequest gives a nonempty one */
+    return gtls_conn_illegal(c); /* only a CertificateRequest gives a nonempty one */
   }
   if (cert.count == 0) {
     /* RFC 8446 section 4.4.2: a server's Certificate must not be empty, and
      * the alert for one that is is decode_error. */
-    return fail(c, GTLS_ERR_CERT_INVALID, GTLS_ALERT_DECODE_ERROR);
+    return gtls_conn_fail(c, GTLS_ERR_CERT_INVALID, GTLS_ALERT_DECODE_ERROR);
   }
   if (cert.has_entry_extensions) {
     /* status_request and signed_certificate_timestamp were not offered. */
-    return fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
+    return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
   }
   if (c->chain_fn != NULL) {
     result = c->chain_fn(c->chain_user, c, &cert, now);
@@ -796,43 +831,28 @@ static GTLS_Result on_certificate(GTLS_Conn * c, const unsigned char * msg,
     result = gtls_verify_chain(NULL, c, &cert, now);
   }
   if (result != GTLS_OK) {
-    return fail(c, result, alert_for_certificate(result));
+    return gtls_conn_fail(c, result, alert_for_certificate(result));
   }
   c->leaf = gcu_allocator_malloc(c->allocator, cert.der_len[0]);
   if (c->leaf == NULL) {
-    return fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
   }
   memcpy(c->leaf, cert.der[0], cert.der_len[0]);
   c->leaf_len = cert.der_len[0];
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_WAIT_CV;
   return GTLS_OK;
 }
 
-/** Schemes TLS 1.3 allows in a CertificateVerify: no PKCS#1, no SHA-1. */
-static int cv_scheme_ok(unsigned scheme) {
-  switch (scheme) {
-    case GCERT_SIG_RSA_PSS_SHA256:
-    case GCERT_SIG_RSA_PSS_SHA384:
-    case GCERT_SIG_RSA_PSS_SHA512:
-    case GCERT_SIG_ECDSA_P256_SHA256:
-    case GCERT_SIG_ECDSA_P384_SHA384:
-    case GCERT_SIG_ED25519:
-      return 1;
-    default:
-      return 0;
-  }
-}
-
 static GTLS_Result on_certificate_verify(GTLS_Conn * c,
     const unsigned char * msg, size_t msg_len) {
-  static const char label[] = "TLS 1.3, server CertificateVerify";
   GTLS_CertificateVerifyMsg cv;
   GCERT_X509 leaf;
-  unsigned char content[64 + sizeof label + GTLS_HASH_MAX];
+  unsigned char content[GTLS_CV_CONTENT_MAX];
+  unsigned char th[GTLS_HASH_MAX];
   size_t n = 0;
   size_t hlen = gtls_hash_len(gtls_suite_hash((uint32_t)c->suite));
   GTLS_Result result;
@@ -841,36 +861,31 @@ static GTLS_Result on_certificate_verify(GTLS_Conn * c,
   result = gtls_msg_parse_certificate_verify(msg + 4, msg_len - 4u, &c->limits,
       &cv);
   if (result != GTLS_OK) {
-    return fail_parse(c, result);
+    return gtls_conn_fail_parse(c, result);
   }
-  if (!cv_scheme_ok(cv.scheme) ||
+  if (!gtls_cv_scheme_ok(cv.scheme) ||
       !offered_u16(c, GTLS_EXT_SIGNATURE_ALGORITHMS, cv.scheme)) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
   if (gcert_x509_parse(c->leaf, c->leaf_len, &leaf) != GCERT_OK ||
       !gcert_key_scheme_fits((GCERT_SigScheme)cv.scheme, leaf.key)) {
-    return illegal(c);
+    return gtls_conn_illegal(c);
   }
-  /* RFC 8446 section 4.4.3: 64 spaces, a context string, a zero byte, and
-   * the transcript hash through Certificate. */
-  memset(content, 0x20, 64);
-  n = 64;
-  memcpy(content + n, label, sizeof label); /* includes the zero byte */
-  n += sizeof label;
+  /* RFC 8446 section 4.4.3: the transcript hash through Certificate. */
   result = gtls_transcript_snapshot(&c->sec.transcript,
-      gtls_suite_hash((uint32_t)c->suite), content + n);
+      gtls_suite_hash((uint32_t)c->suite), th);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  n += hlen;
+  n = gtls_cv_content(1, th, hlen, content);
   verdict = gcert_x509_verify_signature(&leaf, (GCERT_SigScheme)cv.scheme,
       content, n, cv.signature, cv.signature_len);
   if (verdict != GCERT_OK) {
-    return fail(c, GTLS_ERR_SIGNATURE, GTLS_ALERT_DECRYPT_ERROR);
+    return gtls_conn_fail(c, GTLS_ERR_SIGNATURE, GTLS_ALERT_DECRYPT_ERROR);
   }
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_WAIT_FIN;
   return GTLS_OK;
@@ -892,7 +907,7 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
   }
   if (result != GTLS_OK) {
     (void)gsec_wipe(th, sizeof th);
-    return fail(c, result, result == GTLS_ERR_FINISHED
+    return gtls_conn_fail(c, result, result == GTLS_ERR_FINISHED
         ? GTLS_ALERT_DECRYPT_ERROR : GTLS_ALERT_INTERNAL_ERROR);
   }
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
@@ -915,17 +930,17 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
     result = gtls_transcript_update(&c->sec.transcript, fin, 4u + hlen);
   }
   if (result == GTLS_OK) {
-    result = queue(c, GTLS_EPOCH_HANDSHAKE, fin, 4u + hlen);
+    result = gtls_conn_queue(c, GTLS_EPOCH_HANDSHAKE, fin, 4u + hlen);
     if (result != GTLS_OK) {
       (void)gsec_wipe(th, sizeof th);
       (void)gsec_wipe(verify, sizeof verify);
-      return result; /* queue() has already failed the connection */
+      return result; /* gtls_conn_queue() has already failed the connection */
     }
   }
   (void)gsec_wipe(th, sizeof th);
   (void)gsec_wipe(verify, sizeof verify);
   if (result != GTLS_OK) {
-    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_CONNECTED;
   return GTLS_OK;
@@ -937,19 +952,23 @@ static GTLS_Result on_post_handshake(GTLS_Conn * c, unsigned type,
   GTLS_Result result;
 
   if (type == GTLS_HS_KEY_UPDATE) {
-    /* Key update belongs to the record layer, which is not built. */
-    return fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNEXPECTED_MESSAGE);
+    if (c->mode == GTLS_MODE_STREAM) {
+      return gtls_conn_on_key_update(c, msg, msg_len);
+    }
+    /* A caller that carries the messages itself (QUIC, RFC 9001 section 6)
+     * has its own key update, and this one is not allowed. */
+    return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
-  if (type != GTLS_HS_NEW_SESSION_TICKET) {
-    return unexpected(c);
+  if (type != GTLS_HS_NEW_SESSION_TICKET || c->role != GTLS_ROLE_CLIENT) {
+    return gtls_conn_unexpected(c);
   }
   if (c->tickets >= c->limits.max_tickets) {
-    return fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
+    return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
   result = gtls_msg_parse_new_session_ticket(msg + 4, msg_len - 4u,
       &c->limits, &t);
   if (result != GTLS_OK) {
-    return fail_parse(c, result);
+    return gtls_conn_fail_parse(c, result);
   }
   /* Parsed, checked, and discarded: resumption is a later piece. */
   c->tickets++;
@@ -964,50 +983,55 @@ static GTLS_Result on_message(GTLS_Conn * c, const unsigned char * msg,
     case GTLS_STATE_WAIT_SH:
     case GTLS_STATE_WAIT_SH2:
       if (type != GTLS_HS_SERVER_HELLO) {
-        return unexpected(c);
+        return gtls_conn_unexpected(c);
       }
       return on_server_hello(c, msg, msg_len);
     case GTLS_STATE_WAIT_EE:
       if (type != GTLS_HS_ENCRYPTED_EXTENSIONS) {
-        return unexpected(c);
+        return gtls_conn_unexpected(c);
       }
       return on_encrypted_extensions(c, msg, msg_len);
     case GTLS_STATE_WAIT_CERT:
       if (type == GTLS_HS_CERTIFICATE_REQUEST) {
         /* Client authentication is a later piece. Better to say so than to
          * answer with an empty Certificate and be refused for it later. */
-        return fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_HANDSHAKE_FAILURE);
+        return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_HANDSHAKE_FAILURE);
       }
       if (type != GTLS_HS_CERTIFICATE) {
-        return unexpected(c);
+        return gtls_conn_unexpected(c);
       }
       return on_certificate(c, msg, msg_len, now);
     case GTLS_STATE_WAIT_CV:
       if (type != GTLS_HS_CERTIFICATE_VERIFY) {
-        return unexpected(c);
+        return gtls_conn_unexpected(c);
       }
       return on_certificate_verify(c, msg, msg_len);
     case GTLS_STATE_WAIT_FIN:
       if (type != GTLS_HS_FINISHED) {
-        return unexpected(c);
+        return gtls_conn_unexpected(c);
       }
       return on_finished(c, msg, msg_len);
     case GTLS_STATE_CONNECTED:
       return on_post_handshake(c, type, msg, msg_len);
+    case GTLS_STATE_S_WAIT_CH:
+    case GTLS_STATE_S_WAIT_CH2:
+    case GTLS_STATE_S_WAIT_FIN:
+      return gtls_server_on_message(c, msg, msg_len, now);
     case GTLS_STATE_NEW:
     case GTLS_STATE_FAILED:
     case GTLS_STATE_COUNT:
       break;
   }
-  return fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+  return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
 }
 
-static GTLS_Epoch expected_epoch(GTLS_State state) {
+GTLS_Epoch gtls_conn_expected_epoch(GTLS_State state) {
   switch (state) {
     case GTLS_STATE_WAIT_EE:
     case GTLS_STATE_WAIT_CERT:
     case GTLS_STATE_WAIT_CV:
     case GTLS_STATE_WAIT_FIN:
+    case GTLS_STATE_S_WAIT_FIN:
       return GTLS_EPOCH_HANDSHAKE;
     case GTLS_STATE_CONNECTED:
       return GTLS_EPOCH_APPLICATION;
@@ -1016,7 +1040,7 @@ static GTLS_Epoch expected_epoch(GTLS_State state) {
   }
 }
 
-GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
+static GTLS_Result conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     size_t len, int64_t unix_time) {
   const unsigned char * p = data;
 
@@ -1032,8 +1056,8 @@ GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
   if (len == 0) {
     return GTLS_OK;
   }
-  if (epoch != expected_epoch(c->state)) {
-    return unexpected(c);
+  if (epoch != gtls_conn_expected_epoch(c->state)) {
+    return gtls_conn_unexpected(c);
   }
   while (len > 0) {
     size_t body = 0;
@@ -1050,7 +1074,7 @@ GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     take = len < need ? len : need;
     result = gtls_buf_append(&c->in, p, take);
     if (result != GTLS_OK) {
-      return fail_parse(c, result);
+      return gtls_conn_fail_parse(c, result);
     }
     p += take;
     len -= take;
@@ -1059,8 +1083,10 @@ GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     }
     body = ((size_t)c->in.data[1] << 16) | ((size_t)c->in.data[2] << 8) |
         c->in.data[3];
-    if (body > c->limits.max_handshake_message) {
-      return fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR);
+    if (body > c->limits.max_handshake_message ||
+        ((c->state == GTLS_STATE_S_WAIT_CH || c->state == GTLS_STATE_S_WAIT_CH2) &&
+            body > c->limits.max_client_hello)) {
+      return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR);
     }
     if (c->in.len < 4u + body) {
       continue;
@@ -1069,7 +1095,7 @@ GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     if (c->state != GTLS_STATE_CONNECTED) {
       c->hs_total += c->in.len;
       if (c->hs_total > c->limits.max_handshake_total) {
-        return fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR);
+        return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR);
       }
     }
     before = c->state;
@@ -1081,19 +1107,39 @@ GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     /* A message that moves the keys on, or that ends the first flight,
      * must be the last of its epoch (RFC 8446 section 5.1 and RFC 9001
      * section 4.1.4). */
-    if (len > 0 && (expected_epoch(c->state) != expected_epoch(before) ||
-        before == GTLS_STATE_WAIT_SH || before == GTLS_STATE_WAIT_SH2)) {
-      return unexpected(c);
+    if (len > 0 && (gtls_conn_expected_epoch(c->state) != gtls_conn_expected_epoch(before) ||
+        before == GTLS_STATE_WAIT_SH || before == GTLS_STATE_WAIT_SH2 ||
+        before == GTLS_STATE_S_WAIT_CH || before == GTLS_STATE_S_WAIT_CH2)) {
+      return gtls_conn_unexpected(c);
     }
   }
   return GTLS_OK;
+}
+
+/** A feed that is not part of the stream interface: the one the callers of the message interface make. */
+GTLS_Result gtls_conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
+    size_t len, int64_t unix_time) {
+  if (c != NULL && c->mode == GTLS_MODE_STREAM) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c != NULL && c->mode == GTLS_MODE_NONE) {
+    c->mode = GTLS_MODE_MESSAGE;
+  }
+  return conn_feed(c, epoch, data, len, unix_time);
+}
+
+/** The stream layer's way in: the same state machine, for a connection in stream mode. */
+GTLS_Result gtls_conn_feed_stream(GTLS_Conn * c, GTLS_Epoch epoch,
+    const void * data, size_t len, int64_t unix_time) {
+  return conn_feed(c, epoch, data, len, unix_time);
 }
 
 /* ---------------------------------------------------------------- accessors */
 
 GTLS_Result gtls_conn_pending_output(const GTLS_Conn * c, GTLS_Epoch epoch,
     const unsigned char ** data, size_t * len) {
-  if (c == NULL || data == NULL || len == NULL || (unsigned)epoch >= GTLS_EPOCH_COUNT) {
+  if (c == NULL || data == NULL || len == NULL || (unsigned)epoch >= GTLS_EPOCH_COUNT ||
+      c->mode == GTLS_MODE_STREAM) {
     return GTLS_ERR_INVALID;
   }
   *data = c->out[epoch].data;
@@ -1104,8 +1150,11 @@ GTLS_Result gtls_conn_pending_output(const GTLS_Conn * c, GTLS_Epoch epoch,
 GTLS_Result gtls_conn_consume_output(GTLS_Conn * c, GTLS_Epoch epoch,
     size_t n) {
   if (c == NULL || (unsigned)epoch >= GTLS_EPOCH_COUNT ||
-      n > c->out[epoch].len) {
+      n > c->out[epoch].len || c->mode == GTLS_MODE_STREAM) {
     return GTLS_ERR_INVALID;
+  }
+  if (c->mode == GTLS_MODE_NONE) {
+    c->mode = GTLS_MODE_MESSAGE;
   }
   gtls_buf_consume(&c->out[epoch], n);
   return GTLS_OK;
@@ -1147,12 +1196,14 @@ GTLS_Result gtls_conn_secret(const GTLS_Conn * c, GTLS_Epoch epoch,
   if (epoch == GTLS_EPOCH_EARLY) {
     return GTLS_ERR_UNSUPPORTED;
   }
+  /* The direction is the local one: a client writes with the client's
+   * secret and a server with the server's. */
   if (epoch == GTLS_EPOCH_HANDSHAKE && c->sec.schedule.stage >= 2) {
-    secret = direction == GTLS_DIR_WRITE ? c->sec.schedule.c_hs
-                                         : c->sec.schedule.s_hs;
+    secret = (direction == GTLS_DIR_WRITE) == (c->role == GTLS_ROLE_CLIENT)
+        ? c->sec.schedule.c_hs : c->sec.schedule.s_hs;
   } else if (epoch == GTLS_EPOCH_APPLICATION && c->sec.schedule.stage >= 3) {
-    secret = direction == GTLS_DIR_WRITE ? c->sec.schedule.c_ap
-                                         : c->sec.schedule.s_ap;
+    secret = (direction == GTLS_DIR_WRITE) == (c->role == GTLS_ROLE_CLIENT)
+        ? c->sec.schedule.c_ap : c->sec.schedule.s_ap;
   } else {
     return GTLS_ERR_INVALID;
   }
@@ -1165,14 +1216,27 @@ GTLS_Result gtls_conn_secret(const GTLS_Conn * c, GTLS_Epoch epoch,
   return GTLS_OK;
 }
 
+/** 1 once the suite and group are settled: ServerHello accepted, or sent. */
+static int negotiated(const GTLS_Conn * c) {
+  switch (c->state) {
+    case GTLS_STATE_WAIT_EE:
+    case GTLS_STATE_WAIT_CERT:
+    case GTLS_STATE_WAIT_CV:
+    case GTLS_STATE_WAIT_FIN:
+    case GTLS_STATE_CONNECTED:
+    case GTLS_STATE_S_WAIT_FIN:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
 GTLS_Suite gtls_conn_suite(const GTLS_Conn * c) {
-  return c != NULL && c->state >= GTLS_STATE_WAIT_EE && c->state != GTLS_STATE_FAILED
-      ? c->suite : GTLS_SUITE_NONE;
+  return c != NULL && negotiated(c) ? c->suite : GTLS_SUITE_NONE;
 }
 
 GTLS_Group gtls_conn_group(const GTLS_Conn * c) {
-  return c != NULL && c->state >= GTLS_STATE_WAIT_EE && c->state != GTLS_STATE_FAILED
-      ? c->group : GTLS_GROUP_NONE;
+  return c != NULL && negotiated(c) ? c->group : GTLS_GROUP_NONE;
 }
 
 GTLS_Result gtls_conn_alpn(const GTLS_Conn * c, const unsigned char ** protocol,

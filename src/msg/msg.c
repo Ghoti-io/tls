@@ -446,6 +446,8 @@ GTLS_Result gtls_msg_parse_client_hello(const void * body, size_t len,
   }
   if (result == GTLS_OK) {
     result = n == 0 ? GTLS_ERR_CORRUPT : gtls_reader_bytes(&r, n, &p);
+    h.compression = p;
+    h.compression_len = n;
   }
   if (result != GTLS_OK) {
     return result;
@@ -849,5 +851,426 @@ GTLS_Result gtls_msg_parse_new_session_ticket(const void * body, size_t len,
     }
   }
   *out = t;
+  return GTLS_OK;
+}
+
+/* ------------------------------------------- ClientHello, as a server reads it */
+
+GTLS_Result gtls_msg_parse_ch_versions(const GTLS_Ext * e, int * has_tls13) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  int found = 0;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 1, 2, 254, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result == GTLS_OK && (list.len & 1u) != 0) {
+    result = GTLS_ERR_CORRUPT;
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    unsigned v = 0;
+
+    (void)gtls_reader_u16(&list, &v);
+    if (v == 0x0304u) {
+      found = 1;
+    }
+  }
+  *has_tls13 = found;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_u16_list(const GTLS_Ext * e, uint16_t * out,
+    size_t cap, size_t * count) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  size_t n = 0;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 2, 0, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result == GTLS_OK && (list.len & 1u) != 0) {
+    result = GTLS_ERR_CORRUPT;
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  if (list.len / 2u > GTLS_CH_LIST_MAX) {
+    return GTLS_ERR_LIMIT;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    unsigned v = 0;
+
+    (void)gtls_reader_u16(&list, &v);
+    if (n < cap) {
+      out[n] = (uint16_t)v;
+    }
+    n++;
+  }
+  *count = n < cap ? n : cap;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_key_shares(const GTLS_Ext * e,
+    GTLS_ClientShare * out, size_t * count) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  size_t n = 0;
+  size_t i;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 0, 0, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    unsigned group = 0;
+    GTLS_Reader kx;
+
+    result = gtls_reader_u16(&list, &group);
+    if (result == GTLS_OK) {
+      result = gtls_reader_vector(&list, 2, 1, 0, &kx);
+    }
+    if (result != GTLS_OK) {
+      return result;
+    }
+    if (n >= GTLS_CH_SHARES_MAX) {
+      return GTLS_ERR_LIMIT;
+    }
+    for (i = 0; i < n; i++) {
+      if (out[i].group == group) {
+        return GTLS_ERR_PROTOCOL;
+      }
+    }
+    out[n].group = group;
+    out[n].kx = kx.p;
+    out[n].kx_len = kx.len;
+    n++;
+  }
+  *count = n;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_alpn(const GTLS_Ext * e, GTLS_Name * out,
+    size_t * count) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  size_t n = 0;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 2, 0, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    GTLS_Reader name;
+
+    result = gtls_reader_vector(&list, 1, 1, 0, &name);
+    if (result != GTLS_OK) {
+      return result;
+    }
+    if (n >= GTLS_CH_NAMES_MAX) {
+      return GTLS_ERR_LIMIT;
+    }
+    out[n].p = name.p;
+    out[n].len = name.len;
+    n++;
+  }
+  *count = n;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_server_name(const GTLS_Ext * e, GTLS_Name * host) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  int seen = 0;
+
+  host->p = NULL;
+  host->len = 0;
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 1, 0, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    unsigned type = 0;
+    GTLS_Reader name;
+
+    result = gtls_reader_u8(&list, &type);
+    if (result == GTLS_OK) {
+      result = gtls_reader_vector(&list, 2, 1, 0, &name);
+    }
+    if (result != GTLS_OK) {
+      return result;
+    }
+    if (type == 0) {
+      if (seen) {
+        return GTLS_ERR_PROTOCOL;
+      }
+      seen = 1;
+      host->p = name.p;
+      host->len = name.len;
+    }
+  }
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_cookie(const GTLS_Ext * e, GTLS_Name * cookie) {
+  GTLS_Reader r;
+  GTLS_Reader v;
+  GTLS_Result result;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 1, 0, &v);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  cookie->p = v.p;
+  cookie->len = v.len;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke) {
+  GTLS_Reader r;
+  GTLS_Reader list;
+  GTLS_Result result;
+  int found = 0;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 1, 1, 0, &list);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&list) != 0) {
+    unsigned m = 0;
+
+    (void)gtls_reader_u8(&list, &m);
+    if (m == 1u) {
+      found = 1;
+    }
+  }
+  *has_dhe_ke = found;
+  return GTLS_OK;
+}
+
+/* ----------------------------------------------------- what a server sends */
+
+/** Open a handshake message: the type, and a length written by finish_message. */
+static void begin_message(GTLS_Buf * b, unsigned type) {
+  gtls_buf_u8(b, type);
+  gtls_buf_u24(b, 0);
+}
+
+static GTLS_Result finish_message(GTLS_Buf * b, size_t start) {
+  if (b->err == GTLS_OK) {
+    size_t body = b->len - start - 4u;
+
+    if (body > 0xffffffu) {
+      b->err = GTLS_ERR_LIMIT;
+    } else {
+      b->data[start + 1u] = (unsigned char)(body >> 16);
+      b->data[start + 2u] = (unsigned char)(body >> 8);
+      b->data[start + 3u] = (unsigned char)body;
+    }
+  }
+  return b->err;
+}
+
+GTLS_Result gtls_msg_build_server_hello(const GTLS_ServerHelloParams * p,
+    GTLS_Buf * out) {
+  size_t start;
+  size_t ext_at;
+  size_t at;
+
+  if (p == NULL || out == NULL || (p->session_id == NULL && p->session_id_len != 0) ||
+      p->session_id_len > 32u || (p->cookie == NULL && p->cookie_len != 0) ||
+      (!p->is_hrr && (p->key_exchange == NULL || p->key_exchange_len == 0))) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_SERVER_HELLO);
+  gtls_buf_u16(out, 0x0303);
+  if (p->is_hrr) {
+    (void)gtls_buf_append(out, hrr_random, sizeof hrr_random);
+  } else {
+    (void)gtls_buf_append(out, p->random, 32);
+  }
+  gtls_buf_u8(out, (unsigned)p->session_id_len);
+  (void)gtls_buf_append(out, p->session_id, p->session_id_len);
+  gtls_buf_u16(out, p->suite);
+  gtls_buf_u8(out, 0);
+  ext_at = gtls_buf_begin(out, 2);
+  if (p->group != 0) {
+    ext_begin(out, GTLS_EXT_KEY_SHARE, &at);
+    gtls_buf_u16(out, p->group);
+    if (!p->is_hrr) {
+      gtls_buf_u16(out, (unsigned)p->key_exchange_len);
+      (void)gtls_buf_append(out, p->key_exchange, p->key_exchange_len);
+    }
+    gtls_buf_end(out, at, 2);
+  }
+  if (p->cookie_len != 0) {
+    ext_begin(out, GTLS_EXT_COOKIE, &at);
+    gtls_buf_u16(out, (unsigned)p->cookie_len);
+    (void)gtls_buf_append(out, p->cookie, p->cookie_len);
+    gtls_buf_end(out, at, 2);
+  }
+  ext_begin(out, GTLS_EXT_SUPPORTED_VERSIONS, &at);
+  gtls_buf_u16(out, 0x0304);
+  gtls_buf_end(out, at, 2);
+  gtls_buf_end(out, ext_at, 2);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_encrypted_extensions(const GTLS_EeParams * p,
+    GTLS_Buf * out) {
+  size_t start;
+  size_t ext_at;
+  size_t at;
+  size_t list;
+
+  if (p == NULL || out == NULL || (p->prefix == NULL && p->prefix_len != 0) ||
+      (p->alpn == NULL && p->alpn_len != 0) || p->alpn_len > 255u) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_ENCRYPTED_EXTENSIONS);
+  ext_at = gtls_buf_begin(out, 2);
+  (void)gtls_buf_append(out, p->prefix, p->prefix_len);
+  if (p->ack_server_name) {
+    ext_begin(out, GTLS_EXT_SERVER_NAME, &at);
+    gtls_buf_end(out, at, 2);
+  }
+  if (p->alpn_len != 0) {
+    ext_begin(out, GTLS_EXT_ALPN, &at);
+    list = gtls_buf_begin(out, 2);
+    gtls_buf_u8(out, (unsigned)p->alpn_len);
+    (void)gtls_buf_append(out, p->alpn, p->alpn_len);
+    gtls_buf_end(out, list, 2);
+    gtls_buf_end(out, at, 2);
+  }
+  gtls_buf_end(out, ext_at, 2);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_certificate(const unsigned char * const * der,
+    const size_t * der_len, size_t count, GTLS_Buf * out) {
+  size_t start;
+  size_t list;
+  size_t i;
+
+  if (der == NULL || der_len == NULL || out == NULL || count == 0) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_CERTIFICATE);
+  gtls_buf_u8(out, 0); /* certificate_request_context: empty for a server */
+  list = gtls_buf_begin(out, 3);
+  for (i = 0; i < count; i++) {
+    if (der[i] == NULL || der_len[i] == 0 || der_len[i] > 0xffffffu) {
+      return GTLS_ERR_INVALID;
+    }
+    gtls_buf_u24(out, (unsigned)der_len[i]);
+    (void)gtls_buf_append(out, der[i], der_len[i]);
+    gtls_buf_u16(out, 0); /* no entry extensions */
+  }
+  gtls_buf_end(out, list, 3);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_certificate_verify(unsigned scheme,
+    const void * signature, size_t signature_len, GTLS_Buf * out) {
+  size_t start;
+
+  if (signature == NULL || signature_len == 0 || signature_len > 0xffffu ||
+      out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_CERTIFICATE_VERIFY);
+  gtls_buf_u16(out, scheme);
+  gtls_buf_u16(out, (unsigned)signature_len);
+  (void)gtls_buf_append(out, signature, signature_len);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_finished(const void * verify_data, size_t len,
+    GTLS_Buf * out) {
+  size_t start;
+
+  if (verify_data == NULL || len == 0 || len > GTLS_HASH_MAX || out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_FINISHED);
+  (void)gtls_buf_append(out, verify_data, len);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_key_update(unsigned request, GTLS_Buf * out) {
+  size_t start;
+
+  if (request > 1u || out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_KEY_UPDATE);
+  gtls_buf_u8(out, request);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_parse_key_update(const void * body, size_t len,
+    unsigned * request) {
+  GTLS_Reader r;
+  unsigned v = 0;
+  GTLS_Result result;
+
+  gtls_reader_init(&r, body, len);
+  result = gtls_reader_u8(&r, &v);
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  if (v > 1u) {
+    return GTLS_ERR_PROTOCOL;
+  }
+  *request = v;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_finished(const void * body, size_t len,
+    size_t hash_len, const unsigned char ** verify_data) {
+  if (hash_len == 0 || len != hash_len || body == NULL) {
+    return GTLS_ERR_CORRUPT;
+  }
+  *verify_data = body;
   return GTLS_OK;
 }

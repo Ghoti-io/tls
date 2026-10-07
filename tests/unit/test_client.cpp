@@ -50,7 +50,8 @@ TEST(Context, WhatIsNotBuiltIsRefusedNotIgnored) {
   gtls_context_config_default(&c);
   c.trust = trust.store;
   c.role = GTLS_ROLE_SERVER;
-  EXPECT_EQ(gtls_context_new(nullptr, &c, &ctx), GTLS_ERR_UNSUPPORTED);
+  EXPECT_EQ(gtls_context_new(nullptr, &c, &ctx), GTLS_ERR_INVALID)
+      << "the server role is built; one with no identity has nothing to present";
   gtls_context_config_default(&c);
   c.trust = trust.store;
   c.versions = GTLS_VERSION_TLS13 | GTLS_VERSION_TLS12;

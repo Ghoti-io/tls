@@ -169,6 +169,8 @@ typedef struct GTLS_ClientHello {
   size_t session_id_len;
   const unsigned char * suites;     /* 2 bytes each */
   size_t suites_len;
+  const unsigned char * compression; /* legacy_compression_methods */
+  size_t compression_len;
   size_t prefix_len;                /* body bytes before the extension block */
   GTLS_Ext exts[GTLS_EXT_MAX];
   size_t ext_count;
@@ -304,5 +306,135 @@ typedef struct GTLS_NewSessionTicket {
 
 GTLS_Result gtls_msg_parse_new_session_ticket(const void * body, size_t len,
     const GTLS_Limits * limits, GTLS_NewSessionTicket * out);
+
+/* ------------------------------------------- ClientHello, as a server reads it */
+
+/** Most entries read out of one list in a ClientHello extension; more is ::GTLS_ERR_LIMIT. */
+#define GTLS_CH_LIST_MAX 128u
+/** Most key shares read out of one ClientHello. */
+#define GTLS_CH_SHARES_MAX 16u
+/** Most ALPN protocol names read out of one ClientHello. */
+#define GTLS_CH_NAMES_MAX 64u
+
+/** One protocol name or host name, a view into the message. */
+typedef struct GTLS_Name {
+  const unsigned char * p;
+  size_t len;
+} GTLS_Name;
+
+/** One entry of a client's key_share extension, a view into the message. */
+typedef struct GTLS_ClientShare {
+  unsigned group;
+  const unsigned char * kx;
+  size_t kx_len;
+} GTLS_ClientShare;
+
+/**
+ * supported_versions in a ClientHello (RFC 8446 section 4.2.1): a one-byte
+ * length of 2 to 254 and then 16-bit versions. @p has_tls13 is set when
+ * 0x0304 is among them. Odd lengths, empty lists and trailing bytes are
+ * ::GTLS_ERR_CORRUPT.
+ */
+GTLS_Result gtls_msg_parse_ch_versions(const GTLS_Ext * e, int * has_tls13);
+
+/**
+ * A u16-length-prefixed list of 16-bit values: supported_groups (section
+ * 4.2.7) or signature_algorithms (section 4.2.3). At most @p cap values are
+ * stored; more than ::GTLS_CH_LIST_MAX is ::GTLS_ERR_LIMIT, an odd length or
+ * an empty list ::GTLS_ERR_CORRUPT.
+ */
+GTLS_Result gtls_msg_parse_ch_u16_list(const GTLS_Ext * e, uint16_t * out,
+    size_t cap, size_t * count);
+
+/**
+ * key_share in a ClientHello (section 4.2.8): a list of (group, key
+ * exchange). More than ::GTLS_CH_SHARES_MAX entries is ::GTLS_ERR_LIMIT; two
+ * for one group is ::GTLS_ERR_PROTOCOL (illegal_parameter). The list may be
+ * empty: the client is then asking for a HelloRetryRequest.
+ */
+GTLS_Result gtls_msg_parse_ch_key_shares(const GTLS_Ext * e,
+    GTLS_ClientShare * out, size_t * count);
+
+/**
+ * ALPN in a ClientHello (RFC 7301): a list of one-byte-length names, each
+ * 1 to 255 bytes. More than ::GTLS_CH_NAMES_MAX is ::GTLS_ERR_LIMIT; an empty
+ * list or an empty name is ::GTLS_ERR_CORRUPT.
+ */
+GTLS_Result gtls_msg_parse_ch_alpn(const GTLS_Ext * e, GTLS_Name * out,
+    size_t * count);
+
+/**
+ * server_name in a ClientHello (RFC 6066 section 3): the first host_name
+ * entry, or none when the list carries only other types. A second host_name
+ * is ::GTLS_ERR_PROTOCOL (the RFC allows one of each type). @p host is empty
+ * (length 0) when there is no host_name. An empty host name is
+ * ::GTLS_ERR_CORRUPT.
+ */
+GTLS_Result gtls_msg_parse_ch_server_name(const GTLS_Ext * e, GTLS_Name * host);
+
+/** cookie (section 4.2.2): a u16-length-prefixed opaque of 1 to 65535 bytes. */
+GTLS_Result gtls_msg_parse_ch_cookie(const GTLS_Ext * e, GTLS_Name * cookie);
+
+/**
+ * psk_key_exchange_modes (section 4.2.9): a one-byte-length list of 1 to 255
+ * one-byte modes. @p has_dhe_ke is set when psk_dhe_ke (1) is in it.
+ */
+GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke);
+
+/* ----------------------------------------------- what a server sends */
+
+/** Everything a ServerHello or a HelloRetryRequest is built from. */
+typedef struct GTLS_ServerHelloParams {
+  int is_hrr;                       /* build a HelloRetryRequest */
+  unsigned char random[32];         /* ignored for an HRR, which has a fixed one */
+  const unsigned char * session_id; /* echoed from the ClientHello */
+  size_t session_id_len;
+  unsigned suite;
+  unsigned group;                   /* the key_share group */
+  const unsigned char * key_exchange; /* the server's share; unused in an HRR */
+  size_t key_exchange_len;
+  const unsigned char * cookie;     /* HRR only; NULL for none */
+  size_t cookie_len;
+} GTLS_ServerHelloParams;
+
+/** Build a whole ServerHello or HelloRetryRequest, header included. */
+GTLS_Result gtls_msg_build_server_hello(const GTLS_ServerHelloParams * params,
+    GTLS_Buf * out);
+
+/** What an EncryptedExtensions message carries. */
+typedef struct GTLS_EeParams {
+  const unsigned char * prefix;     /* whole extensions to put first (test seam); NULL for none */
+  size_t prefix_len;
+  int ack_server_name;              /* an empty server_name extension */
+  const unsigned char * alpn;       /* the one protocol chosen; NULL for none */
+  size_t alpn_len;
+} GTLS_EeParams;
+
+GTLS_Result gtls_msg_build_encrypted_extensions(const GTLS_EeParams * params,
+    GTLS_Buf * out);
+
+/** A Certificate with an empty request context and no entry extensions. */
+GTLS_Result gtls_msg_build_certificate(const unsigned char * const * der,
+    const size_t * der_len, size_t count, GTLS_Buf * out);
+
+GTLS_Result gtls_msg_build_certificate_verify(unsigned scheme,
+    const void * signature, size_t signature_len, GTLS_Buf * out);
+
+GTLS_Result gtls_msg_build_finished(const void * verify_data, size_t len,
+    GTLS_Buf * out);
+
+/** KeyUpdate (section 4.6.3): @p request is 0 or 1. */
+GTLS_Result gtls_msg_build_key_update(unsigned request, GTLS_Buf * out);
+
+/** Parse a KeyUpdate body: one byte, 0 or 1, else ::GTLS_ERR_PROTOCOL; wrong length ::GTLS_ERR_CORRUPT. */
+GTLS_Result gtls_msg_parse_key_update(const void * body, size_t len,
+    unsigned * request);
+
+/**
+ * Parse a Finished body: exactly @p hash_len bytes of verify_data, else
+ * ::GTLS_ERR_CORRUPT (the peer sent the wrong length: decode_error).
+ */
+GTLS_Result gtls_msg_parse_finished(const void * body, size_t len,
+    size_t hash_len, const unsigned char ** verify_data);
 
 #endif /* GHOTI_IO_GTLS_SRC_MSG_MSG_INTERNAL_H */

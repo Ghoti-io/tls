@@ -21,25 +21,32 @@
 /**
  * @file conn.h
  *
- * One TLS 1.3 handshake, as a state machine over buffers.
+ * One TLS 1.3 connection, as a state machine over buffers.
  *
- * **Handshake messages in, handshake messages out, never records.** The
- * caller owns the socket, the timers and the record layer (or QUIC's CRYPTO
- * frames). Bytes of handshake messages go in with ::gtls_conn_feed, tagged
- * with the epoch they arrived at; bytes to send come out of
- * ::gtls_conn_pending_output, tagged with the epoch they must be protected
- * at; and ::gtls_conn_secret hands out the traffic secrets by epoch. That is
- * the whole interface RFC 9001 section 4 asks of a TLS stack.
+ * **This file is the message interface: handshake messages in, handshake
+ * messages out, never records.** The caller owns the socket, the timers and
+ * the record layer (or QUIC's CRYPTO frames). Bytes of handshake messages go
+ * in with ::gtls_conn_feed, tagged with the epoch they arrived at; bytes to
+ * send come out of ::gtls_conn_pending_output, tagged with the epoch they
+ * must be protected at; and ::gtls_conn_secret hands out the traffic secrets
+ * by epoch. That is the whole interface RFC 9001 section 4 asks of a TLS
+ * stack. A caller that carries a byte stream (TLS over TCP) uses record.h
+ * instead: the same connection, driven through the other interface, and the
+ * first call decides which.
  *
  * A message may arrive in any number of pieces, down to one byte at a time,
  * but it may not span a change of epoch (RFC 8446 section 5.1 says the same
- * of a key change), and nothing may follow ServerHello within its epoch. Both
- * are protocol errors.
+ * of a key change), and nothing may follow ServerHello (or, for a server, a
+ * ClientHello) within its epoch. Both are protocol errors.
  *
- * The client authenticates the server and itself stays anonymous. The chain
- * and the name are checked by `certificate`; there is no mode that skips
- * either. A refusal is a specific ::GTLS_Result, an alert for the caller to
- * send, and a connection whose secrets have been wiped.
+ * Either role. A client (::gtls_conn_new) authenticates the server and
+ * itself stays anonymous; the chain and the name are checked by `certificate`
+ * and there is no mode that skips either. A server (::gtls_conn_new_server)
+ * presents one of its context's identities, chosen by the client's
+ * server_name, selects ALPN, and answers a ClientHello that needs it with a
+ * HelloRetryRequest; it never asks for a client certificate. A refusal is a
+ * specific ::GTLS_Result, an alert for the caller to send, and a connection
+ * whose secrets have been wiped.
  */
 
 #ifndef GHOTI_IO_GTLS_CONN_H
@@ -95,13 +102,28 @@ typedef struct GTLS_Conn GTLS_Conn;
 GTLS_API GTLS_Result gtls_conn_new(const GTLS_Context * context,
     const char * host, size_t host_len, GTLS_Conn ** out);
 
+/**
+ * @brief Make a connection for accepting.
+ *
+ * @param context A server context (::GTLS_ROLE_SERVER). Outlives the
+ *   connection. Not NULL.
+ * @param out Receives the connection. Not NULL; written only on success.
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID (not a server context), or
+ *   ::GTLS_ERR_OOM.
+ */
+GTLS_API GTLS_Result gtls_conn_new_server(const GTLS_Context * context,
+    GTLS_Conn ** out);
+
 /** @brief Wipe and free a connection. NULL is allowed. */
 GTLS_API void gtls_conn_free(GTLS_Conn * conn);
 
 /**
- * @brief Build the ClientHello and queue it at ::GTLS_EPOCH_INITIAL.
+ * @brief Begin the handshake.
  *
- * Draws the random and the ephemeral key from the kernel generator.
+ * A client builds the ClientHello and queues it at ::GTLS_EPOCH_INITIAL,
+ * drawing the random and the ephemeral key from the kernel generator. A
+ * server has nothing to send first: it arms the connection to accept a
+ * ClientHello, and does no drawing.
  *
  * @return ::GTLS_OK; ::GTLS_ERR_INVALID if already started;
  *   ::GTLS_ERR_FAILED if the connection has already failed;
@@ -176,10 +198,13 @@ GTLS_API unsigned gtls_conn_alert(const GTLS_Conn * conn);
 /**
  * @brief A traffic secret.
  *
- * The handshake secrets exist once ServerHello has been accepted, and the
- * application secrets once the server's Finished has verified. Asking for
- * one earlier is ::GTLS_ERR_INVALID, and a failed connection answers
- * ::GTLS_ERR_FAILED: no secret outlives the failure that wiped it.
+ * The handshake secrets exist once ServerHello has been accepted (a client)
+ * or built (a server), and the application secrets once the server's Finished
+ * has verified (a client) or been built (a server). Asking for one earlier is
+ * ::GTLS_ERR_INVALID, and a failed connection answers ::GTLS_ERR_FAILED: no
+ * secret outlives the failure that wiped it. They are the epoch's own secrets
+ * and stay what they were after a key update: that is the stream interface's
+ * to track.
  *
  * @param epoch ::GTLS_EPOCH_HANDSHAKE or ::GTLS_EPOCH_APPLICATION.
  *   ::GTLS_EPOCH_EARLY is ::GTLS_ERR_UNSUPPORTED.
@@ -219,11 +244,34 @@ GTLS_API GTLS_Result gtls_conn_alpn(const GTLS_Conn * conn,
 GTLS_API GTLS_Result gtls_conn_server_name_acknowledged(const GTLS_Conn * conn,
     int * out);
 
-/** @brief 1 when a HelloRetryRequest was answered. */
+/**
+ * @brief The host_name the client sent in server_name (server role).
+ *
+ * @param name Receives a pointer into the connection, valid until it is
+ *   freed; NULL with @p len 0 when the client sent none, or no ClientHello
+ *   has been read.
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID (a client connection, or a NULL
+ *   argument), or ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_server_name(const GTLS_Conn * conn,
+    const unsigned char ** name, size_t * len);
+
+/**
+ * @brief Which of the context's identities the server chose (server role).
+ *
+ * @param index Receives the index into the list the context was made from.
+ * @return ::GTLS_OK; ::GTLS_ERR_INVALID before the ClientHello has been
+ *   accepted, for a client connection, or a NULL argument; ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_identity(const GTLS_Conn * conn, size_t * index);
+
+/** @brief 1 when a HelloRetryRequest was answered, or sent. */
 GTLS_API int gtls_conn_retried(const GTLS_Conn * conn);
 
 /**
  * @brief The server's end-entity certificate, once the handshake has completed.
+ * A server has none to show: it never asks for the client's, so this is NULL
+ * with a length of 0.
  *
  * Before that, though the chain may already have been accepted, it is NULL:
  * the certificate is trusted only after CertificateVerify and Finished. A

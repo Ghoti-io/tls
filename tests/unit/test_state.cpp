@@ -17,9 +17,11 @@ using namespace gtlstest;
 
 namespace {
 
+/* The client's half of the table; test_server.cpp has the server's. */
 const GTLS_State kAll[] = {GTLS_STATE_NEW, GTLS_STATE_WAIT_SH, GTLS_STATE_WAIT_SH2,
     GTLS_STATE_WAIT_EE, GTLS_STATE_WAIT_CERT, GTLS_STATE_WAIT_CV, GTLS_STATE_WAIT_FIN,
     GTLS_STATE_CONNECTED, GTLS_STATE_FAILED};
+const size_t kServerOnly = 3; /* S_WAIT_CH, S_WAIT_CH2, S_WAIT_FIN */
 
 const char * name(GTLS_State s) {
   switch (s) {
@@ -106,7 +108,7 @@ unsigned wanted_type(GTLS_State s) {
 }  // namespace
 
 TEST(StateTable, EveryStateIsReachedAndTheTableHasNoOthers) {
-  EXPECT_EQ(sizeof kAll / sizeof *kAll, static_cast<size_t>(GTLS_STATE_COUNT));
+  EXPECT_EQ(sizeof kAll / sizeof *kAll + kServerOnly, static_cast<size_t>(GTLS_STATE_COUNT));
   std::set<GTLS_State> visited;
   for (GTLS_State target : kAll) {
     if (target == GTLS_STATE_FAILED) {
@@ -119,7 +121,7 @@ TEST(StateTable, EveryStateIsReachedAndTheTableHasNoOthers) {
     EXPECT_EQ(gtls_conn_state(d.w.conn), target) << name(target);
     visited.insert(gtls_conn_state(d.w.conn));
   }
-  EXPECT_EQ(visited.size(), static_cast<size_t>(GTLS_STATE_COUNT));
+  EXPECT_EQ(visited.size(), static_cast<size_t>(GTLS_STATE_COUNT) - kServerOnly);
 }
 
 TEST(StateTable, EveryMessageTypeInEveryWaitingState) {

@@ -887,8 +887,12 @@ endef
 
 $(eval $(call fuzz-rule,fuzz_msg,msg))
 $(eval $(call fuzz-rule,fuzz_client,client))
+$(eval $(call fuzz-rule,fuzz_server,server))
+$(eval $(call fuzz-rule,fuzz_record,record))
+$(eval $(call fuzz-rule,fuzz_pump,pump))
+$(eval $(call fuzz-rule,fuzz_stream,stream))
 
-FUZZERS := client msg
+FUZZERS := client msg server record pump stream
 
 fuzz: $(addprefix fuzz-run-,$(FUZZERS)) ## Build and run every fuzzer
 
