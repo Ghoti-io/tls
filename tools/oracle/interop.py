@@ -57,8 +57,8 @@ IMAGE = os.environ.get("GHOTI_TLS_ORACLE_IMAGE",
                        "localhost/ghoti-certificate-oracle-openssl:3.5.7")
 PIN = "OpenSSL 3.5.7"
 CASE_TIMEOUT = 40
-POPULATION_FLOOR = 64   # cases a full run must have run
-PASS_FLOOR = 54          # and how many of them must have interoperated
+POPULATION_FLOOR = 67   # cases a full run must have run
+PASS_FLOOR = 57          # and how many of them must have interoperated
 
 KINDS = {
     "ed": "ed.example.com",
@@ -93,7 +93,7 @@ class Case:
                  server_name=None, expect="ok", refusal=None, declared=None,
                  no_anchor=False, theirs_sigalgs=None, ours_sigalgs=None,
                  our_alert=None, peer_alert=None, theirs_extra=(), ours_extra=(),
-                 theirs_has=(), identities=None):
+                 theirs_has=(), identities=None, resume=None, theirs_lacks=()):
         self.role = role              # "client": our client, their s_server; "server": the reverse
         self.name = "%s/%s" % (role, name)
         self.kind = kind
@@ -123,6 +123,12 @@ class Case:
         self.ours_extra = list(ours_extra)
         self.theirs_has = list(theirs_has)     # text the peer's output must contain
         self.identities = identities           # kinds this library's server holds, default first
+        # "ticket": s_client offers a session ticket a first connection to
+        # an OpenSSL s_server gave it (-sess_in); "early": and early data too
+        # (-early_data). This library's server issues no tickets and accepts
+        # no early data, so it must answer with a full handshake.
+        self.resume = resume
+        self.theirs_lacks = list(theirs_lacks)  # text the peer's output must not contain
 
 
 def population():
@@ -185,6 +191,23 @@ def population():
                       identities=["ed", "rsa"]))
     cases.append(Case("client", "refuse-alpn-no-overlap", alpn_ours=["h2"], alpn_theirs=["spdy/3"],
                       expect="refuse", peer_alert=120))
+    # A client that offers a session ticket (pre_shared_key) and early data to
+    # a server that issues neither: RFC 8446 section 4.2.11 says to fall back
+    # to a full handshake, and the early-data records are skipped (4.2.10).
+    # The evidence that the offer was made is OpenSSL's own trace of its
+    # ClientHello; that it was not taken is "New" and not "Reused".
+    full = ["New, TLSv1.3"]
+    cases.append(Case("server", "psk-ticket-fallback", resume="ticket",
+                      theirs_has=["extension_type=psk(41)"] + full,
+                      theirs_lacks=["Reused, TLSv1.3"]))
+    cases.append(Case("server", "early-data-fallback", resume="early",
+                      theirs_has=["extension_type=psk(41)", "extension_type=early_data",
+                                  "Early data was rejected"] + full,
+                      theirs_lacks=["Reused, TLSv1.3", "early data from the client"]))
+    cases.append(Case("server", "early-data-fallback-retry", resume="early", group="p256",
+                      groups=["x25519", "p256"], retried=1,
+                      theirs_has=["extension_type=psk(41)", "extension_type=early_data", "Early data was rejected"] + full,
+                      theirs_lacks=["Reused, TLSv1.3"]))
     return cases
 
 
@@ -392,6 +415,12 @@ def run_case(case, echo, pems, tmp):
                        None, theirs, ours_text)
 
     # OpenSSL dials; this library serves.
+    if case.resume:
+        why = get_session(case, pems, tmp)
+        if why:
+            return Outcome(False, "setting up the ticket: " + why)
+        with open(os.path.join(tmp, "early.txt"), "w") as f:
+            f.write("early data from the client\n")
     ours_cmd = [echo, "server", "--time", str(int(time.time()))]
     kinds = case.identities or [case.kind]
     for n, kind in enumerate(kinds):
@@ -412,6 +441,10 @@ def run_case(case, echo, pems, tmp):
         else:
             cli += ["-tls1_3"]
         cli += case.theirs_extra
+        if case.resume:
+            cli += ["-sess_in", "/work/sess.pem", "-trace"]
+            if case.resume == "early":
+                cli += ["-early_data", "/work/early.txt"]
         if case.suite:
             cli += ["-ciphersuites", SUITES[case.suite][0]]
         if case.groups:
@@ -426,9 +459,10 @@ def run_case(case, echo, pems, tmp):
         if case.key_update:
             script += "printf 'K\\n'; sleep 0.4; printf 'again\\n'; sleep 0.4; "
         script += "sleep 0.6"
+        extra_mount = ["-v", "%s:/work:z" % tmp] if case.resume else []
         sh = "(%s) | %s 2>&1" % (script, " ".join(shell_quote(x) for x in
                                                   [ENGINE, "run", "-i", "--rm", "--name", name, "--network", "host",
-                                                   "-v", mount, IMAGE] + cli))
+                                                   "-v", mount] + extra_mount + [IMAGE] + cli))
         r = subprocess.run(["sh", "-c", sh], capture_output=True, text=True, timeout=CASE_TIMEOUT)
         try:
             out, err = ours_proc.communicate(timeout=15)
@@ -450,6 +484,44 @@ def run_case(case, echo, pems, tmp):
         return Outcome(True, "", ours, theirs, out + err)
     return Outcome(False, (out + err).replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300],
                    None, theirs, out + err)
+
+
+def get_session(case, pems, tmp):
+    """A session ticket for s_client to offer: one connection to an OpenSSL
+    s_server that issues tickets (and takes early data), saved with -sess_out.
+    Returns an error string, or None with tmp/sess.pem written."""
+    port = free_port()
+    sname = container_name()
+    cname = container_name()
+    mounts = ["-v", "%s:/pki:ro,z" % pems, "-v", "%s:/work:z" % tmp]
+    srv = [ENGINE, "run", "-i", "--rm", "--name", sname, "--network", "host"] + mounts + [IMAGE,
+           "openssl", "s_server", "-accept", "127.0.0.1:%d" % port, "-cert", "/pki/%s-leaf.pem" % case.kind,
+           "-key", "/pki/%s-key.pem" % case.kind, "-naccept", "1", "-early_data", "-ign_eof"]
+    out = os.path.join(tmp, "ticket-server.out")
+    with open(out, "w") as to:
+        # stdin stays open: s_server ends the connection when its input does
+        proc = subprocess.Popen(srv, stdin=subprocess.PIPE, stdout=to, stderr=subprocess.STDOUT)
+    try:
+        if not wait_listening(port, proc):
+            return "the ticket-issuing s_server did not start: " + open(out).read()[:200].replace("\n", " ")
+        cli = [ENGINE, "run", "-i", "--rm", "--name", cname, "--network", "host"] + mounts + [IMAGE,
+               "openssl", "s_client", "-connect", "127.0.0.1:%d" % port, "-CAfile", "/pki/%s-ca.pem" % case.kind,
+               "-servername", case.server_name, "-verify_return_error", "-no_ign_eof", "-tls1_3",
+               "-sess_out", "/work/sess.pem"]
+        sh = "(printf 'x\\n'; sleep 1.5) | %s 2>&1" % " ".join(shell_quote(x) for x in cli)
+        r = subprocess.run(["sh", "-c", sh], capture_output=True, text=True, timeout=CASE_TIMEOUT)
+    finally:
+        subprocess.run([ENGINE, "rm", "-f", cname], capture_output=True)
+        subprocess.run([ENGINE, "rm", "-f", sname], capture_output=True)
+        proc.stdin.close()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    path = os.path.join(tmp, "sess.pem")
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return "no session was saved: " + r.stdout[-300:].replace("\n", " ")
+    return None
 
 
 def shell_quote(s):
@@ -482,6 +554,12 @@ def judge(case, outcome):
     for text in case.theirs_has:
         if text not in outcome.theirs:
             errors.append("OpenSSL's output does not contain %r" % text)
+    if case.resume and outcome.theirs.count("extension_type=psk(41)") != 1:
+        errors.append("the PSK extension was in %d messages of the trace, wanted the ClientHello's alone "
+                      "(a ServerHello that selected it would make two)" % outcome.theirs.count("extension_type=psk(41)"))
+    for text in case.theirs_lacks:
+        if text in outcome.theirs:
+            errors.append("OpenSSL's output contains %r" % text)
     if case.identities and case.role == "server":
         # OpenSSL verified the chain it was sent against this kind's CA: it
         # got the identity the name asked for, or the handshake would have failed.
@@ -539,6 +617,16 @@ PLANTS = {
                              "type != GTLS_CT_CHANGE_CIPHER_SPEC &&\n      !(type == GTLS_CT_ALERT && c->state != GTLS_STATE_CONNECTED && len == 2u)) {",
                              "type != GTLS_CT_CHANGE_CIPHER_SPEC) {",
                              ["server/refuse-wrong-name"]),
+    "early-skip-off": ("src/server/server.c", "c->early_skip = 1;", "(void)0;",
+                       ["server/early-data-fallback", "server/early-data-fallback-retry"]),
+    "psk-refused": ("src/server/server.c",
+                    "result = gtls_msg_parse_ch_psk_offer(e, &c->limits, &identities);",
+                    "result = GTLS_ERR_UNSUPPORTED; (void)identities;",
+                    ["server/psk-ticket-fallback", "server/early-data-fallback"]),
+    "retry-skip-ends": ("src/client/stream.c",
+                        "if (c->early_skip && epoch == GTLS_EPOCH_INITIAL && type == GTLS_CT_APPLICATION_DATA) {",
+                        "if (0) {",
+                        ["server/early-data-fallback-retry"]),
     "sni-selection": ("src/server/server.c",
                       "if (name_rank(&x->identities[i], o->host.p, o->host.len) != rank) {",
                       "if (0) {",

@@ -381,6 +381,23 @@ GTLS_Result gtls_msg_parse_ch_cookie(const GTLS_Ext * e, GTLS_Name * cookie);
  */
 GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke);
 
+/**
+ * A ClientHello's pre_shared_key (section 4.2.11): the identities (each 1 to
+ * 65535 bytes, with a 4-byte age) and the binders (each 32 to 255 bytes).
+ * Nothing is checked against a key; the shape is. @p count receives the
+ * number of identities.
+ *
+ * @return ::GTLS_ERR_CORRUPT for a list that does not parse or has bytes
+ *   left over; ::GTLS_ERR_PROTOCOL when the two lists differ in length;
+ *   ::GTLS_ERR_LIMIT for more identities than ::GTLS_Limits::max_tickets or
+ *   one longer than ::GTLS_Limits::max_ticket_bytes.
+ */
+GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
+    const GTLS_Limits * limits, size_t * count);
+
+/** early_data in a ClientHello (section 4.2.10): an empty body, else ::GTLS_ERR_CORRUPT. */
+GTLS_Result gtls_msg_parse_ch_early_data(const GTLS_Ext * e);
+
 /* ----------------------------------------------- what a server sends */
 
 /** Everything a ServerHello or a HelloRetryRequest is built from. */

@@ -28,8 +28,11 @@
  *
  * Every failure goes through gtls_conn_fail(), as the client's do, so none
  * leaves a secret behind. The server sends no CertificateRequest and no
- * NewSessionTicket, and refuses PSK, early data and anything that does not
- * offer TLS 1.3 with the alert that says so.
+ * NewSessionTicket, and refuses anything that does not offer TLS 1.3 with the
+ * alert that says so. A pre_shared_key or early_data offer is checked for
+ * shape and then ignored (RFC 8446 sections 4.2.9 to 4.2.11): the server
+ * issues no tickets, so it holds no PSK and no early-data key, and falls back
+ * to the full certificate handshake it would have done without them.
  */
 
 #include <ghoti.io/tls/macros.h>
@@ -139,11 +142,8 @@ typedef struct Offer {
   size_t alpn_count;
   int has_alpn;
   GTLS_Name host;
+  int early_data;   /* early_data was offered */
 } Offer;
-
-static GTLS_Result refuse_extension(GTLS_Conn * c) {
-  return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNSUPPORTED_EXTENSION);
-}
 
 static GTLS_Result missing(GTLS_Conn * c) {
   return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
@@ -182,12 +182,17 @@ static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
   if (!tls13) {
     return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);
   }
-  /* PSK, and early data which only a PSK can carry, are not offered by this
-   * server. The checks RFC 8446 section 4.2.11 makes of the offer come first,
-   * so a malformed one is called that and not merely unsupported. */
+  /* A PSK offer is validated and then ignored: this server has issued no
+   * ticket and holds no key, so it never selects an identity (RFC 8446
+   * section 4.2.11 says to fall back to a full handshake). The binders are
+   * not checked, because nothing is accepted that a binder could vouch for.
+   * What section 4.2.11 requires of the shape is enforced, so a malformed
+   * offer is called that: pre_shared_key last, psk_key_exchange_modes
+   * present, as many binders as identities. */
   e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_PRE_SHARED_KEY);
   if (e != NULL) {
     int dhe = 0;
+    size_t identities = 0;
     const GTLS_Ext * modes = gtls_msg_find_ext(ch->exts, ch->ext_count,
         GTLS_EXT_PSK_KEY_EXCHANGE_MODES);
 
@@ -201,10 +206,21 @@ static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
     if (result != GTLS_OK) {
       return gtls_conn_fail_parse(c, result);
     }
-    return refuse_extension(c);
+    result = gtls_msg_parse_ch_psk_offer(e, &c->limits, &identities);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail_parse(c, result);
+    }
   }
-  if (gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_EARLY_DATA) != NULL) {
-    return refuse_extension(c);
+  /* early_data is offered, and rejected by not echoing it in
+   * EncryptedExtensions (section 4.2.10); with or without a PSK beside it. The
+   * client's early records are then skipped by the record layer. */
+  e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_EARLY_DATA);
+  if (e != NULL) {
+    result = gtls_msg_parse_ch_early_data(e);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail_parse(c, result);
+    }
+    o->early_data = 1;
   }
   /* The only cookie this server could be sent is one it issued, and it
    * issues none. */
@@ -270,15 +286,19 @@ static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
 
 /**
  * The second ClientHello must be the first, changed only where RFC 8446
- * section 4.1.2 allows: the key_share, the padding, and an early_data or a
- * cookie neither of which this server accepts. Anything else is
- * illegal_parameter.
+ * section 4.1.2 allows: the key_share, the padding, early_data dropped, and
+ * a pre_shared_key brought up to date (the binders and ages change with the
+ * transcript). Anything else is illegal_parameter, and so is early_data in
+ * the second hello (section 4.2.10).
  */
 static GTLS_Result check_retry(GTLS_Conn * c, const Offer * o) {
   GTLS_ClientHello first;
   GTLS_Limits l = gtls_conn_own_limits(c);
   size_t i;
 
+  if (o->early_data) {
+    return gtls_conn_illegal(c);
+  }
   if (gtls_msg_parse_client_hello(c->hello.data + 4, c->hello.len - 4u, &l,
           &first) != GTLS_OK) {
     return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
@@ -297,7 +317,8 @@ static GTLS_Result check_retry(GTLS_Conn * c, const Offer * o) {
     const GTLS_Ext * a = &first.exts[i];
     const GTLS_Ext * b;
 
-    if (a->type == GTLS_EXT_KEY_SHARE || a->type == GTLS_EXT_PADDING) {
+    if (a->type == GTLS_EXT_KEY_SHARE || a->type == GTLS_EXT_PADDING ||
+        a->type == GTLS_EXT_EARLY_DATA || a->type == GTLS_EXT_PRE_SHARED_KEY) {
       continue;
     }
     b = gtls_msg_find_ext(o->ch.exts, o->ch.ext_count, a->type);
@@ -818,6 +839,10 @@ static GTLS_Result on_client_hello(GTLS_Conn * c, const unsigned char * msg,
     if (result != GTLS_OK) {
       return result;
     }
+    /* The early data came before the retry was answered, so none follows. */
+    c->early_skip = 0;
+  } else if (o.early_data) {
+    c->early_skip = 1;
   }
   result = copy_sni(c, &o.host);
   if (result != GTLS_OK) {

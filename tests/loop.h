@@ -127,6 +127,7 @@ struct Pair {
   std::string host;
   int64_t now = kNow;
   bool auto_read = true;   /* read what arrives into Endpoint::got as it comes */
+  Bytes raw_hello;         /* when set, the client starts from this ClientHello (its X25519 private key is 0x33 repeated) */
   Endpoint c, s;
 
   explicit Pair(std::vector<Cred *> cs) : creds(cs) {
@@ -194,7 +195,9 @@ struct Pair {
     if (r != GTLS_OK) {
       return r;
     }
-    r = gtls_conn_start(c.conn);
+    r = raw_hello.empty() ? gtls_conn_start(c.conn)
+                          : gtls_conn_start_raw(c.conn, raw_hello.data(), raw_hello.size(),
+                                Bytes(32, 0x33).data());
     if (r != GTLS_OK) {
       return r;
     }

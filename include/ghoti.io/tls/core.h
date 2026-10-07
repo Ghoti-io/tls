@@ -148,13 +148,17 @@ typedef struct GTLS_Limits {
   uint32_t max_extensions;
   /** Largest CertificateVerify signature, in bytes. Default 1024. */
   uint32_t max_signature_bytes;
-  /** Largest NewSessionTicket ticket, in bytes. Default 16384. */
+  /**
+   * Largest NewSessionTicket ticket, in bytes, and largest identity in a
+   * ClientHello's `pre_shared_key`. Default 16384.
+   */
   uint32_t max_ticket_bytes;
   /** Largest cookie a HelloRetryRequest may ask to be echoed. Default 1024. */
   uint32_t max_cookie_bytes;
   /**
    * Most post-handshake NewSessionTicket messages one connection accepts
-   * (each is parsed and discarded). Default 16.
+   * (each is parsed and discarded), and most identities a ClientHello's
+   * `pre_shared_key` may offer to a server. Default 16.
    */
   uint32_t max_tickets;
   /** Most bytes of output a connection holds unconsumed, per epoch. Default 65536. */
@@ -183,6 +187,15 @@ typedef struct GTLS_Limits {
   uint32_t max_app_buffer;
   /** Most KeyUpdate messages one connection accepts. Default 65536. */
   uint32_t max_key_updates;
+  /**
+   * Most bytes (headers included) of a client's early-data records a server
+   * discards without reading them, after a ClientHello that offered
+   * `early_data` (RFC 8446 section 4.2.10; this server never accepts early
+   * data, so it has to skip it). Past this the connection fails with
+   * ::GTLS_ERR_LIMIT. Default 16384 plus the record overhead (one maximal
+   * record: 16384 + 256 + 5 bytes).
+   */
+  uint32_t max_early_skip_bytes;
 } GTLS_Limits;
 
 /**

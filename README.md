@@ -9,6 +9,9 @@ over TCP needs: HTTP/2, `wss`), and **handshake messages by epoch with the
 traffic secrets** (what QUIC needs). It is built on `certificate` (chains,
 names, signatures) and `security` (the primitives). Client authentication,
 TLS 1.2, resumption and early data are later pieces; see [Status](#status).
+A server that is offered a PSK or early data (a client that remembers a
+ticket from elsewhere) ignores the offer, skips the early records, and does the
+full handshake.
 
 ## Example
 

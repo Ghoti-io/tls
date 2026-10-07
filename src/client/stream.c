@@ -316,6 +316,21 @@ static GTLS_Result open_failed(GTLS_Conn * c, GTLS_Result result) {
   }
 }
 
+/**
+ * Discard one record of early data that was offered and not accepted. Only
+ * the number of bytes is kept: they never reach the application, and the cap
+ * is what keeps a peer from sending them for ever.
+ */
+static GTLS_Result skip_early(GTLS_Conn * c, size_t body_len) {
+  size_t cost = GTLS_RECORD_HEADER + body_len;
+
+  if (cost > c->limits.max_early_skip_bytes - c->early_skipped) {
+    return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  c->early_skipped += cost;
+  return GTLS_OK;
+}
+
 /** One whole record is in rbuf. */
 static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
   const unsigned char * header = c->rbuf.data;
@@ -344,6 +359,11 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
      * on the path can do by closing it. */
     return on_alert(c, body, blen, 0);
   }
+  if (c->early_skip && epoch == GTLS_EPOCH_INITIAL && type == GTLS_CT_APPLICATION_DATA) {
+    /* After a HelloRetryRequest the client's early records arrive before
+     * its second ClientHello, and no key exists to try them with. */
+    return skip_early(c, blen);
+  }
   if (epoch == GTLS_EPOCH_INITIAL) {
     pt = body;
     pt_len = blen;
@@ -357,10 +377,18 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
     }
     result = gtls_record_open(&c->sec.rd, header, body, blen,
         c->limits.max_record_padding, scratch, &pt_len, &inner);
+    if (result == GTLS_ERR_MISMATCH && c->early_skip && type == GTLS_CT_APPLICATION_DATA) {
+      /* Early data, which was offered and not accepted, is encrypted under a
+       * key this server never had: a record that does not open is skipped
+       * (RFC 8446 section 4.2.10). The counter did not move. */
+      (void)gsec_wipe(scratch, sizeof scratch);
+      return skip_early(c, blen);
+    }
     if (result != GTLS_OK) {
       (void)gsec_wipe(scratch, sizeof scratch);
       return open_failed(c, result);
     }
+    c->early_skip = 0; /* a record that opens ends the early data */
     pt = scratch;
   }
   switch (inner) {
@@ -413,7 +441,8 @@ static GTLS_Result check_header(GTLS_Conn * c) {
     return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_PROTOCOL_VERSION);
   }
   if (len > GTLS_RECORD_CIPHERTEXT_MAX ||
-      (epoch == GTLS_EPOCH_INITIAL && len > GTLS_RECORD_PLAIN_MAX)) {
+      (epoch == GTLS_EPOCH_INITIAL && len > GTLS_RECORD_PLAIN_MAX &&
+          !(c->early_skip && type == GTLS_CT_APPLICATION_DATA))) {
     return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_RECORD_OVERFLOW);
   }
   if (type == GTLS_CT_CHANGE_CIPHER_SPEC && len != 1u) {

@@ -32,7 +32,7 @@ accepts.
 
 | Document | What | Deviation |
 | --- | --- | --- |
-| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | no PSK, no early data, no client certificate and no CertificateRequest, no NewSessionTicket sent, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
+| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | a PSK or early data offered to a server is ignored (the handshake falls back to the full one), none is accepted or sent, no client certificate and no CertificateRequest, no NewSessionTicket sent, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
 | RFC 6066 | `server_name`; an IP literal is never sent; a server chooses its identity by it and acknowledges it | no other extension of that RFC |
 | RFC 7301 | ALPN, offered and read back; a server picks the first of its list that the client offered | no overlap with both lists present is fatal (`no_application_protocol`), as the RFC says |
 | RFC 7685 | padding a ClientHello of 256 to 511 bytes to 512 | |
@@ -115,8 +115,8 @@ flight fit the queue a connection holds. What a ClientHello makes it choose:
   (a share in hand saves a round trip, so it wins over a more preferred group
   without one); else the server's first group the client lists, which is a
   HelloRetryRequest. No cookie is sent: the server is stateful. The second
-  ClientHello must be the first with only the key_share, the padding, and an
-  early_data or cookie this server never accepts changed (RFC 8446 section
+  ClientHello must be the first with only the key_share, the padding, an
+  early_data dropped and a pre_shared_key refreshed changed (RFC 8446 section
   4.1.2), and carry one share, for the group asked for. A second ClientHello
   that still has no usable share is `unexpected_message`; a share for another
   group is `illegal_parameter`.
@@ -128,11 +128,32 @@ flight fit the queue a connection holds. What a ClientHello makes it choose:
 
 It sends no CertificateRequest and no NewSessionTicket. It refuses, with the
 alert that names the cause: a hello with no `supported_versions` or none that
-offers 1.3 (`protocol_version`); `pre_shared_key` and `early_data`
-(`unsupported_extension`, after the checks RFC 8446 section 4.2.11 makes of a
-PSK offer, so a malformed one is called that); a cookie it never issued; a
+offers 1.3 (`protocol_version`); a cookie it never issued; a
 missing `supported_groups`, `signature_algorithms` or `key_share`
 (`missing_extension`); nothing in common (`handshake_failure`).
+
+**A PSK or early-data offer is validated and ignored** (RFC 8446 sections
+4.2.9 to 4.2.11), because the server issues no tickets and so holds no key to
+select and no early-data key. A `pre_shared_key` must be the last extension
+(`illegal_parameter`), `psk_key_exchange_modes` must be there
+(`missing_extension`), the identities and the binders must parse, be as many
+as each other (`illegal_parameter`), and fit `GTLS_Limits::max_tickets` and
+`max_ticket_bytes` (`GTLS_ERR_LIMIT`, `decode_error`). The binders are not
+checked: they vouch for a PSK that is used, and none is. No `pre_shared_key`
+goes in the ServerHello and the full certificate handshake follows.
+`early_data` must have an empty body (`decode_error`) and is rejected by not
+echoing it in EncryptedExtensions, with or without a PSK beside it. The client
+then sends records protected by a key this server never had, and section
+4.2.10 has the server skip them: an `application_data` record that does not
+open is discarded, its bytes counted (`GTLS_Limits::max_early_skip_bytes`,
+default one maximal record; past it is `GTLS_ERR_LIMIT` and `unexpected_message`),
+and the first record that opens ends the skipping. It also covers the records
+that arrive between a HelloRetryRequest and the second ClientHello, where no
+key exists to try; the second ClientHello ends it, and may not carry
+`early_data` itself. Skipping is off unless `early_data` was offered, so a bad
+record is otherwise a fatal `bad_record_mac`. Skipped bytes never reach the
+application and the sequence number does not move for them. Accepting a PSK,
+issuing tickets and accepting early data are later work (planning step 8).
 
 The server writes application data only once the client's Finished has
 verified, and reads and writes under the application keys from the moment its
@@ -220,7 +241,10 @@ header as additional data, and the outer type says application data
 | CertificateVerify does not verify (wrong transcript, wrong key) | `GTLS_ERR_SIGNATURE` | `decrypt_error` |
 | Finished does not verify | `GTLS_ERR_FINISHED` | `decrypt_error` |
 | (server) no `supported_versions`, or none naming 1.3 | `GTLS_ERR_UNSUPPORTED` | `protocol_version` |
-| (server) PSK or early data | `GTLS_ERR_UNSUPPORTED` | `unsupported_extension` |
+| (server) `pre_shared_key` not last, or a binder count that differs | `GTLS_ERR_PROTOCOL` | `illegal_parameter` |
+| (server) `pre_shared_key` or `early_data` that does not parse | `GTLS_ERR_CORRUPT` | `decode_error` |
+| (server) more identities, or a longer one, than the limits | `GTLS_ERR_LIMIT` | `decode_error` |
+| (server) more early-data bytes skipped than the limit | `GTLS_ERR_LIMIT` | `unexpected_message` |
 | (server) required extension missing | `GTLS_ERR_PROTOCOL` | `missing_extension` |
 | (server) no suite, group or signature scheme in common | `GTLS_ERR_NO_COMMON` | `handshake_failure` |
 | (server) both ALPN lists and no overlap | `GTLS_ERR_ALPN` | `no_application_protocol` |
@@ -324,7 +348,7 @@ the record layer and the server, the nonce (and its byte order), the label of th
 traffic secret, padding (stripped, and capped), the sequence limit, the
 authentication of a record, the size cap, truncation, the dummy-record limit,
 the answer to a KeyUpdate, the automatic update, the alert on a bad record, the
-ALPN overlap, the SNI match, the client's Finished, a second retry, early data,
+ALPN overlap, the SNI match, the client's Finished, a second retry, the PSK and early-data rules,
 the version check, and the key-fits-scheme choice; and, from review, the
 plaintext-alert rules, the fragments rule, KeyUpdate's record and its answers,
 the key of a server's alert, the client's dummy record, ALPN names compared by
@@ -382,6 +406,6 @@ covers here. The tag comparison is `security`'s, with its own gate there.
 
 Client authentication and `CertificateRequest` (the server never sends one);
 TLS 1.2; resumption and tickets (a client parses and discards a
-NewSessionTicket; a server sends none); early data; DTLS; revocation in the
+NewSessionTicket; a server sends none; a server ignores a PSK or early-data offer and does the full handshake); accepting early data; DTLS; revocation in the
 handshake; the `http` adapter. `GTLS_ContextConfig` already has room for TLS
 1.2, a PSK and a client certificate.

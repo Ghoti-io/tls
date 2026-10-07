@@ -61,7 +61,6 @@ server-alpn-overlap	src/server/server.c	if (c->alpn_selected_len == 0) {\n      
 server-sni-match	src/server/server.c	return plen == hlen \&\& names_equal(pat, host, plen);	return 1;	testServer
 server-client-finished	src/server/server.c	result = gtls_finished_check(hash, c->sec.schedule.c_hs, th, got, hlen);	result = GTLS_OK;	testServer
 server-second-retry	src/server/server.c	/* The retry would need another retry, which RFC 8446 does not allow. */\n      return gtls_conn_unexpected(c);	/* The retry would need another retry, which RFC 8446 does not allow. */\n      return gtls_conn_illegal(c);	testServer
-server-early-data	src/server/server.c	if (gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_EARLY_DATA) != NULL) {	if (0) {	testServer
 server-version	src/server/server.c	if (!tls13) {	if (0) {	testServer
 server-scheme-fits	src/server/server.c	gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)	1	testServer
 server-cv-label	src/client/verify.c	static const char server_label[] = "TLS 1.3, server CertificateVerify";	static const char server_label[] = "TLS 1.3, client CertificateVerify";	testRfc8448
@@ -98,6 +97,24 @@ handshake-key-limit	src/client/stream.c	epoch == GTLS_EPOCH_APPLICATION ? c->lim
 wire-room	src/client/client.c	2u * (size_t)c->limits.max_output_bytes + 4096u + GTLS_RECORD_HEADER +\n          GTLS_RECORD_CIPHER_MAX);	2u * (size_t)c->limits.max_output_bytes + 4096u);	testEdges
 oom-in-flight	src/server/server.c	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
 oom-in-record-buffer	src/client/stream.c	      *consumed = pos;\n      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	      *consumed = pos;\n      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
+psk-last	src/server/server.c	if (ch->exts[ch->ext_count - 1u].type != GTLS_EXT_PRE_SHARED_KEY) {	if (0) {	testPsk
+psk-modes-present	src/server/server.c	if (modes == NULL) {\n      return missing(c);	if (modes == NULL) {\n      return gtls_conn_illegal(c);	testPsk
+psk-offer-parsed	src/server/server.c	result = gtls_msg_parse_ch_psk_offer(e, \&c->limits, \&identities);	result = GTLS_OK; (void)identities;	testPsk
+psk-count-equal	src/msg/msg.c	if (n_ids != n_binders) {	if (0) {	testPsk
+psk-identity-cap	src/msg/msg.c	identity.len > limits->max_ticket_bytes \|\|	0 \|\|	testPsk
+psk-count-cap	src/msg/msg.c	++n_ids > limits->max_tickets	0	testPsk
+psk-binder-length	src/msg/msg.c	result = gtls_reader_vector(\&binders, 1, 32, 0, \&binder);	result = gtls_reader_vector(\&binders, 1, 0, 0, \&binder);	testPsk
+early-data-empty	src/msg/msg.c	return e->len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;	return GTLS_OK;	testPsk
+early-data-seen	src/server/server.c	c->early_skip = 1;	(void)0;	testPsk
+early-skip-needs-offer	src/client/stream.c	result == GTLS_ERR_MISMATCH \&\& c->early_skip \&\&	result == GTLS_ERR_MISMATCH \&\&	testPsk
+early-skip-ends-on-open	src/client/stream.c	c->early_skip = 0; /* a record that opens ends the early data */	(void)0;	testPsk
+early-skip-cap	src/client/stream.c	if (cost > c->limits.max_early_skip_bytes - c->early_skipped) {	if (0) {	testPsk
+early-skip-after-retry	src/client/stream.c	if (c->early_skip \&\& epoch == GTLS_EPOCH_INITIAL \&\& type == GTLS_CT_APPLICATION_DATA) {	if (0) {	testPsk
+early-skip-header	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	1	testPsk
+retry-early-data	src/server/server.c	if (o->early_data) {\n    return gtls_conn_illegal(c);	if (0) {\n    return gtls_conn_illegal(c);	testPsk
+retry-ends-skip	src/server/server.c	    c->early_skip = 0;\n  } else if (o.early_data) {	    (void)0;\n  } else if (o.early_data) {	testPsk
+retry-may-drop-early-data	src/server/server.c	a->type == GTLS_EXT_EARLY_DATA \|\|	0 \|\|	testPsk
+retry-may-refresh-psk	src/server/server.c	a->type == GTLS_EXT_PRE_SHARED_KEY) {	0) {	testPsk
 PLANTS
 }
 

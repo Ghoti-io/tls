@@ -204,6 +204,8 @@ struct GTLS_Conn {
   GTLS_Epoch wr_epoch;              /* the epoch of the installed write keys */
   int ccs_sent;
   unsigned ccs_seen;
+  int early_skip;             /* server: the first ClientHello offered early_data, which is not accepted, so the records that do not decrypt are skipped */
+  size_t early_skipped;       /* server: bytes of records skipped so far */
   int hello_flushed;                /* the first ClientHello has gone out */
   int peer_closed;                  /* close_notify received */
   int local_closed;                 /* close_notify sent */

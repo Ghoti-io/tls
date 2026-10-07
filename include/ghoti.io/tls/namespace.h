@@ -172,6 +172,8 @@
 #define gtls_msg_parse_ch_cookie GHOTIIO_TLS(gtls_msg_parse_ch_cookie)
 #define gtls_msg_parse_ch_key_shares GHOTIIO_TLS(gtls_msg_parse_ch_key_shares)
 #define gtls_msg_parse_ch_psk_modes GHOTIIO_TLS(gtls_msg_parse_ch_psk_modes)
+#define gtls_msg_parse_ch_psk_offer GHOTIIO_TLS(gtls_msg_parse_ch_psk_offer)
+#define gtls_msg_parse_ch_early_data GHOTIIO_TLS(gtls_msg_parse_ch_early_data)
 #define gtls_msg_parse_ch_server_name GHOTIIO_TLS(gtls_msg_parse_ch_server_name)
 #define gtls_msg_parse_ch_u16_list GHOTIIO_TLS(gtls_msg_parse_ch_u16_list)
 #define gtls_msg_parse_ch_versions GHOTIIO_TLS(gtls_msg_parse_ch_versions)

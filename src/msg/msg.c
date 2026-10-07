@@ -1079,6 +1079,63 @@ GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke) {
   return GTLS_OK;
 }
 
+GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
+    const GTLS_Limits * limits, size_t * count) {
+  GTLS_Reader r;
+  GTLS_Reader ids;
+  GTLS_Reader binders;
+  GTLS_Result result;
+  size_t n_ids = 0;
+  size_t n_binders = 0;
+
+  gtls_reader_init(&r, e->data, e->len);
+  result = gtls_reader_vector(&r, 2, 7, 0, &ids);
+  if (result == GTLS_OK) {
+    result = gtls_reader_vector(&r, 2, 33, 0, &binders);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_reader_end(&r);
+  }
+  if (result != GTLS_OK) {
+    return result;
+  }
+  while (gtls_reader_left(&ids) != 0) {
+    GTLS_Reader identity;
+    const unsigned char * age;
+
+    result = gtls_reader_vector(&ids, 2, 1, 0, &identity);
+    if (result == GTLS_OK) {
+      result = gtls_reader_bytes(&ids, 4, &age); /* obfuscated_ticket_age */
+    }
+    if (result != GTLS_OK) {
+      return result;
+    }
+    if (identity.len > limits->max_ticket_bytes || ++n_ids > limits->max_tickets) {
+      return GTLS_ERR_LIMIT;
+    }
+  }
+  while (gtls_reader_left(&binders) != 0) {
+    GTLS_Reader binder;
+
+    result = gtls_reader_vector(&binders, 1, 32, 0, &binder);
+    if (result != GTLS_OK) {
+      return result;
+    }
+    if (++n_binders > limits->max_tickets) {
+      return GTLS_ERR_LIMIT;
+    }
+  }
+  if (n_ids != n_binders) {
+    return GTLS_ERR_PROTOCOL;
+  }
+  *count = n_ids;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_msg_parse_ch_early_data(const GTLS_Ext * e) {
+  return e->len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;
+}
+
 /* ----------------------------------------------------- what a server sends */
 
 /** Open a handshake message: the type, and a length written by finish_message. */

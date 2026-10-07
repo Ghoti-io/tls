@@ -508,10 +508,6 @@ TEST(ServerHello, EveryRefusalHasItsOwnResultAndAlert) {
       {"only PKCS#1 offered, which CertificateVerify may not use",
           [](HelloSpec & h) { h.sigs = {0x0401, 0x0501, 0x0601}; },
           GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE},
-      {"a PSK offer", [](HelloSpec & h) {
-            h.extra.push_back(ext_of(GTLS_EXT_PRE_SHARED_KEY, Bytes(50, 1)));
-          },
-          GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNSUPPORTED_EXTENSION},
       {"a PSK offer with no psk_key_exchange_modes", [](HelloSpec & h) {
             h.psk_modes = false;
             h.extra.push_back(ext_of(GTLS_EXT_PRE_SHARED_KEY, Bytes(50, 1)));
@@ -522,10 +518,6 @@ TEST(ServerHello, EveryRefusalHasItsOwnResultAndAlert) {
             h.extra.push_back(ext_of(GTLS_EXT_PADDING, Bytes(4, 0)));
           },
           GTLS_ERR_PROTOCOL, GTLS_ALERT_ILLEGAL_PARAMETER},
-      {"early data", [](HelloSpec & h) {
-            h.extra.push_back(ext_of(GTLS_EXT_EARLY_DATA, Bytes()));
-          },
-          GTLS_ERR_UNSUPPORTED, GTLS_ALERT_UNSUPPORTED_EXTENSION},
       {"a cookie the server never issued", [](HelloSpec & h) {
             h.extra.push_back(ext_of(GTLS_EXT_COOKIE, lp16(Bytes(8, 1))));
           },

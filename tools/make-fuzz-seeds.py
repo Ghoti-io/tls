@@ -24,6 +24,7 @@ change_cipher_spec, an alert) that need no key.
 `--check` fails if a committed seed differs from what this writes.
 """
 
+import struct
 import sys
 from pathlib import Path
 
@@ -149,8 +150,48 @@ def main():
 
     srv["refuse-compression"] = bytes([0]) + c_ch[:5 + 48] + b"\x01" + c_ch[5 + 49:]
     srv["refuse-no-versions"] = bytes([0]) + edit(c_ch, bytes.fromhex("002b0003020304"), bytes.fromhex("0a2b0003020304"))
-    srv["refuse-psk"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002900024001"))
-    srv["refuse-early-data"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002a00024001"))
+    # A pre_shared_key anywhere but last, and an early_data with a body: both
+    # are refused by shape (the first extension of the RFC's hello is edited).
+    srv["refuse-psk-not-last"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002900024001"))
+    srv["refuse-early-data-body"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002a00024001"))
+
+    # A pre_shared_key and an early_data extension appended to the RFC's
+    # hello, which fixes up its three lengths. The server ignores the offer,
+    # skips the early-data records, and reads the (now wrong) Finished.
+    def with_ext(record, ext_type, body):
+        ext = struct.pack(">HH", ext_type, len(body)) + body
+        hs = record[5:]
+        assert hs[0] == 1 and record[0] == 22
+        sid = 4 + 2 + 32
+        at = sid + 1 + hs[sid]
+        at += 2 + struct.unpack(">H", hs[at:at + 2])[0]
+        at += 1 + hs[at]
+        ext_len = struct.unpack(">H", hs[at:at + 2])[0]
+        assert at + 2 + ext_len == len(hs)
+        hs = hs[:at] + struct.pack(">H", ext_len + len(ext)) + hs[at + 2:] + ext
+        hs = hs[:1] + struct.pack(">I", len(hs) - 4)[1:] + hs[4:]
+        return record[:3] + struct.pack(">H", len(hs)) + hs
+
+    def psk_body(identities, binders, binder_len=32):
+        ids = b"".join(struct.pack(">H", 8) + bytes([0x50 + i]) * 8 + b"\x00\x00\x12\x34" for i in range(identities))
+        bnd = b"".join(bytes([binder_len]) + bytes([0x60 + i]) * binder_len for i in range(binders))
+        return struct.pack(">H", len(ids)) + ids + struct.pack(">H", len(bnd)) + bnd
+
+    def early_record(n):
+        return b"\x17\x03\x03" + struct.pack(">H", n) + b"\xa5" * n
+
+    ch_psk = with_ext(c_ch, 0x29, psk_body(1, 1))
+    ch_psk_early = with_ext(with_ext(c_ch, 0x2a, b""), 0x29, psk_body(2, 2))
+    ch_early = with_ext(c_ch, 0x2a, b"")
+    srv["psk-offer"] = bytes([0]) + ch_psk + c_fin
+    srv["psk-offer-bad-count"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 1))
+    srv["psk-offer-short-binder"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 2, 8))
+    srv["early-data-skipped"] = bytes([0]) + ch_early + early_record(40) + early_record(300) + c_fin + c_app
+    srv["early-data-skipped-bytewise"] = bytes([0x02]) + ch_psk_early + early_record(60) + c_fin + c_app
+    srv["early-data-small-limits"] = bytes([0x40]) + ch_early + early_record(40) + early_record(300) + c_fin
+    srv["early-data-then-garbage"] = bytes([0]) + ch_early + early_record(40) + c_fin + early_record(20)
+    srv["early-data-after-retry"] = bytes([0x10]) + ch_early + early_record(40) + early_record(16384 + 256) + c_ch
+    srv["no-early-data-then-garbage"] = bytes([0]) + c_ch + early_record(40)
     srv["refuse-cookie"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002c00024001"))
     srv["refuse-bad-alpn"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("001000024001"))
     srv["refuse-plain-alert-after-hello"] = bytes([0]) + c_ch + bytes.fromhex("1503030002 0100".replace(" ", ""))

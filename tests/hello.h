@@ -60,8 +60,37 @@ struct HelloSpec {
   bool has_sni = false;
   std::vector<std::string> alpn;
   bool psk_modes = true;
+  bool early_data = false;       /* an empty early_data extension, after `extra` */
+  int psk_identities = 0;        /* a pre_shared_key, last of all, when either count is nonzero */
+  int psk_binders = 0;
+  size_t psk_identity_len = 16;
+  size_t psk_binder_len = 32;
+  size_t psk_first_binder_len = 0;   /* nonzero: the first binder's length, the others keeping psk_binder_len */
   std::vector<Bytes> extra;      /* whole extensions, appended */
   std::vector<Bytes> before;     /* whole extensions, put first */
+
+  /** The body of a pre_shared_key: the identities, then the binders (RFC 8446 section 4.2.11). */
+  Bytes psk_body() const {
+    Bytes ids, binders;
+    for (int i = 0; i < psk_identities; i++) {
+      Bytes id(psk_identity_len, static_cast<unsigned char>(0x50 + i));
+      put16(ids, id.size());
+      ids.insert(ids.end(), id.begin(), id.end());
+      put16(ids, 0);
+      put16(ids, 0x1234);   /* obfuscated_ticket_age */
+    }
+    for (int i = 0; i < psk_binders; i++) {
+      size_t n = (i == 0 && psk_first_binder_len != 0) ? psk_first_binder_len : psk_binder_len;
+      binders.push_back(static_cast<unsigned char>(n));
+      binders.insert(binders.end(), n, static_cast<unsigned char>(0x60 + i));
+    }
+    Bytes body;
+    put16(body, ids.size());
+    body.insert(body.end(), ids.begin(), ids.end());
+    put16(body, binders.size());
+    body.insert(body.end(), binders.begin(), binders.end());
+    return body;
+  }
 
   Bytes build() const {
     std::vector<Bytes> exts = before;
@@ -109,6 +138,12 @@ struct HelloSpec {
       exts.push_back(ext_of(GTLS_EXT_PSK_KEY_EXCHANGE_MODES, Bytes{1, 1}));
     }
     for (const Bytes & e : extra) exts.push_back(e);
+    if (early_data) {
+      exts.push_back(ext_of(GTLS_EXT_EARLY_DATA, Bytes()));
+    }
+    if (psk_identities != 0 || psk_binders != 0) {
+      exts.push_back(ext_of(GTLS_EXT_PRE_SHARED_KEY, psk_body()));
+    }
     Bytes body;
     put16(body, legacy_version);
     body.insert(body.end(), random.begin(), random.end());
