@@ -162,6 +162,8 @@ typedef struct GTLS_Limits {
   /**
    * Largest ClientHello a server accepts, body only. Default 16384, which is
    * more than any browser sends (a post-quantum key share is about 1.2 KiB).
+   * A server context refuses a value above 65536, the most a ClientHello
+   * can come to.
    */
   uint32_t max_client_hello;
   /**

@@ -63,7 +63,6 @@ static const unsigned char p384_order[48] = {
 };
 
 /** The most a ClientHello this library builds can come to, header included. */
-#define GTLS_HELLO_MAX 65540u
 
 /**
  * Limits for parsing a hello this library wrote itself. The caps in a
@@ -148,9 +147,11 @@ GTLS_Result gtls_conn_alloc(const GTLS_Context * context, GTLS_Conn ** out) {
   }
   gtls_buf_init(&c->rbuf, allocator, GTLS_RECORD_HEADER + GTLS_RECORD_CIPHER_MAX);
   /* Room for what a flush of a full handshake queue can add, besides the
-   * application data, which stops at max_output_bytes. */
+   * application data, which stops at max_output_bytes, and for one whole
+   * record on top of that, so a write into an empty output always fits. */
   gtls_buf_init(&c->wire, allocator,
-      2u * (size_t)c->limits.max_output_bytes + 4096u);
+      2u * (size_t)c->limits.max_output_bytes + 4096u + GTLS_RECORD_HEADER +
+          GTLS_RECORD_CIPHER_MAX);
   gtls_buf_init(&c->app_in, allocator,
       c->limits.max_app_buffer > GTLS_RECORD_PLAIN_MAX
           ? c->limits.max_app_buffer
@@ -1065,6 +1066,7 @@ static GTLS_Result conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
     size_t take;
     GTLS_Result result;
     GTLS_State before;
+    int was_key_update;
 
     if (c->in.len >= 4u) {
       body = ((size_t)c->in.data[1] << 16) | ((size_t)c->in.data[2] << 8) |
@@ -1099,6 +1101,7 @@ static GTLS_Result conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
       }
     }
     before = c->state;
+    was_key_update = c->in.data[0] == GTLS_HS_KEY_UPDATE;
     result = on_message(c, c->in.data, c->in.len, unix_time);
     c->in.len = 0;
     if (result != GTLS_OK) {
@@ -1109,7 +1112,8 @@ static GTLS_Result conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
      * section 4.1.4). */
     if (len > 0 && (gtls_conn_expected_epoch(c->state) != gtls_conn_expected_epoch(before) ||
         before == GTLS_STATE_WAIT_SH || before == GTLS_STATE_WAIT_SH2 ||
-        before == GTLS_STATE_S_WAIT_CH || before == GTLS_STATE_S_WAIT_CH2)) {
+        before == GTLS_STATE_S_WAIT_CH || before == GTLS_STATE_S_WAIT_CH2 ||
+        (was_key_update && c->mode == GTLS_MODE_STREAM))) {
       return gtls_conn_unexpected(c);
     }
   }

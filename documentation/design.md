@@ -101,11 +101,15 @@ answers to. `gtls_context_new` checks that the key is the leaf's
 (`gcert_key_matches`) and that the Certificate message and the rest of the
 flight fit the queue a connection holds. What a ClientHello makes it choose:
 
-- **Identity**: the first whose names include the client's `server_name`
-  (case-insensitively, a leading `*.` standing for exactly one label), else the
-  default (the first, or `default_identity`). The `server_name` is
-  acknowledged (an empty extension in EncryptedExtensions) only when a name
-  matched.
+- **Identity and signature scheme**: an identity whose names include the
+  client's `server_name` (case-insensitively, a leading `*.` standing for
+  exactly one label). An exact name is preferred to a wildcard, and among equal
+  matches the first listed. A match that cannot sign with any scheme the client
+  listed is passed over for the next one that can; if none can, the default
+  (the first identity, or `default_identity`) is tried, and if it cannot
+  either, `GTLS_ERR_NO_COMMON`. The `server_name` is acknowledged (an empty
+  extension in EncryptedExtensions) only when the identity used was one whose
+  names matched.
 - **Suite**: the server's order, among the client's.
 - **Group**: the server's order among the groups the client sent a share for
   (a share in hand saves a round trip, so it wins over a more preferred group
@@ -150,21 +154,32 @@ header as additional data, and the outer type says application data
   the stream.
 - **Size**: content at most 2^14, ciphertext at most 2^14 + 256, refused at the
   header with `record_overflow` before the body is read. A handshake message
-  may be split across records, but may not span a key change.
+  may be split across records, but nothing else may come between its pieces
+  (no dummy change_cipher_spec, no alert, no application data: `unexpected_message`)
+  and it may not span a key change; a KeyUpdate must be the last message of
+  its record (RFC 8446 section 5.1).
 - **Padding** is never sent. It is accepted up to `max_record_padding` and a
   record that is nothing but padding has no content type: `unexpected_message`.
 - **Keys follow the handshake.** The read keys are for the epoch the handshake
   is waiting for; the write keys change when the first record of a later epoch
   is made, so a record is always sealed under keys the peer has been told
   about. Before the Finished is sent an alert goes in the clear; a receiver
-  under keys accepts such a plaintext alert until its own handshake is done.
+  under keys accepts such a plaintext alert of two bytes until its own
+  handshake is done, **as a fatal alert and nothing else**: it is
+  `GTLS_ERR_ALERT` whatever its description (`close_notify` included), never a
+  clean close and never ignored, because nobody authenticated it. Once the
+  handshake is done a plaintext alert is `unexpected_message`.
 - **KeyUpdate** (section 4.6.3) is sent on request and answered when it asks
   to be, once. Its message is sealed under the old key and every record after
   it under the new one; the sequence number starts again. A key that has
   protected `max_records_per_key` records (default 2^24, under the AES-GCM
   limit of section 5.5) is replaced by the sending side by itself, one record
-  before the counter would run out; a limit under 2 is `GTLS_ERR_LIMIT`.
-  Received updates are counted against `max_key_updates`.
+  before the counter would run out; a limit under 2 is `GTLS_ERR_LIMIT`
+  for a write (handshake records are not counted against it). A request is
+  answered once however many arrive before the answer goes out, and not at all
+  once this end has sent `close_notify`. `max_key_updates` caps the updates
+  that arrive with no application data between them (a flood), not a
+  connection's life.
 - **Closing.** `close_notify` ends this end's writing and is read as the end of
   the peer's. Everything after it is ignored. Any other alert is fatal
   whatever its level says (`user_canceled` excepted), and is
@@ -310,7 +325,17 @@ traffic secret, padding (stripped, and capped), the sequence limit, the
 authentication of a record, the size cap, truncation, the dummy-record limit,
 the answer to a KeyUpdate, the automatic update, the alert on a bad record, the
 ALPN overlap, the SNI match, the client's Finished, a second retry, early data,
-the version check, and the key-fits-scheme choice.
+the version check, and the key-fits-scheme choice; and, from review, the
+plaintext-alert rules, the fragments rule, KeyUpdate's record and its answers,
+the key of a server's alert, the client's dummy record, ALPN names compared by
+their bytes, what a second ClientHello may change, a context's checks on a chain,
+which identity a name picks, the wire's room for a record, and the result of an
+allocation failure.
+
+`make check-controls` runs all of it (slow: it builds a copy per plant; needs
+`PREFIX`). `make test` runs `check-controls-anchors`, which needs no build and
+fails if a plant's text no longer occurs in the tree exactly once: the code moved
+and the plant would otherwise go quietly unmeasured.
 
 The second gate is **interop** (`make check-interop`, `tools/oracle/`): OpenSSL
 `s_server` and `s_client` in a podman container, not linked, against
@@ -325,7 +350,18 @@ group, signature scheme, ALPN case, HelloRetryRequest, key update and
 `close_notify`, each over a real chain from `tests/data/pki`. A handshake the
 peer refuses is counted in the denominator, with the reason, and declared
 differences are written down in `tools/oracle/DIFFERENCES`. A planted defect
-(`tools/oracle/plant.sh`) must make the same run fail.
+(`make interop-plants`, `interop.py --plant`) must make the cases it names fail:
+four damage what is sent, and five remove a check or a rule (the ALPN failure,
+the `supported_versions` check, the no-common-scheme refusal, the plaintext-alert
+rule, the identity choice).
+
+A refusal is judged on **this side's own result**, not on a string: the case
+says which alert the library sent (or was sent), and a different alert, or the
+right alert for the wrong reason, fails. A full run has a floor on the cases that
+ran and the cases that interoperated, so a population that shrank, or an `--only`
+that matched nothing, is not a pass. The server role is run with several
+identities against `s_client` (the name picks the chain OpenSSL verifies) and
+with a requested KeyUpdate (OpenSSL reports the update it was answered with).
 
 ## Constant time
 
@@ -335,8 +371,12 @@ same function) and the AEAD tag, which `security` compares itself. The review:
 `tools/check-secret.py` forbids `memcmp` and kin under `src/`; the padding scan
 in `gtls_record_open` runs only on a record that has already authenticated, so
 what it learns an attacker chose nothing of; the ALPN and SNI comparisons are of
-public names and may branch; the key schedule and the `Finished` run under the
-`check-ct` gate as before, the server's check being the same code.
+public names and may branch. Under the `check-ct` gate is the check of `Finished`
+(from the key up to `gsec_equal`; the server's check is the same function): not
+the key schedule, the record nonce or the AEAD dispatch, which touch a secret but
+never branch on one, and which the review of the source (no branch or index on
+secret data, enforced for nothing but `memcmp` by `check-secret`) is all that
+covers here. The tag comparison is `security`'s, with its own gate there.
 
 ## Not here
 

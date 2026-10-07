@@ -167,7 +167,7 @@ GTLS_API void gtls_context_config_default(GTLS_ContextConfig * config);
  * @param out Receives the context. Not NULL; written only on success.
  * @return ::GTLS_OK; ::GTLS_ERR_INVALID for a client with no trust store, a
  *   server with no identity (or with both forms of one), an identity whose key
- *   does not match its leaf or whose names are empty or oversized, an empty
+ *   does not match its leaf or whose names are empty or oversized, a server with a max_client_hello above 65536, an empty
  *   or oversized name, an unknown suite or group, or a count with a NULL
  *   list; ::GTLS_ERR_UNSUPPORTED for a reserved field or a version other
  *   than TLS 1.3; ::GTLS_ERR_LIMIT for an ALPN list that does not fit in the

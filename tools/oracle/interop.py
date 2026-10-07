@@ -57,6 +57,8 @@ IMAGE = os.environ.get("GHOTI_TLS_ORACLE_IMAGE",
                        "localhost/ghoti-certificate-oracle-openssl:3.5.7")
 PIN = "OpenSSL 3.5.7"
 CASE_TIMEOUT = 40
+POPULATION_FLOOR = 64   # cases a full run must have run
+PASS_FLOOR = 54          # and how many of them must have interoperated
 
 KINDS = {
     "ed": "ed.example.com",
@@ -89,7 +91,9 @@ class Case:
                  scheme=None, alpn_ours=(), alpn_theirs=(), expect_alpn="",
                  retried=0, key_update=False, compat=False, tls12=False,
                  server_name=None, expect="ok", refusal=None, declared=None,
-                 no_anchor=False, theirs_sigalgs=None, ours_sigalgs=None):
+                 no_anchor=False, theirs_sigalgs=None, ours_sigalgs=None,
+                 our_alert=None, peer_alert=None, theirs_extra=(), ours_extra=(),
+                 theirs_has=(), identities=None):
         self.role = role              # "client": our client, their s_server; "server": the reverse
         self.name = "%s/%s" % (role, name)
         self.kind = kind
@@ -111,6 +115,14 @@ class Case:
         self.no_anchor = no_anchor
         self.theirs_sigalgs = theirs_sigalgs
         self.ours_sigalgs = ours_sigalgs
+        # What a refusal must say on this side: the alert this library sent
+        # (its own result), or the alert it received. Not a regex on a string.
+        self.our_alert = our_alert
+        self.peer_alert = peer_alert
+        self.theirs_extra = list(theirs_extra)
+        self.ours_extra = list(ours_extra)
+        self.theirs_has = list(theirs_has)     # text the peer's output must contain
+        self.identities = identities           # kinds this library's server holds, default first
 
 
 def population():
@@ -142,30 +154,37 @@ def population():
                           alpn_ours=[] if role == "server" else ["h2"],
                           alpn_theirs=["h2"] if role == "server" else [],
                           expect_alpn=""))
-        cases.append(Case(role, "key-update", key_update=True))
+        cases.append(Case(role, "key-update", key_update=True,
+                          theirs_has=["KEYUPDATE"] if role == "server" else []))
         cases.append(Case(role, "compat", compat=True))
         cases.append(Case(role, "everything-chacha-p384-retry", kind="p384", suite="chacha",
                           group="p384", groups=["x25519", "p384"], retried=1, scheme="p384",
                           alpn_ours=["h2"], alpn_theirs=["h2"], expect_alpn="h2", key_update=True))
-        # The refusals.
-        cases.append(Case(role, "refuse-tls12-only", tls12=True, expect="refuse",
-                          refusal=r"(protocol_version|alert=70|peer_alert=70|Unsupported|"
-                                  r"alert number 70|protocol version)"))
-        cases.append(Case(role, "refuse-no-common-scheme",
-                          theirs_sigalgs="rsa_pss_rsae_sha256", ours_sigalgs="ed25519",
-                          kind="ed", expect="refuse",
-                          refusal=r"(handshake_failure|alert=40|peer_alert=40|alert number 40|"
-                                  r"No common|no suitable signature)"))
+        # The refusals, each with the alert this side sent or was sent.
+        if role == "client":
+            cases.append(Case(role, "refuse-tls12-only", tls12=True, expect="refuse", peer_alert=70))
+            cases.append(Case(role, "refuse-no-common-scheme", theirs_sigalgs="rsa_pss_rsae_sha256",
+                              ours_sigalgs="ed25519", kind="ed", expect="refuse", peer_alert=40))
+        else:
+            cases.append(Case(role, "refuse-tls12-only", tls12=True, expect="refuse", our_alert=70))
+            cases.append(Case(role, "refuse-no-common-scheme", theirs_sigalgs="rsa_pss_rsae_sha256",
+                              ours_sigalgs="ed25519", kind="ed", expect="refuse", our_alert=40))
     cases.append(Case("client", "refuse-wrong-name", server_name="other.example.com", expect="refuse",
-                      refusal=r"(does not name|bad_certificate|alert=42|Certificate does not name)"))
-    cases.append(Case("client", "refuse-unknown-anchor", no_anchor=True, expect="refuse",
-                      refusal=r"(No path to a trust anchor|alert=48|unknown_ca)"))
+                      our_alert=42))
+    cases.append(Case("client", "refuse-unknown-anchor", no_anchor=True, expect="refuse", our_alert=48))
+    cases.append(Case("server", "refuse-wrong-name", expect="refuse",
+                      theirs_extra=["-verify_hostname", "other.example.com"], peer_alert=42))
     cases.append(Case("server", "refuse-alpn-no-overlap", alpn_ours=["h2"], alpn_theirs=["spdy/3"],
-                      expect="refuse", refusal=r"(no_application_protocol|alert=120|peer_alert=120|"
-                                               r"alert number 120|No application protocol)"))
+                      expect="refuse", our_alert=120))
+    # Which of the server's identities the client's name picks, seen by the
+    # certificate OpenSSL verifies the name against.
+    for name, kind, ids in (("sni-first", "ed", ["ed", "rsa"]), ("sni-second", "rsa", ["ed", "rsa"]),
+                            ("sni-third", "p256", ["ed", "rsa", "p256"])):
+        cases.append(Case("server", name, kind=kind, identities=ids))
+    cases.append(Case("server", "sni-default", kind="ed", server_name="unknown.example.org",
+                      identities=["ed", "rsa"]))
     cases.append(Case("client", "refuse-alpn-no-overlap", alpn_ours=["h2"], alpn_theirs=["spdy/3"],
-                      expect="refuse", refusal=r"(no_application_protocol|alert=0 peer_alert=120|peer_alert=120|"
-                                               r"No application protocol)"))
+                      expect="refuse", peer_alert=120))
     return cases
 
 
@@ -255,11 +274,12 @@ def echo_args(case, echo_role, port):
 # --------------------------------------------------------------------------------- the cases
 
 class Outcome:
-    def __init__(self, ok, detail, ours="", theirs=""):
+    def __init__(self, ok, detail, ours="", theirs="", ours_text=""):
         self.ok = ok
         self.detail = detail
         self.ours = ours
         self.theirs = theirs
+        self.ours_text = ours_text   # what this library's side printed
 
 
 def parse_ours(text):
@@ -336,6 +356,7 @@ def run_case(case, echo, pems, tmp):
             srv += ["-alpn", ",".join(case.alpn_theirs)]
         if case.tls12:
             srv += ["-tls1_2"]
+        srv += case.theirs_extra
         cmd = [ENGINE, "run", "--rm", "--name", name, "--network", "host", "-v", mount, IMAGE] + srv
         theirs_out = os.path.join(tmp, "theirs.out")
         with open(theirs_out, "w") as to:
@@ -350,7 +371,7 @@ def run_case(case, echo, pems, tmp):
                 ours_cmd += ["--ca", os.path.join(PKI, case.kind + "-ca.der")]
             if case.key_update:
                 ours_cmd += ["--key-update"]
-            ours_cmd += echo_args(case, "client", port) + ["127.0.0.1", str(port)]
+            ours_cmd += echo_args(case, "client", port) + case.ours_extra + ["127.0.0.1", str(port)]
             r = subprocess.run(ours_cmd, capture_output=True, text=True, timeout=CASE_TIMEOUT)
             try:
                 proc.wait(timeout=10)
@@ -366,14 +387,19 @@ def run_case(case, echo, pems, tmp):
         ours_text = r.stdout + r.stderr
         if r.returncode == 0:
             ours = parse_ours(r.stdout)
-            return Outcome(True, "", ours, theirs)
-        return Outcome(False, ours_text.replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300], None, theirs)
+            return Outcome(True, "", ours, theirs, ours_text)
+        return Outcome(False, ours_text.replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300],
+                       None, theirs, ours_text)
 
     # OpenSSL dials; this library serves.
-    ours_cmd = [echo, "server", "--chain", os.path.join(PKI, case.kind + "-leaf.der"),
-                "--key", os.path.join(PKI, case.kind + "-leaf.pkcs8"), "--name", KINDS[case.kind],
-                "--time", str(int(time.time()))]
-    ours_cmd += echo_args(case, "server", port) + [str(port)]
+    ours_cmd = [echo, "server", "--time", str(int(time.time()))]
+    kinds = case.identities or [case.kind]
+    for n, kind in enumerate(kinds):
+        if n:
+            ours_cmd += ["--next-identity"]
+        ours_cmd += ["--chain", os.path.join(PKI, kind + "-leaf.der"),
+                     "--key", os.path.join(PKI, kind + "-leaf.pkcs8"), "--name", KINDS[kind]]
+    ours_cmd += echo_args(case, "server", port) + case.ours_extra + [str(port)]
     ours_proc = subprocess.Popen(ours_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
         if not wait_listening(port, ours_proc):
@@ -385,6 +411,7 @@ def run_case(case, echo, pems, tmp):
             cli += ["-tls1_2"]
         else:
             cli += ["-tls1_3"]
+        cli += case.theirs_extra
         if case.suite:
             cli += ["-ciphersuites", SUITES[case.suite][0]]
         if case.groups:
@@ -418,13 +445,21 @@ def run_case(case, echo, pems, tmp):
         ours = parse_ours(out)
         need = "hello" if not case.key_update else "again"
         if need not in theirs:
-            return Outcome(False, "the echo did not come back to s_client: " + theirs.replace("\n", " ")[:300], ours, theirs)
-        return Outcome(True, "", ours, theirs)
-    return Outcome(False, (out + err).replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300], None, theirs)
+            return Outcome(False, "the echo did not come back to s_client: " + theirs.replace("\n", " ")[:300],
+                           ours, theirs, out + err)
+        return Outcome(True, "", ours, theirs, out + err)
+    return Outcome(False, (out + err).replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300],
+                   None, theirs, out + err)
 
 
 def shell_quote(s):
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def alerts_of(text):
+    """(alert this side sent, alert it received) from the echo program's failure line."""
+    m = re.search(r"alert=(\d+) peer_alert=(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
 
 
 def judge(case, outcome):
@@ -432,13 +467,25 @@ def judge(case, outcome):
     if case.expect == "refuse":
         if outcome.ok:
             return "fail", "was expected to be refused and was accepted"
-        if case.refusal and not re.search(case.refusal, outcome.detail, re.I):
-            return "fail", "refused for a reason that is not the expected one: " + outcome.detail[:300]
-        return "refused", outcome.detail[:160]
+        sent, got = alerts_of(outcome.ours_text)
+        if case.our_alert is not None and sent != case.our_alert:
+            return "fail", "this side sent alert %s, wanted %s: %s" % (sent, case.our_alert, outcome.detail[:200])
+        if case.peer_alert is not None and got != case.peer_alert:
+            return "fail", "this side was sent alert %s, wanted %s: %s" % (got, case.peer_alert, outcome.detail[:200])
+        if case.our_alert is None and case.peer_alert is None:
+            return "fail", "a refusal with no alert declared for it"
+        return "refused", "alert sent %s, received %s" % (sent, got)
     if not outcome.ok:
         return "fail", outcome.detail[:400]
     errors = []
     check_negotiated(case, outcome.ours, outcome.theirs, errors)
+    for text in case.theirs_has:
+        if text not in outcome.theirs:
+            errors.append("OpenSSL's output does not contain %r" % text)
+    if case.identities and case.role == "server":
+        # OpenSSL verified the chain it was sent against this kind's CA: it
+        # got the identity the name asked for, or the handshake would have failed.
+        pass
     if errors:
         return "fail", "; ".join(errors)
     return "pass", ""
@@ -460,7 +507,10 @@ def read_differences():
 
 # ------------------------------------------------------------------------------------ plants
 
-# name, file, text removed, text put in its place, the cases (substrings) it must break
+# name: (file, text removed, text put in its place, the cases (exact names) it
+# must break). The first four damage what is sent; the rest remove a check or a
+# rule, and the case that must break each is a refusal (or a plaintext alert)
+# whose alert is then the wrong one, or absent.
 PLANTS = {
     "record-nonce": ("src/record/record.c",
                      "nonce[GTLS_IV_LEN - 1u - i] ^= (unsigned char)(k->seq >> (8u * i));", "(void)i;",
@@ -473,6 +523,26 @@ PLANTS = {
     "client-finished": ("src/client/client.c", "result = gtls_finished_verify_data(hash, c->sec.schedule.c_hs, th, verify);",
                         "result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, th, verify);",
                         ["client/default-ed", "client/default-p256"]),
+    "alpn-failure": ("src/server/server.c",
+                     "    if (c->alpn_selected_len == 0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,",
+                     "    if (0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,",
+                     ["server/refuse-alpn-no-overlap"]),
+    "supported-versions": ("src/server/server.c",
+                           "  if (e == NULL) {\n    return gtls_conn_fail(c, GTLS_ERR_UNSUPPORTED, GTLS_ALERT_PROTOCOL_VERSION);\n  }\n  result = gtls_msg_parse_ch_versions(e, &tls13);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }\n  if (!tls13) {",
+                           "  tls13 = 1;\n  if (!tls13) {",
+                           ["server/refuse-tls12-only"]),
+    "no-common-scheme": ("src/server/server.c",
+                         "  if (c->scheme == 0) {\n    return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);\n  }\n\n  /* ALPN",
+                         "  if (c->scheme == 0) {\n    c->scheme = GCERT_SIG_ED25519;\n  }\n\n  /* ALPN",
+                         ["server/refuse-no-common-scheme"]),
+    "plaintext-alert-rule": ("src/client/stream.c",
+                             "type != GTLS_CT_CHANGE_CIPHER_SPEC &&\n      !(type == GTLS_CT_ALERT && c->state != GTLS_STATE_CONNECTED && len == 2u)) {",
+                             "type != GTLS_CT_CHANGE_CIPHER_SPEC) {",
+                             ["server/refuse-wrong-name"]),
+    "sni-selection": ("src/server/server.c",
+                      "if (name_rank(&x->identities[i], o->host.p, o->host.len) != rank) {",
+                      "if (0) {",
+                      ["server/sni-second", "server/sni-third"]),
 }
 
 
@@ -520,11 +590,11 @@ def plant_run(name, args):
             tmp = tempfile.mkdtemp(prefix="gtls-interop-case.")
             good = judge(c, run_case(c, args.echo, pems, tmp))
             bad = judge(c, run_case(c, planted, pems, tmp))
-            if good[0] != "pass":
+            if good[0] not in ("pass", "refused"):
                 print("plant %s: %s fails BEFORE the plant (%s), so nothing was measured" % (name, c.name, good[1]))
                 status = 1
-            elif bad[0] == "pass":
-                print("plant %s: %s still PASSES with the defect planted" % (name, c.name))
+            elif bad[0] != "fail":
+                print("plant %s: %s still %s with the defect planted" % (name, c.name, bad[0].upper()))
                 status = 1
             else:
                 print("plant %s: %s passes, and fails with the defect planted (%s)" % (name, c.name, bad[1][:100]))
@@ -558,6 +628,9 @@ def main():
     if args.plant:
         return plant_run(args.plant, args)
 
+    if args.only and not [c for c in cases if args.only in c.name]:
+        print("interop: --only %r matches no case" % args.only, file=sys.stderr)
+        return 2
     declared = read_differences()
     in_code = {c.name for c in cases if c.declared}
     problems = []
@@ -598,6 +671,12 @@ def main():
     finally:
         shutil.rmtree(pems, ignore_errors=True)
     if not args.only:
+        total = totals["client"][0] + totals["server"][0]
+        passed = totals["client"][1] + totals["server"][1]
+        if total < POPULATION_FLOOR or totals["client"][0] < POPULATION_FLOOR // 3 or \
+                totals["server"][0] < POPULATION_FLOOR // 3 or passed < PASS_FLOOR:
+            problems.append("only %d cases ran and %d interoperated: the floors are %d and %d, so a population "
+                            "that shrank is not a pass" % (total, passed, POPULATION_FLOOR, PASS_FLOOR))
         for n in sorted(in_code - seen_declared):
             problems.append("%s: a declared difference that no longer happens" % n)
     print()

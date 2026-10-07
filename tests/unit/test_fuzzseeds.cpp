@@ -53,8 +53,8 @@ struct Harness {
 const Harness kHarnesses[] = {
     {"client", gtlsfuzz::client_one, 15},
     {"msg", gtlsfuzz::msg_one, 17},
-    {"server", gtlsfuzz::server_one, 15},
-    {"stream", gtlsfuzz::client_stream_one, 12},
+    {"server", gtlsfuzz::server_one, 26},
+    {"stream", gtlsfuzz::client_stream_one, 20},
     {"record", gtlsfuzz::record_one, 7},
     {"pump", gtlsfuzz::pump_one, 12},
 };
@@ -138,7 +138,7 @@ TEST(FuzzSeeds, EachHarnessAloneReachesItsOwnRolesStates) {
          "a record-fed client passes through inside one call";
 }
 
-TEST(FuzzSeeds, EveryByteFlippedAndEveryTruncationOfEveryStreamSeed) {
+TEST(FuzzSeeds, ByteFlipsAndTruncationsAtAStrideOfEveryStreamSeed) {
   size_t runs = 0;
   for (const Harness & h : kHarnesses) {
     const std::string kind = h.kind;
@@ -162,7 +162,7 @@ TEST(FuzzSeeds, EveryByteFlippedAndEveryTruncationOfEveryStreamSeed) {
   EXPECT_GT(runs, 800u);
 }
 
-TEST(FuzzSeeds, EveryByteFlippedAndEveryTruncationOfEveryMessageAndRecordSeed) {
+TEST(FuzzSeeds, ByteFlipsAndTruncationsOfEveryMessageAndRecordSeed) {
   for (const char * kind : {"msg", "record"}) {
     int (*run)(const uint8_t *, size_t) = std::string(kind) == "msg" ? gtlsfuzz::msg_one : gtlsfuzz::record_one;
     for (const std::string & p : seeds(kind)) {
@@ -190,7 +190,7 @@ TEST(FuzzSeeds, EveryByteFlippedAndEveryTruncationOfEveryMessageAndRecordSeed) {
 
 /* Two real endpoints, one byte of the traffic changed at a time: whichever
  * byte it is, in whichever direction, no check fails to hold. */
-TEST(FuzzSeeds, EveryPositionOfBothStreamsOfARealHandshakeChangedInTurn) {
+TEST(FuzzSeeds, PositionsAtAStrideOfBothStreamsOfARealHandshakeChangedInTurn) {
   size_t runs = 0;
   for (int direction = 0; direction < 2; direction++) {
     for (unsigned at = 0; at < 3200; at += 31) {

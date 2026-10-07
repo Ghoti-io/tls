@@ -94,7 +94,8 @@ static GTLS_Result install_keys(GTLS_Conn * c, GTLS_Epoch epoch, int write) {
   if (write) {
     memcpy(c->sec.wr_secret, secret, hlen);
     result = gtls_record_keys_from_secret(&c->sec.wr, (uint32_t)c->suite,
-        c->sec.wr_secret, c->limits.max_records_per_key);
+        c->sec.wr_secret,
+        epoch == GTLS_EPOCH_APPLICATION ? c->limits.max_records_per_key : 0);
     c->wr_epoch = epoch;
   } else {
     memcpy(c->sec.rd_secret, secret, hlen);
@@ -145,16 +146,15 @@ static GTLS_Result put_sealed(GTLS_Conn * c, unsigned type, const void * data,
   return result == GTLS_OK ? GTLS_OK : record_failed(c, result);
 }
 
-void gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description) {
+GTLS_Result gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description) {
   unsigned char a[2];
 
   a[0] = (unsigned char)level;
   a[1] = (unsigned char)description;
   if (c->wr_epoch == GTLS_EPOCH_INITIAL) {
-    (void)gtls_record_plain(GTLS_CT_ALERT, 0x0303, a, 2, &c->wire);
-  } else {
-    (void)gtls_record_seal(&c->sec.wr, GTLS_CT_ALERT, a, 2, 0, &c->wire);
+    return gtls_record_plain(GTLS_CT_ALERT, 0x0303, a, 2, &c->wire);
   }
+  return gtls_record_seal(&c->sec.wr, GTLS_CT_ALERT, a, 2, 0, &c->wire);
 }
 
 /** The dummy change_cipher_spec of RFC 8446 appendix D.4, once. */
@@ -277,10 +277,19 @@ static GTLS_Result on_ccs(GTLS_Conn * c, const unsigned char * body, size_t n) {
   return GTLS_OK;
 }
 
-static GTLS_Result on_alert(GTLS_Conn * c, const unsigned char * body, size_t n) {
+static GTLS_Result on_alert(GTLS_Conn * c, const unsigned char * body, size_t n,
+    int authenticated) {
   if (n != 2u) {
     /* An alert is one record of two bytes, never split and never empty. */
     return gtls_conn_fail(c, GTLS_ERR_CORRUPT, GTLS_ALERT_DECODE_ERROR);
+  }
+  if (!authenticated) {
+    /* Nobody vouched for this record. It can end the handshake, which anyone
+     * on the path can do by closing the connection, but it can neither be a
+     * clean close (that would be a truncation nobody could tell from the
+     * peer's own) nor be ignored. */
+    c->peer_alert = body[1];
+    return gtls_conn_fail(c, GTLS_ERR_ALERT, GTLS_ALERT_NONE);
   }
   if (body[1] == 0) {
     c->peer_closed = 1; /* close_notify */
@@ -320,6 +329,11 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
   unsigned inner;
   GTLS_Result result;
 
+  if (c->in.len != 0 && (type == GTLS_CT_CHANGE_CIPHER_SPEC || type == GTLS_CT_ALERT)) {
+    /* A handshake message is in pieces: only its next piece may follow
+     * (RFC 8446 section 5.1). */
+    return gtls_conn_unexpected(c);
+  }
   if (type == GTLS_CT_CHANGE_CIPHER_SPEC) {
     return on_ccs(c, body, blen);
   }
@@ -328,7 +342,7 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
      * alert in the clear, and this end may already be reading under keys. An
      * alert nobody authenticated can only end the handshake, which anyone
      * on the path can do by closing it. */
-    return on_alert(c, body, blen);
+    return on_alert(c, body, blen, 0);
   }
   if (epoch == GTLS_EPOCH_INITIAL) {
     pt = body;
@@ -358,12 +372,17 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
       }
       break;
     case GTLS_CT_ALERT:
-      result = on_alert(c, pt, pt_len);
+      if (c->in.len != 0) {
+        result = gtls_conn_unexpected(c);
+        break;
+      }
+      result = on_alert(c, pt, pt_len, epoch != GTLS_EPOCH_INITIAL);
       break;
     case GTLS_CT_APPLICATION_DATA:
-      if (c->state != GTLS_STATE_CONNECTED) {
+      if (c->state != GTLS_STATE_CONNECTED || c->in.len != 0) {
         result = gtls_conn_unexpected(c);
       } else {
+        c->ku_run = 0; /* data between updates: they are not a flood */
         result = gtls_buf_append(&c->app_in, pt, pt_len);
         if (result != GTLS_OK) {
           /* The room was checked before the record was read. */
@@ -554,7 +573,8 @@ GTLS_Result gtls_conn_on_key_update(GTLS_Conn * c, const unsigned char * msg,
   if (result != GTLS_OK) {
     return gtls_conn_fail_parse(c, result);
   }
-  if (++c->key_updates > c->limits.max_key_updates) {
+  c->key_updates++;
+  if (++c->ku_run > c->limits.max_key_updates) {
     return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
   result = rotate(c, 0);
@@ -564,7 +584,7 @@ GTLS_Result gtls_conn_on_key_update(GTLS_Conn * c, const unsigned char * msg,
   /* A request is answered before the next application data, with a
    * KeyUpdate that asks for nothing back (section 4.6.3). One already
    * waiting to go is the answer. */
-  if (request == 1u && c->ku_queued == 0) {
+  if (request == 1u && c->ku_queued == 0 && !c->local_closed) {
     return queue_key_update(c, 0);
   }
   return GTLS_OK;
@@ -697,7 +717,10 @@ GTLS_Result gtls_conn_close(GTLS_Conn * c) {
   if (result != GTLS_OK) {
     return result;
   }
-  gtls_stream_send_alert(c, GTLS_ALERT_WARNING, 0);
+  result = gtls_stream_send_alert(c, GTLS_ALERT_WARNING, 0);
+  if (result != GTLS_OK) {
+    return result; /* the close_notify did not fit: this end is not closed */
+  }
   c->local_closed = 1;
   return GTLS_OK;
 }

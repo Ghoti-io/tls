@@ -334,6 +334,46 @@ static GTLS_Result copy_sni(GTLS_Conn * c, const GTLS_Name * host) {
   return GTLS_OK;
 }
 
+/** 2 when one of the identity's names is exactly @p host, 1 when a wildcard one serves it, else 0. */
+static int name_rank(const GTLS_ServerIdentity * id, const unsigned char * host, size_t hlen) {
+  size_t off = 0;
+  size_t j;
+  int best = 0;
+
+  for (j = 0; j < id->name_count; j++) {
+    const unsigned char * pat = id->names + off;
+    size_t plen = id->name_len[j];
+
+    if (plen == hlen && names_equal(pat, host, plen)) {
+      return 2;
+    }
+    if (name_serves(pat, plen, host, hlen)) {
+      best = 1;
+    }
+    off += plen;
+  }
+  return best;
+}
+
+/** The scheme this identity would sign with for this client, or 0. */
+static unsigned scheme_for(const GTLS_Conn * c, const Offer * o, const GTLS_ServerIdentity * id) {
+  const GTLS_Context * x = c->context;
+  size_t i;
+
+  if (c->seam_scheme != 0) {
+    return c->seam_scheme;
+  }
+  for (i = 0; i < x->sig_alg_count; i++) {
+    unsigned s = (unsigned)x->sig_algs[i];
+
+    if (gtls_cv_scheme_ok(s) && has_u16(o->sigs, o->sig_count, s) &&
+        gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)) {
+      return s;
+    }
+  }
+  return 0;
+}
+
 /**
  * Choose what the connection will use from what the client offered:
  * the identity (by SNI, else the default), the suite, the group, the
@@ -343,30 +383,9 @@ static GTLS_Result copy_sni(GTLS_Conn * c, const GTLS_Name * host) {
 static GTLS_Result choose(GTLS_Conn * c, const Offer * o, int second,
     GTLS_Group * group, const GTLS_ClientShare ** share) {
   const GTLS_Context * x = c->context;
-  const GTLS_ServerIdentity * id;
   size_t i;
   size_t j;
   size_t k;
-
-  /* The identity. */
-  c->identity_index = x->default_identity;
-  c->sni_matched = 0;
-  if (o->host.len != 0) {
-    for (i = 0; i < x->identity_count && !c->sni_matched; i++) {
-      size_t off = 0;
-
-      for (j = 0; j < x->identities[i].name_count; j++) {
-        if (name_serves(x->identities[i].names + off, x->identities[i].name_len[j],
-                o->host.p, o->host.len)) {
-          c->identity_index = i;
-          c->sni_matched = 1;
-          break;
-        }
-        off += x->identities[i].name_len[j];
-      }
-    }
-  }
-  id = &x->identities[c->identity_index];
 
   /* The suite: the server's preference among the client's. */
   c->suite = GTLS_SUITE_NONE;
@@ -420,20 +439,41 @@ static GTLS_Result choose(GTLS_Conn * c, const Offer * o, int second,
     }
   }
 
-  /* The signature scheme: the first of the server's own that TLS 1.3 allows
-   * in CertificateVerify, that the client listed, and that the key signs. */
+  /* The identity and the signature scheme with it. The identity is the best
+   * match for the client's server_name (an exact name before a wildcard),
+   * and one that cannot sign with anything the client listed is passed over
+   * for the next match; then the default is tried. The scheme is the first
+   * of the server's own that TLS 1.3 allows in CertificateVerify, that the
+   * client listed, and that the key signs. */
+  c->identity_index = x->default_identity;
+  c->sni_matched = 0;
   c->scheme = 0;
-  if (c->seam_scheme != 0) {
-    c->scheme = c->seam_scheme;
-  } else {
-    for (i = 0; i < x->sig_alg_count; i++) {
-      unsigned s = (unsigned)x->sig_algs[i];
+  {
+    int rank;
+    int found = 0;
 
-      if (gtls_cv_scheme_ok(s) && has_u16(o->sigs, o->sig_count, s) &&
-          gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)) {
-        c->scheme = s;
-        break;
+    for (rank = 2; rank >= 1 && !found && o->host.len != 0; rank--) {
+      for (i = 0; i < x->identity_count; i++) {
+        unsigned s;
+
+        if (name_rank(&x->identities[i], o->host.p, o->host.len) != rank) {
+          continue;
+        }
+        s = scheme_for(c, o, &x->identities[i]);
+        if (s != 0) {
+          c->identity_index = i;
+          c->sni_matched = 1;
+          c->scheme = s;
+          found = 1;
+          break;
+        }
       }
+    }
+    if (!found) {
+      c->identity_index = x->default_identity;
+      c->scheme = scheme_for(c, o, &x->identities[x->default_identity]);
+      c->sni_matched = o->host.len != 0 &&
+          name_rank(&x->identities[x->default_identity], o->host.p, o->host.len) != 0;
     }
   }
   if (c->scheme == 0) {
@@ -492,8 +532,12 @@ static GTLS_Result sign_cv(GTLS_Conn * c, const unsigned char * content,
   GTLS_Result result;
 
   if (c->sign_fn != NULL) {
-    return c->sign_fn(c->sign_user, c, c->scheme, content, n, sig, GCERT_SIG_MAX,
+    result = c->sign_fn(c->sign_user, c, c->scheme, content, n, sig, GCERT_SIG_MAX,
         sig_len);
+    if (result == GTLS_OK && (*sig_len == 0 || *sig_len > GCERT_SIG_MAX)) {
+      return GTLS_ERR_INTERNAL; /* a signer that claims more than it was given room for */
+    }
+    return result;
   }
   switch (gcert_key_sign(c->context->identities[c->identity_index].key,
       (GCERT_SigScheme)c->scheme, content, n, sig, GCERT_SIG_MAX, sig_len)) {
@@ -518,8 +562,18 @@ static GTLS_Result sign_cv(GTLS_Conn * c, const unsigned char * content,
  * CertificateVerify, Finished. Leaves the connection waiting for the
  * client's Finished, with the application secrets derived.
  */
-static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
-    const GTLS_ClientShare * share) {
+
+/** Everything the flight derives that must not outlive it, wiped on every path out. */
+typedef struct FlightScratch {
+  unsigned char ecdhe[GTLS_KX_MAX];
+  unsigned char th[GTLS_HASH_MAX];
+  unsigned char verify[GTLS_HASH_MAX];
+  unsigned char content[GTLS_CV_CONTENT_MAX];
+  unsigned char sig[GCERT_SIG_MAX];
+} FlightScratch;
+
+static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, GTLS_Group group,
+    const GTLS_ClientShare * share, FlightScratch * k) {
   const GTLS_Context * x = c->context;
   const GTLS_ServerIdentity * id = &x->identities[c->identity_index];
   GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
@@ -528,12 +582,7 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   GTLS_KeyShare mine;
   GTLS_EeParams ee;
   GTLS_Buf m;
-  unsigned char ecdhe[GTLS_KX_MAX];
   size_t ecdhe_len = 0;
-  unsigned char th[GTLS_HASH_MAX];
-  unsigned char verify[GTLS_HASH_MAX];
-  unsigned char content[GTLS_CV_CONTENT_MAX];
-  unsigned char sig[GCERT_SIG_MAX];
   size_t sig_len = 0;
   size_t n;
   const unsigned char * ptr[GTLS_CERT_MAX];
@@ -557,10 +606,10 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  result = gtls_conn_shared_secret(c, group, share->kx, share->kx_len, ecdhe,
+  result = gtls_conn_shared_secret(c, group, share->kx, share->kx_len, k->ecdhe,
       &ecdhe_len);
   if (result != GTLS_OK) {
-    (void)gsec_wipe(ecdhe, sizeof ecdhe);
+    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);
     return gtls_conn_illegal(c); /* a point that is not on the curve, or too small */
   }
   sp.session_id = o->ch.session_id;
@@ -576,18 +625,18 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   }
   gtls_buf_free(&m);
   if (result != GTLS_OK) {
-    (void)gsec_wipe(ecdhe, sizeof ecdhe);
+    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);
     return c->state == GTLS_STATE_FAILED ? result
         : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, k->th);
   if (result == GTLS_OK) {
     result = gtls_schedule_early(&c->sec.schedule, hash);
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_handshake(&c->sec.schedule, ecdhe, ecdhe_len, th);
+    result = gtls_schedule_handshake(&c->sec.schedule, k->ecdhe, ecdhe_len, k->th);
   }
-  (void)gsec_wipe(ecdhe, sizeof ecdhe);
+  (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);
   gtls_conn_wipe_kx(c);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
@@ -639,20 +688,20 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   }
 
   /* CertificateVerify, over the transcript through Certificate. */
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, k->th);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  n = gtls_cv_content(1, th, hlen, content);
-  result = sign_cv(c, content, n, sig, &sig_len);
-  (void)gsec_wipe(content, sizeof content);
+  n = gtls_cv_content(1, k->th, hlen, k->content);
+  result = sign_cv(c, k->content, n, k->sig, &sig_len);
+  (void)gsec_wipe(k->content, sizeof k->content);
   if (result != GTLS_OK) {
-    (void)gsec_wipe(sig, sizeof sig);
+    (void)gsec_wipe(k->sig, sizeof k->sig);
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   gtls_buf_init(&m, c->allocator, 4096u);
-  result = gtls_msg_build_certificate_verify(c->scheme, sig, sig_len, &m);
-  (void)gsec_wipe(sig, sizeof sig);
+  result = gtls_msg_build_certificate_verify(c->scheme, k->sig, sig_len, &m);
+  (void)gsec_wipe(k->sig, sizeof k->sig);
   if (result == GTLS_OK) {
     result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
   }
@@ -663,16 +712,16 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   }
 
   /* Finished, over the transcript through CertificateVerify. */
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, k->th);
   if (result == GTLS_OK) {
-    result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, th, verify);
+    result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, k->th, k->verify);
   }
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   gtls_buf_init(&m, c->allocator, 4096u);
-  result = gtls_msg_build_finished(verify, hlen, &m);
-  (void)gsec_wipe(verify, sizeof verify);
+  result = gtls_msg_build_finished(k->verify, hlen, &m);
+  (void)gsec_wipe(k->verify, sizeof k->verify);
   if (result == GTLS_OK) {
     result = emit(c, GTLS_EPOCH_HANDSHAKE, &m);
   }
@@ -683,16 +732,28 @@ static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
   }
 
   /* The application secrets come from the transcript through this Finished. */
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, k->th);
   if (result == GTLS_OK) {
-    result = gtls_schedule_master(&c->sec.schedule, th);
+    result = gtls_schedule_master(&c->sec.schedule, k->th);
   }
-  (void)gsec_wipe(th, sizeof th);
+  (void)gsec_wipe(k->th, sizeof k->th);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_S_WAIT_FIN;
   return GTLS_OK;
+}
+
+
+static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, GTLS_Group group,
+    const GTLS_ClientShare * share) {
+  FlightScratch k;
+  GTLS_Result result;
+
+  memset(&k, 0, sizeof k);
+  result = send_flight_inner(c, o, group, share, &k);
+  (void)gsec_wipe(&k, sizeof k);
+  return result;
 }
 
 static GTLS_Result send_retry(GTLS_Conn * c, const unsigned char * msg,

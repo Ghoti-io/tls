@@ -262,6 +262,10 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
       config->sig_alg_count > GTLS_SIG_ALGS_MAX) {
     return GTLS_ERR_INVALID;
   }
+  if (config->role == GTLS_ROLE_SERVER && config->limits != NULL &&
+      config->limits->max_client_hello > GTLS_HELLO_MAX - 4u) {
+    return GTLS_ERR_INVALID; /* a hello it accepted could not be kept for a retry */
+  }
   c = gcu_allocator_calloc(allocator, 1, sizeof *c);
   if (c == NULL) {
     return GTLS_ERR_OOM;

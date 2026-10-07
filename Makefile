@@ -266,7 +266,7 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage clears this: --coverage links the gcov runtime, whose mangle_path
 # check-symbols is right to reject in a shipping library.
 TEST_GATES ?= check-symbols check-aliasing check-stamps check-secret check-harden \
-	check-depfiles check-analyzer check-foundation check-ct check-fuzz-ub
+	check-depfiles check-analyzer check-foundation check-ct check-fuzz-ub check-controls-anchors
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
@@ -385,7 +385,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 
 .PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-stamps check-aliasing
 .PHONY: check-secret check-foundation check-ct check-fuzz-ub check-harden check-depfiles
-.PHONY: check-analyzer analyze check-interop interop-plants
+.PHONY: check-analyzer analyze check-interop interop-plants check-controls check-controls-anchors
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 .PHONY: fuzz fuzz-clean
@@ -510,6 +510,12 @@ check-fuzz-ub: ## Fail unless the fuzz flags make undefined behaviour a failing 
 	fi
 	@printf 'check-fuzz-ub: planted undefined behaviour fails the run, and the control does not\n'
 
+check-controls-anchors: ## Fail if a planted defect in tools/controls.sh no longer applies exactly once
+	@sh tools/controls.sh --anchors
+
+check-controls: ## Plant each defect in a scratch copy and require its test to fail (slow; needs PREFIX)
+	@sh tools/controls.sh
+
 check-secret: ## Fail if src/ calls memcmp, a userspace generator, or printf
 	@python3 tools/check-secret.py
 
@@ -572,7 +578,7 @@ check-interop: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Run the OpenSSL inter
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION)
 
 interop-plants: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Plant a defect, one at a time, and require the interop cases to fail
-	@status=0; for p in record-nonce key-update-label server-cv-label client-finished; do \
+	@status=0; for p in record-nonce key-update-label server-cv-label client-finished alpn-failure supported-versions no-common-scheme plaintext-alert-rule sni-selection; do \
 		LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION) --plant $$p || status=1; \
 	done; exit $$status
 

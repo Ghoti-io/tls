@@ -17,7 +17,10 @@ selects its parser. The record fuzzers (server, stream, record) take the RFC's
 records, byte for byte, behind their option bytes; the two-endpoint pump takes
 option bytes and a few mutation entries. Every byte of content comes from
 tests/data/rfc8448; the only bytes written here are option bytes, the
-three-byte mutation entries of the pump, and the lengths that frame a segment.
+three-byte mutation entries of the pump, the lengths that frame a segment, the
+two-byte extension types edited in the RFC's ClientHello to take the server
+down each of its refusals, and a few seven-byte plaintext records (a
+change_cipher_spec, an alert) that need no key.
 `--check` fails if a committed seed differs from what this writes.
 """
 
@@ -138,6 +141,24 @@ def main():
     srv["unexpected-hello-after-flight"] = bytes([0]) + c_ch + c_ch
     srv["app-data-first"] = bytes([0]) + c_app
 
+    # The server, fed the RFC's ClientHello with one field edited in place (the
+    # lengths do not change): the paths a refusal takes.
+    def edit(record, old, new):
+        assert record.count(old) == 1, old.hex()
+        return record.replace(old, new)
+
+    srv["refuse-compression"] = bytes([0]) + c_ch[:5 + 48] + b"\x01" + c_ch[5 + 49:]
+    srv["refuse-no-versions"] = bytes([0]) + edit(c_ch, bytes.fromhex("002b0003020304"), bytes.fromhex("0a2b0003020304"))
+    srv["refuse-psk"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002900024001"))
+    srv["refuse-early-data"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002a00024001"))
+    srv["refuse-cookie"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002c00024001"))
+    srv["refuse-bad-alpn"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("001000024001"))
+    srv["refuse-plain-alert-after-hello"] = bytes([0]) + c_ch + bytes.fromhex("1503030002 0100".replace(" ", ""))
+    srv["refuse-plain-alert-first"] = bytes([0]) + bytes.fromhex("15030300020100")
+    srv["refuse-ccs-first"] = bytes([0]) + bytes.fromhex("140303000101") + c_ch
+    srv["ccs-after-hello"] = bytes([0]) + c_ch + bytes.fromhex("140303000101") + c_fin
+    srv["refuse-wrong-size-alert"] = bytes([0]) + c_ch + bytes.fromhex("150303000301 0000".replace(" ", ""))
+
     # The client, fed the RFC's server records.
     s_sh = simple["server.send-handshake-record.complete-record"]
     s_flight = simple["server.send-handshake-record@2.complete-record"]
@@ -161,6 +182,13 @@ def main():
     st["retry-trace-bytewise"] = bytes([0x03]) + h_hrr + h_sh + h_flight
     st["retry-trace-act"] = bytes([0x21]) + h_hrr + h_sh + h_flight
     st["alert-first"] = bytes([0]) + s_alert
+    st["plain-close-notify"] = bytes([0]) + bytes.fromhex("15030300020100")
+    st["plain-close-notify-after-hello"] = bytes([0]) + s_sh + bytes.fromhex("15030300020100")
+    st["wrong-size-plain-alert"] = bytes([0]) + s_sh + bytes.fromhex("150303000301 0000".replace(" ", ""))
+    st["ccs-between-hello-and-flight"] = bytes([0]) + s_sh + bytes.fromhex("140303000101") + s_flight
+    st["ccs-three-times"] = bytes([0]) + s_sh + bytes.fromhex("140303000101140303000101140303000101") + s_flight
+    st["ccs-after-connected"] = bytes([0]) + s_sh + s_flight + bytes.fromhex("140303000101")
+    st["plain-alert-connected"] = bytes([0]) + s_sh + s_flight + bytes.fromhex("15030300020100")
 
     # The record layer: seal-and-open (option bits 0-1 suite, 2 padding), and
     # open-only on real records.

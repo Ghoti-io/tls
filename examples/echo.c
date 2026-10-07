@@ -38,6 +38,8 @@
  *   --chain FILE     a DER certificate to present, leaf first   (server)
  *   --key FILE       the leaf's private key, PKCS#8 DER         (server)
  *   --name NAME      a server name the identity answers to      (server)
+ *   --next-identity  start another identity: the --chain, --key and --name
+ *                    that follow are its; the first is the default (server)
  *   --ca FILE        a DER trust anchor                         (client)
  *   --server-name N  the name to send and verify, default HOST  (client)
  *   --alpn NAME      a protocol to offer (client) or accept (server)
@@ -77,16 +79,20 @@ int main(void) {
 #include <unistd.h>
 
 #define MAX_FILES 16
+#define MAX_IDS 4
 #define IO_TIMEOUT_MS 15000
 
 typedef struct Options {
   int server;
   const char * host;
   int port;
-  const char * chain[MAX_FILES];
-  size_t chain_count;
-  const char * key;
-  const char * name;
+  struct {
+    const char * chain[MAX_FILES];
+    size_t chain_count;
+    const char * key;
+    const char * name;
+  } id[MAX_IDS];
+  size_t id_count;
   const char * ca[MAX_FILES];
   size_t ca_count;
   const char * server_name;
@@ -181,6 +187,7 @@ static int parse_options(int argc, char ** argv, Options * o) {
   int positional = 0;
 
   memset(o, 0, sizeof *o);
+  o->id_count = 1;
   o->message = "hello";
   o->now = (int64_t)time(NULL);
   if (argc < 2) {
@@ -216,16 +223,23 @@ static int parse_options(int argc, char ** argv, Options * o) {
       o->compat = 1;
       continue;
     }
+    if (strcmp(a, "--next-identity") == 0) {
+      if (o->id_count >= MAX_IDS) {
+        return -1;
+      }
+      o->id_count++;
+      continue;
+    }
     if (v == NULL) {
       return -1;
     }
     i++;
-    if (strcmp(a, "--chain") == 0 && o->chain_count < MAX_FILES) {
-      o->chain[o->chain_count++] = v;
+    if (strcmp(a, "--chain") == 0 && o->id[o->id_count - 1].chain_count < MAX_FILES) {
+      o->id[o->id_count - 1].chain[o->id[o->id_count - 1].chain_count++] = v;
     } else if (strcmp(a, "--key") == 0) {
-      o->key = v;
+      o->id[o->id_count - 1].key = v;
     } else if (strcmp(a, "--name") == 0) {
-      o->name = v;
+      o->id[o->id_count - 1].name = v;
     } else if (strcmp(a, "--ca") == 0 && o->ca_count < MAX_FILES) {
       o->ca[o->ca_count++] = v;
     } else if (strcmp(a, "--server-name") == 0) {
@@ -365,8 +379,7 @@ static void report_failure(const GTLS_Conn * conn) {
 
 /* ----------------------------------------------------------------- the contexts */
 
-typedef struct Material {
-  GCERT_TrustStore * trust;
+typedef struct IdMaterial {
   GCERT_Key * key;
   unsigned char * files[MAX_FILES];
   size_t lens[MAX_FILES];
@@ -375,26 +388,34 @@ typedef struct Material {
   const char * names[1];
   unsigned char * key_der;
   size_t key_len;
+} IdMaterial;
+
+typedef struct Material {
+  GCERT_TrustStore * trust;
+  IdMaterial id[MAX_IDS];
 } Material;
 
 static int load_material(const Options * o, Material * m) {
   size_t i;
+  size_t k;
 
   memset(m, 0, sizeof *m);
   if (o->server) {
-    if (o->chain_count == 0 || o->key == NULL) {
-      return -1;
-    }
-    for (i = 0; i < o->chain_count; i++) {
-      if (read_file(o->chain[i], &m->files[i], &m->lens[i]) != 0) {
+    for (k = 0; k < o->id_count; k++) {
+      if (o->id[k].chain_count == 0 || o->id[k].key == NULL) {
         return -1;
       }
-      m->file_count++;
-      m->chain[i] = m->files[i];
-    }
-    if (read_file(o->key, &m->key_der, &m->key_len) != 0 ||
-        gcert_key_from_pkcs8(NULL, m->key_der, m->key_len, &m->key) != GCERT_OK) {
-      return -1;
+      for (i = 0; i < o->id[k].chain_count; i++) {
+        if (read_file(o->id[k].chain[i], &m->id[k].files[i], &m->id[k].lens[i]) != 0) {
+          return -1;
+        }
+        m->id[k].file_count++;
+        m->id[k].chain[i] = m->id[k].files[i];
+      }
+      if (read_file(o->id[k].key, &m->id[k].key_der, &m->id[k].key_len) != 0 ||
+          gcert_key_from_pkcs8(NULL, m->id[k].key_der, m->id[k].key_len, &m->id[k].key) != GCERT_OK) {
+        return -1;
+      }
     }
   } else {
     if (gcert_trust_new(NULL, NULL, &m->trust) != GCERT_OK) {
@@ -417,15 +438,18 @@ static int load_material(const Options * o, Material * m) {
 
 static void free_material(Material * m) {
   size_t i;
+  size_t k;
 
-  for (i = 0; i < m->file_count; i++) {
-    free(m->files[i]);
+  for (k = 0; k < MAX_IDS; k++) {
+    for (i = 0; i < m->id[k].file_count; i++) {
+      free(m->id[k].files[i]);
+    }
+    if (m->id[k].key_der != NULL) {
+      memset(m->id[k].key_der, 0, m->id[k].key_len);
+      free(m->id[k].key_der);
+    }
+    gcert_key_free(m->id[k].key);
   }
-  if (m->key_der != NULL) {
-    memset(m->key_der, 0, m->key_len);
-    free(m->key_der);
-  }
-  gcert_key_free(m->key);
   gcert_trust_free(m->trust);
 }
 
@@ -433,10 +457,10 @@ int main(int argc, char ** argv) {
   Options o;
   Material m;
   GTLS_ContextConfig config;
-  GTLS_Identity identity;
+  GTLS_Identity identity[MAX_IDS];
+  size_t chain_lens[MAX_IDS][MAX_FILES];
   GTLS_Context * context = NULL;
   GTLS_Conn * conn = NULL;
-  size_t chain_lens[MAX_FILES];
   unsigned char buf[16384];
   unsigned char echo[65536];
   size_t echo_len = 0;
@@ -470,19 +494,23 @@ int main(int argc, char ** argv) {
   config.sig_alg_count = o.sig_count;
   config.middlebox_compat = o.compat;
   if (o.server) {
-    for (i = 0; i < o.chain_count; i++) {
-      chain_lens[i] = m.lens[i];
+    size_t k;
+
+    for (k = 0; k < o.id_count; k++) {
+      for (i = 0; i < o.id[k].chain_count; i++) {
+        chain_lens[k][i] = m.id[k].lens[i];
+      }
+      memset(&identity[k], 0, sizeof identity[k]);
+      identity[k].chain = m.id[k].chain;
+      identity[k].chain_lens = chain_lens[k];
+      identity[k].chain_count = o.id[k].chain_count;
+      identity[k].key = m.id[k].key;
+      m.id[k].names[0] = o.id[k].name;
+      identity[k].names = o.id[k].name != NULL ? m.id[k].names : NULL;
+      identity[k].name_count = o.id[k].name != NULL ? 1u : 0u;
     }
-    memset(&identity, 0, sizeof identity);
-    identity.chain = m.chain;
-    identity.chain_lens = chain_lens;
-    identity.chain_count = o.chain_count;
-    identity.key = m.key;
-    identity.names = o.name != NULL ? m.names : NULL;
-    m.names[0] = o.name;
-    identity.name_count = o.name != NULL ? 1u : 0u;
-    config.identities = &identity;
-    config.identity_count = 1;
+    config.identities = identity;
+    config.identity_count = o.id_count;
   }
   if (gtls_context_new(NULL, &config, &context) != GTLS_OK) {
     free_material(&m);

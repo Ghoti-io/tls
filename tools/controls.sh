@@ -24,9 +24,6 @@
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-: "${PREFIX:?set PREFIX to the prefix holding cutil, security and certificate}"
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/gtls-controls.XXXXXX")
-trap 'rm -rf "$scratch"' EXIT
 
 # name, file, text removed, text put in its place, test binary; tab-separated
 # (a bar is part of the text a plant removes)
@@ -57,7 +54,7 @@ record-authentication	src/record/record.c	if (result != GTLS_OK) {\n    (void)gs
 record-overflow	src/client/stream.c	if (len > GTLS_RECORD_CIPHERTEXT_MAX \|\|	if (0 \|\|	testStream
 stream-truncation	src/client/stream.c	return gtls_conn_fail(c, GTLS_ERR_TRUNCATED, GTLS_ALERT_NONE);	return GTLS_OK;	testStream
 stream-ccs-limit	src/client/stream.c	\|\| ++c->ccs_seen > GTLS_CCS_MAX	\|\| 0	testStream
-key-update-answer	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0) {	if (0) {	testStream
+key-update-answer	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0 \&\& !c->local_closed) {	if (0) {	testStream
 key-update-limit	src/client/stream.c	if (c->sec.wr.seq + 1u >= c->sec.wr.limit) {	if (0) {	testStream
 bad-record-mac-alert	src/client/stream.c	return gtls_conn_fail(c, result, GTLS_ALERT_BAD_RECORD_MAC);	return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	testStream
 server-alpn-overlap	src/server/server.c	if (c->alpn_selected_len == 0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,	if (0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,	testServer
@@ -68,6 +65,39 @@ server-early-data	src/server/server.c	if (gtls_msg_find_ext(ch->exts, ch->ext_co
 server-version	src/server/server.c	if (!tls13) {	if (0) {	testServer
 server-scheme-fits	src/server/server.c	gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)	1	testServer
 server-cv-label	src/client/verify.c	static const char server_label[] = "TLS 1.3, server CertificateVerify";	static const char server_label[] = "TLS 1.3, client CertificateVerify";	testRfc8448
+plain-alert-connected	src/client/stream.c	!(type == GTLS_CT_ALERT \&\& c->state != GTLS_STATE_CONNECTED \&\& len == 2u)	!(type == GTLS_CT_ALERT \&\& len == 2u)	testEdges
+plain-alert-length	src/client/stream.c	c->state != GTLS_STATE_CONNECTED \&\& len == 2u	c->state != GTLS_STATE_CONNECTED	testEdges
+plain-alert-clean-close	src/client/stream.c	if (!authenticated) {	if (0) {	testEdges
+fragment-interleave	src/client/stream.c	if (c->in.len != 0 \&\& (type == GTLS_CT_CHANGE_CIPHER_SPEC \|\| type == GTLS_CT_ALERT)) {	if (0) {	testEdges
+fragment-alert-inner	src/client/stream.c	      if (c->in.len != 0) {\n        result = gtls_conn_unexpected(c);	      if (0) {\n        result = gtls_conn_unexpected(c);	testEdges
+fragment-app-data	src/client/stream.c	if (c->state != GTLS_STATE_CONNECTED \|\| c->in.len != 0) {	if (c->state != GTLS_STATE_CONNECTED) {	testEdges
+key-update-last	src/client/client.c	        (was_key_update \&\& c->mode == GTLS_MODE_STREAM))) {	        0)) {	testEdges
+key-update-after-close	src/client/stream.c	c->ku_queued == 0 \&\& !c->local_closed) {	c->ku_queued == 0) {	testEdges
+key-update-run-reset	src/client/stream.c	c->ku_run = 0; /* data between updates: they are not a flood */	(void)0;	testEdges
+key-update-queued-count	src/client/stream.c	    if (c->ku_queued > 0) {\n      c->ku_queued--;\n    }	    if (c->ku_queued > 0) {\n    }	testEdges
+key-update-answer-once	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0 \&\& !c->local_closed) {	if (request == 1u \&\& !c->local_closed) {	testEdges
+server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	(c->state == GTLS_STATE_CONNECTED)) {	testEdges
+client-dummy-record	src/client/stream.c	if (c->role == GTLS_ROLE_CLIENT \&\& c->context->middlebox_compat) {	if (0) {	testEdges
+alpn-bytes	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(o->alpn[k].p, x->alpn + off + 1u, n) == GSEC_OK	o->alpn[k].len == n	testEdges
+alpn-length	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(	gsec_equal(	testEdges
+retry-suites	src/server/server.c	gsec_equal(first.suites, o->ch.suites, first.suites_len) != GSEC_OK \|\|	0 \|\|	testEdges
+retry-extension-bytes	src/server/server.c	b == NULL \|\| a->len != b->len \|\| gsec_equal(a->data, b->data, a->len) != GSEC_OK	b == NULL \|\| a->len != b->len	testEdges
+retry-extension-length	src/server/server.c	b == NULL \|\| a->len != b->len \|\| gsec_equal(a->data, b->data, a->len) != GSEC_OK	b == NULL \|\| gsec_equal(a->data, b->data, a->len < b->len ? a->len : b->len) != GSEC_OK	testEdges
+context-chain-count	src/client/context.c	in->chain_count > GTLS_CERT_MAX \|\|	0 \|\|	testEdges
+context-chain-empty	src/client/context.c	in->chain[i] == NULL \|\| in->chain_lens[i] == 0 \|\|	in->chain[i] == NULL \|\|	testEdges
+context-chain-total	src/client/context.c	in->chain_lens[i] > 0xffffffu - total) {	0) {	testEdges
+context-chain-fit	src/client/context.c	if (msg + 1024u > x->limits.max_output_bytes) {	if (0) {	testEdges
+context-hello-cap	src/client/context.c	config->limits->max_client_hello > GTLS_HELLO_MAX - 4u) {	0) {	testEdges
+sni-exact-first	src/server/server.c	    if (plen == hlen \&\& names_equal(pat, host, plen)) {\n      return 2;	    if (0) {\n      return 2;	testEdges
+sni-fallback	src/server/server.c	        if (s != 0) {\n          c->identity_index = i;	        if (1) {\n          c->identity_index = i;	testEdges
+sni-first-match	src/server/server.c	          found = 1;\n          break;	          found = 1;	testEdges
+sni-length	src/server/server.c	if (o->host.len > 255u) {	if (0) {	testEdges
+seal-padding-wrap	src/record/record.c	padding > GTLS_RECORD_PLAIN_MAX + 256u - GTLS_RECORD_TAG - 1u - pt_len	pt_len + 1u + padding > GTLS_RECORD_PLAIN_MAX + 256u - GTLS_RECORD_TAG	testEdges
+signer-length	src/server/server.c	if (result == GTLS_OK \&\& (*sig_len == 0 \|\| *sig_len > GCERT_SIG_MAX)) {	if (0) {	testEdges
+handshake-key-limit	src/client/stream.c	epoch == GTLS_EPOCH_APPLICATION ? c->limits.max_records_per_key : 0	c->limits.max_records_per_key	testEdges
+wire-room	src/client/client.c	2u * (size_t)c->limits.max_output_bytes + 4096u + GTLS_RECORD_HEADER +\n          GTLS_RECORD_CIPHER_MAX);	2u * (size_t)c->limits.max_output_bytes + 4096u);	testEdges
+oom-in-flight	src/server/server.c	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
+oom-in-record-buffer	src/client/stream.c	      *consumed = pos;\n      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	      *consumed = pos;\n      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
 PLANTS
 }
 
@@ -84,6 +114,37 @@ run_test() {
 }
 
 status=0
+if [ "${1:-}" = "--anchors" ]; then
+  # Fast and needs no build: every plant's text is in the tree exactly once,
+  # so a plant that stopped applying (the code moved) fails `make test` rather
+  # than going quietly unmeasured.
+  plants | python3 -c '
+import sys
+root = sys.argv[1]
+bad = 0
+n = 0
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
+        continue
+    name, path, old = line.split("\t")[:3]
+    old = old.replace("\\&", "&").replace("\\|", "|").replace("\\n", "\n")
+    text = open(root + "/" + path).read()
+    n += 1
+    if text.count(old) != 1:
+        print("controls: %s: its text occurs %d times in %s (stale plant)" % (name, text.count(old), path), file=sys.stderr)
+        bad = 1
+if n < 40:
+    print("controls: only %d plants" % n, file=sys.stderr)
+    bad = 1
+print("controls: %d plants, each applying exactly once" % n)
+sys.exit(bad)
+' "$root"
+  exit $?
+fi
+: "${PREFIX:?set PREFIX to the prefix holding cutil, security and certificate}"
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/gtls-controls.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
 want="$*"
 tab=$(printf '\t')
 plants | while IFS="$tab" read -r name file from to test; do

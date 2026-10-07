@@ -185,7 +185,7 @@ GTLS_Result gtls_record_seal(GTLS_RecordKeys * k, unsigned inner_type,
     return GTLS_ERR_INVALID;
   }
   if (pt_len > GTLS_RECORD_PLAIN_MAX ||
-      pt_len + 1u + padding > GTLS_RECORD_PLAIN_MAX + 256u - GTLS_RECORD_TAG) {
+      padding > GTLS_RECORD_PLAIN_MAX + 256u - GTLS_RECORD_TAG - 1u - pt_len) {
     return GTLS_ERR_LIMIT;
   }
   if (k->seq >= k->limit) {

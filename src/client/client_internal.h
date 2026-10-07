@@ -47,6 +47,8 @@
 #include "../record/record_internal.h"
 #include "../schedule/schedule_internal.h"
 
+/** The most a ClientHello can come to, header included, and so the most a server accepts. */
+#define GTLS_HELLO_MAX 65540u
 #define GTLS_ALPN_WIRE_MAX 1024u
 #define GTLS_SIG_ALGS_MAX 16u
 
@@ -206,7 +208,8 @@ struct GTLS_Conn {
   int peer_closed;                  /* close_notify received */
   int local_closed;                 /* close_notify sent */
   unsigned peer_alert;
-  unsigned key_updates;
+  unsigned key_updates;             /* KeyUpdates received, in all */
+  unsigned ku_run;                  /* ... since application data last arrived */
   unsigned ku_queued;               /* KeyUpdate messages queued, not yet sealed */
 };
 
@@ -270,7 +273,7 @@ void gtls_stream_free(GTLS_Conn * c);
 /** Turn queued handshake output into records. A failed connection sends nothing more. */
 GTLS_Result gtls_stream_flush(GTLS_Conn * c);
 /** Seal and queue @p alert under the keys in use; for failure, best effort. */
-void gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description);
+GTLS_Result gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description);
 
 /** The default chain and name check, which is what ships. */
 GTLS_Result gtls_verify_chain(void * user, const GTLS_Conn * conn,

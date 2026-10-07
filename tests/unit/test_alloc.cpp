@@ -182,7 +182,9 @@ TEST_P(StreamAllocationSweep, FailingEachAllocationLeaksNothingAndIsNeverSilent)
     if (r.create != GTLS_OK) {
       EXPECT_EQ(r.create, GTLS_ERR_OOM) << n;
     } else {
-      EXPECT_TRUE(r.any_oom || !r.both_connected || !r.clean) << n;
+      /* A connection said out-of-memory: not internal error, not a protocol
+       * failure, not a handshake that went on without a block it asked for. */
+      EXPECT_TRUE(r.any_oom) << "allocation " << n << " failed and no connection reported out-of-memory";
     }
   }
   TestAlloc past;
