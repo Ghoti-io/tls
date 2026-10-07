@@ -969,6 +969,10 @@ inline int pump_one(const uint8_t * data, size_t size) {
   if ((opt & 0x10u) != 0) {
     scfg.groups = p256only;
     scfg.group_count = 1;
+    /* A client limited to another group has nothing in common with a server
+     * that wants P-256 only, and an unmutated pump must connect. */
+    ccfg.groups = nullptr;
+    ccfg.group_count = 0;
   }
   GTLS_Limits lim;
   gtls_limits_default(&lim);
