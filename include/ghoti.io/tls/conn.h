@@ -84,7 +84,10 @@ typedef struct GTLS_Conn GTLS_Conn;
  * brackets is not one: the caller removes them.
  *
  * @param context Outlives the connection. Not NULL.
- * @param host The name or address, not NUL-terminated. Not NULL; 1 to 255 bytes.
+ * @param host The name or address, not NUL-terminated. Not NULL; 1 to 255
+ *   bytes of ASCII with no NUL and no trailing dot (an A-label: this library
+ *   has no IDNA). Anything else is ::GTLS_ERR_INVALID.
+ * @param host_len Its length in bytes.
  * @param out Receives the connection. Not NULL; written only on success.
  * @return ::GTLS_OK, ::GTLS_ERR_INVALID, ::GTLS_ERR_UNSUPPORTED, or
  *   ::GTLS_ERR_OOM.
@@ -101,6 +104,7 @@ GTLS_API void gtls_conn_free(GTLS_Conn * conn);
  * Draws the random and the ephemeral key from the kernel generator.
  *
  * @return ::GTLS_OK; ::GTLS_ERR_INVALID if already started;
+ *   ::GTLS_ERR_FAILED if the connection has already failed;
  *   ::GTLS_ERR_IO if the generator failed; ::GTLS_ERR_OOM. After a failure
  *   the connection is failed.
  */
@@ -118,8 +122,12 @@ GTLS_API GTLS_Result gtls_conn_start(GTLS_Conn * conn);
  *   certificates. The library has no clock.
  * @return ::GTLS_OK when everything given was accepted (including when the
  *   last message is still incomplete); otherwise the reason the handshake
- *   failed, and the connection is failed: every later call returns
- *   ::GTLS_ERR_FAILED, and its secrets have been wiped.
+ *   failed, and the connection is failed and its secrets have been wiped.
+ *   After that ::gtls_conn_start, ::gtls_conn_feed, ::gtls_conn_secret,
+ *   ::gtls_conn_alpn, ::gtls_conn_server_name_acknowledged and
+ *   ::gtls_conn_peer_certificate return ::GTLS_ERR_FAILED; the accessors that
+ *   report the failure, and ::gtls_conn_pending_output and
+ *   ::gtls_conn_consume_output, keep working.
  */
 GTLS_API GTLS_Result gtls_conn_feed(GTLS_Conn * conn, GTLS_Epoch epoch,
     const void * data, size_t len, int64_t unix_time);
@@ -197,21 +205,32 @@ GTLS_API GTLS_Group gtls_conn_group(const GTLS_Conn * conn);
  *   freed; NULL with @p len 0 when none was chosen or EncryptedExtensions has
  *   not arrived.
  * @param len Receives its length. Not NULL.
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID, or ::GTLS_ERR_FAILED.
  */
 GTLS_API GTLS_Result gtls_conn_alpn(const GTLS_Conn * conn,
     const unsigned char ** protocol, size_t * len);
 
-/** @brief 1 when the server acknowledged the server_name it was sent. */
-GTLS_API int gtls_conn_server_name_acknowledged(const GTLS_Conn * conn);
+/**
+ * @brief Whether the server acknowledged the server_name it was sent.
+ *
+ * @param out Receives 1 or 0 (0 until EncryptedExtensions has arrived).
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID, or ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_server_name_acknowledged(const GTLS_Conn * conn,
+    int * out);
 
 /** @brief 1 when a HelloRetryRequest was answered. */
 GTLS_API int gtls_conn_retried(const GTLS_Conn * conn);
 
 /**
- * @brief The server's end-entity certificate, once it has been accepted.
+ * @brief The server's end-entity certificate, once the handshake has completed.
+ *
+ * Before that, though the chain may already have been accepted, it is NULL:
+ * the certificate is trusted only after CertificateVerify and Finished. A
+ * failed connection answers ::GTLS_ERR_FAILED.
  *
  * @param der Receives a pointer into the connection, valid until it is
- *   freed; NULL when none has been accepted.
+ *   freed; NULL until the connection is connected.
  * @param len Receives its length. Not NULL.
  */
 GTLS_API GTLS_Result gtls_conn_peer_certificate(const GTLS_Conn * conn,

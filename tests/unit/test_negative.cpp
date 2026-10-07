@@ -189,7 +189,7 @@ static std::vector<Case> certificate_cases() {
         o.chain = {make_cert(l), w.pki.inter};
       }, GTLS_ERR_CERT_INVALID, GTLS_ALERT_BAD_CERTIFICATE});
   c.push_back({"EmptyCertificateList", [](World &, SimOptions & o) { o.chain = {}; },
-      GTLS_ERR_CERT_INVALID, GTLS_ALERT_BAD_CERTIFICATE});
+      GTLS_ERR_CERT_INVALID, GTLS_ALERT_DECODE_ERROR}); /* RFC 8446 section 4.4.2 */
   c.push_back({"LeafIsGarbage", [](World &, SimOptions & o) { o.chain = {Bytes(40, 0x30)}; },
       GTLS_ERR_CERT_INVALID, GTLS_ALERT_BAD_CERTIFICATE});
   c.push_back({"MoreCertificatesThanTheLimit", [](World & w, SimOptions & o) {
@@ -1002,6 +1002,8 @@ TEST(Limits, TheOutputQueueIsCapped) {
   w.build();
   EXPECT_EQ(gtls_conn_start(w.conn), GTLS_ERR_LIMIT);
   EXPECT_TRUE(gtls_conn_is_failed(w.conn));
+  EXPECT_EQ(gtls_conn_alert(w.conn), GTLS_ALERT_INTERNAL_ERROR)
+      << "a cap of ours is not the peer's decode error";
   EXPECT_TRUE(gtls_conn_secrets_are_wiped(w.conn)) << "the key share's private half too";
 }
 

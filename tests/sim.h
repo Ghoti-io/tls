@@ -106,6 +106,7 @@ struct CertSpec {
   int64_t not_before = kNow - 30 * kDay;
   int64_t not_after = kNow + 30 * kDay;
   std::string dns;
+  Bytes ip;  /* an iPAddress SAN, 4 or 16 bytes */
   bool has_eku = false;
   bool eku_server = false;
   bool eku_client = false;
@@ -121,8 +122,15 @@ inline Bytes make_cert(const CertSpec & s) {
           : seq({Bytes{0x01, 0x01, 0xff}}))
       : seq({});
   exts.push_back(seq({oid(Bytes{0x55, 0x1d, 0x13}), Bytes{0x01, 0x01, 0xff}, tlv(0x04, bc_value)}));
-  if (!s.dns.empty()) {
-    Bytes san = seq({tlv(0x82, Bytes(s.dns.begin(), s.dns.end()))});
+  if (!s.dns.empty() || !s.ip.empty()) {
+    std::vector<Bytes> names;
+    if (!s.dns.empty()) {
+      names.push_back(tlv(0x82, Bytes(s.dns.begin(), s.dns.end())));
+    }
+    if (!s.ip.empty()) {
+      names.push_back(tlv(0x87, s.ip));
+    }
+    Bytes san = seq(names);
     exts.push_back(seq({oid(Bytes{0x55, 0x1d, 0x11}), tlv(0x04, san)}));
   }
   if (s.has_eku) {

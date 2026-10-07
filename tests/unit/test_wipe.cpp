@@ -176,6 +176,52 @@ TEST(Wipe, ASecretReadOutThroughTheApiIsTheCallersToWipe) {
   EXPECT_EQ(buf[n], 0) << "nothing written past the digest";
 }
 
+/* The other groups and the other hash: the P-256 and P-384 private keys, and
+ * the 48-byte secrets of an AES-256-GCM-SHA384 handshake. */
+TEST(Wipe, NoSecretReachesAFreedBlockForP256P384AndSha384) {
+  struct Case {
+    GTLS_Group group;
+    GTLS_Suite suite;
+    size_t priv_len;
+  };
+  const Case cases[] = {{GTLS_GROUP_SECP256R1, GTLS_SUITE_AES_128_GCM_SHA256, 32},
+      {GTLS_GROUP_SECP384R1, GTLS_SUITE_AES_256_GCM_SHA384, 48},
+      {GTLS_GROUP_SECP256R1, GTLS_SUITE_AES_256_GCM_SHA384, 32}};
+  for (const Case & c : cases) {
+    TestAlloc alloc;
+    Watch watch;
+    {
+      World w;
+      w.allocator = &alloc.a;
+      GTLS_Group groups[1] = {c.group};
+      w.cfg.groups = groups;
+      w.cfg.group_count = 1;
+      w.build();
+      const Bytes priv(c.priv_len, 0x2d);
+      ScriptedRandom rnd;
+      rnd.chunks = {kClientRandom, priv};
+      gtls_conn_set_hooks(w.conn, ScriptedRandom::fn, &rnd, nullptr, nullptr);
+      SimOptions o = w.server_options();
+      o.group = c.group;
+      o.suite = c.suite;
+      SimServer s(o);
+      ASSERT_EQ(w.run(s), GTLS_OK);
+      const GTLS_Schedule & k = s.sched;
+      const size_t h = k.hlen;
+      ASSERT_EQ(h, c.suite == GTLS_SUITE_AES_256_GCM_SHA384 ? 48u : 32u);
+      watch.secrets = {priv, Bytes(k.handshake, k.handshake + h), Bytes(k.master, k.master + h),
+          Bytes(k.c_hs, k.c_hs + h), Bytes(k.s_hs, k.s_hs + h), Bytes(k.c_ap, k.c_ap + h),
+          Bytes(k.s_ap, k.s_ap + h)};
+      watch.install(alloc);
+      const unsigned char * raw = reinterpret_cast<const unsigned char *>(w.conn);
+      EXPECT_TRUE(contains(raw, sizeof(GTLS_Conn), Bytes(k.c_ap, k.c_ap + h)))
+          << "held until the free";
+    }
+    EXPECT_EQ(watch.found, 0) << "group " << c.group << " suite " << c.suite;
+    EXPECT_EQ(alloc.live, 0);
+  }
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

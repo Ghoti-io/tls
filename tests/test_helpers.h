@@ -136,6 +136,13 @@ struct FixedVerdict {
   }
 };
 
+/** gtls_conn_server_name_acknowledged as a plain value, failing the test if it errs. */
+inline int sni_ack(const GTLS_Conn * c) {
+  int v = -1;
+  EXPECT_EQ(gtls_conn_server_name_acknowledged(c, &v), GTLS_OK);
+  return v;
+}
+
 /** An empty trust store, for the tests that supply their own verdict. */
 struct EmptyTrust {
   GCERT_TrustStore * store = nullptr;

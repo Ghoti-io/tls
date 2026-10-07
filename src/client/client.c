@@ -26,8 +26,9 @@
  * RFC 8446 sections 4 and 7 and appendix A.1.
  *
  * Every failure goes through fail(), which records the reason and the alert,
- * wipes the secrets, and makes the connection terminal. There is no path
- * out of a handshake that leaves a secret behind.
+ * wipes the secrets, and makes the connection terminal, so no failure leaves
+ * a secret behind. A handshake that succeeds keeps its secrets until the
+ * connection is freed or fails.
  */
 
 #include <ghoti.io/tls/macros.h>
@@ -123,8 +124,20 @@ GTLS_Result gtls_conn_new(const GTLS_Context * context, const char * host,
   size_t ip_len = 0;
   const GTLS_Allocator * allocator;
 
+  size_t i;
+
   if (context == NULL || host == NULL || host_len == 0 || host_len > 255u ||
       out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  /* What reaches the wire and the name check is ASCII, with no NUL and no
+   * trailing dot: an A-label, as gcert_x509_verify_host wants it. */
+  for (i = 0; i < host_len; i++) {
+    if (host[i] == 0 || (unsigned char)host[i] > 0x7fu) {
+      return GTLS_ERR_INVALID;
+    }
+  }
+  if (host[host_len - 1u] == '.') {
     return GTLS_ERR_INVALID;
   }
   if (context->role != GTLS_ROLE_CLIENT) {
@@ -423,7 +436,8 @@ static GTLS_Result queue(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
   GTLS_Result result = gtls_buf_append(&c->out[epoch], data, n);
 
   if (result != GTLS_OK) {
-    return fail_parse(c, result == GTLS_ERR_LIMIT ? GTLS_ERR_LIMIT : result);
+    /* The cap is ours (max_output_bytes), not something the peer sent. */
+    return fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   return GTLS_OK;
 }
@@ -501,6 +515,9 @@ GTLS_Result gtls_conn_start_raw(GTLS_Conn * c, const void * hello,
 
   if (c == NULL || hello == NULL || x25519_private == NULL || hello_len < 4u) {
     return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
   }
   if (c->state != GTLS_STATE_NEW) {
     return GTLS_ERR_INVALID;
@@ -765,7 +782,9 @@ static GTLS_Result on_certificate(GTLS_Conn * c, const unsigned char * msg,
     return illegal(c); /* only a CertificateRequest gives a nonempty one */
   }
   if (cert.count == 0) {
-    return fail(c, GTLS_ERR_CERT_INVALID, GTLS_ALERT_BAD_CERTIFICATE);
+    /* RFC 8446 section 4.4.2: a server's Certificate must not be empty, and
+     * the alert for one that is is decode_error. */
+    return fail(c, GTLS_ERR_CERT_INVALID, GTLS_ALERT_DECODE_ERROR);
   }
   if (cert.has_entry_extensions) {
     /* status_request and signed_certificate_timestamp were not offered. */
@@ -1110,7 +1129,7 @@ unsigned gtls_conn_alert(const GTLS_Conn * c) {
 }
 
 GTLS_State gtls_conn_state(const GTLS_Conn * c) {
-  return c->state;
+  return c == NULL ? GTLS_STATE_FAILED : c->state;
 }
 
 GTLS_Result gtls_conn_secret(const GTLS_Conn * c, GTLS_Epoch epoch,
@@ -1161,6 +1180,9 @@ GTLS_Result gtls_conn_alpn(const GTLS_Conn * c, const unsigned char ** protocol,
   if (c == NULL || protocol == NULL || len == NULL) {
     return GTLS_ERR_INVALID;
   }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
   if (c->alpn_selected_len == 0) {
     *protocol = NULL;
     *len = 0;
@@ -1171,8 +1193,15 @@ GTLS_Result gtls_conn_alpn(const GTLS_Conn * c, const unsigned char ** protocol,
   return GTLS_OK;
 }
 
-int gtls_conn_server_name_acknowledged(const GTLS_Conn * c) {
-  return c != NULL && c->sni_acknowledged;
+GTLS_Result gtls_conn_server_name_acknowledged(const GTLS_Conn * c, int * out) {
+  if (c == NULL || out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  *out = c->sni_acknowledged;
+  return GTLS_OK;
 }
 
 int gtls_conn_retried(const GTLS_Conn * c) {
@@ -1183,6 +1212,16 @@ GTLS_Result gtls_conn_peer_certificate(const GTLS_Conn * c,
     const unsigned char ** der, size_t * len) {
   if (c == NULL || der == NULL || len == NULL) {
     return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  /* The certificate is trusted only once CertificateVerify and Finished have
+   * both passed. */
+  if (c->state != GTLS_STATE_CONNECTED) {
+    *der = NULL;
+    *len = 0;
+    return GTLS_OK;
   }
   *der = c->leaf;
   *len = c->leaf_len;
@@ -1195,6 +1234,9 @@ GTLS_Result gtls_conn_debug_secret(const GTLS_Conn * c, GTLS_SecretId id,
     void * out, size_t cap, size_t * len) {
   const unsigned char * s;
 
+  if (c == NULL || out == NULL || len == NULL) {
+    return GTLS_ERR_INVALID;
+  }
   switch (id) {
     case GTLS_SECRET_EARLY: s = c->sec.schedule.early; break;
     case GTLS_SECRET_HANDSHAKE: s = c->sec.schedule.handshake; break;
@@ -1214,10 +1256,14 @@ GTLS_Result gtls_conn_debug_secret(const GTLS_Conn * c, GTLS_SecretId id,
 }
 
 int gtls_conn_secrets_are_wiped(const GTLS_Conn * c) {
-  const unsigned char * p = (const unsigned char *)&c->sec;
+  const unsigned char * p;
   unsigned acc = 0;
   size_t i;
 
+  if (c == NULL) {
+    return 1;
+  }
+  p = (const unsigned char *)&c->sec;
   for (i = 0; i < sizeof c->sec; i++) {
     acc |= p[i];
   }
@@ -1226,8 +1272,12 @@ int gtls_conn_secrets_are_wiped(const GTLS_Conn * c) {
 
 GTLS_Result gtls_conn_debug_transcript(const GTLS_Conn * c, void * out,
     size_t cap, size_t * len) {
-  GTLS_Hash hash = c->sec.transcript.hash;
+  GTLS_Hash hash;
 
+  if (c == NULL || out == NULL || len == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  hash = c->sec.transcript.hash;
   if (hash == GTLS_HASH_NONE) {
     hash = GTLS_HASH_SHA256;
   }

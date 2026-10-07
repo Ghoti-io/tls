@@ -190,6 +190,29 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
     }
     c->sig_alg_count = config->sig_alg_count;
   }
+  {
+    /* TLS 1.3 forbids PKCS#1 in CertificateVerify, so a list of nothing else
+     * could never be satisfied: refuse it here, not at every handshake. */
+    int usable = 0;
+
+    for (i = 0; i < c->sig_alg_count; i++) {
+      switch ((unsigned)c->sig_algs[i]) {
+        case GCERT_SIG_RSA_PSS_SHA256:
+        case GCERT_SIG_RSA_PSS_SHA384:
+        case GCERT_SIG_RSA_PSS_SHA512:
+        case GCERT_SIG_ECDSA_P256_SHA256:
+        case GCERT_SIG_ECDSA_P384_SHA384:
+        case GCERT_SIG_ED25519:
+          usable = 1;
+          break;
+        default:
+          break;
+      }
+    }
+    if (!usable) {
+      goto invalid;
+    }
+  }
   for (i = 0; i < config->alpn_count; i++) {
     size_t n;
 

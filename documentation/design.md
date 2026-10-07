@@ -78,7 +78,9 @@ sends ClientHello at `INITIAL` and its `Finished` at `HANDSHAKE`.
 | Extension not offered, in any message | `GTLS_ERR_PROTOCOL` | `unsupported_extension` |
 | Message out of order or at the wrong epoch | `GTLS_ERR_PROTOCOL` | `unexpected_message` |
 | Truncated, trailing bytes, bad length | `GTLS_ERR_CORRUPT` | `decode_error` |
-| Any cap in `GTLS_Limits` | `GTLS_ERR_LIMIT` | `decode_error` |
+| Any cap in `GTLS_Limits` on what the peer sent | `GTLS_ERR_LIMIT` | `decode_error` |
+| `max_output_bytes`, a cap on what this side queues | `GTLS_ERR_LIMIT` | `internal_error` |
+| An empty Certificate list (RFC 8446 section 4.4.2) | `GTLS_ERR_CERT_INVALID` | `decode_error` |
 | leaf's extendedKeyUsage excludes serverAuth | `GTLS_ERR_CERT_PURPOSE` | `bad_certificate` |
 | no path to an anchor | `GTLS_ERR_CERT_ISSUER` | `unknown_ca` |
 | only fitting path expired / not yet valid | `GTLS_ERR_CERT_EXPIRED` / `_NOT_YET_VALID` | `certificate_expired` |

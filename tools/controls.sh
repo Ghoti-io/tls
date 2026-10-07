@@ -9,9 +9,10 @@
 # under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
 #
-# Every check in the handshake is seen to matter: each one is removed, in a
-# scratch copy of the tree, and the test that is meant to catch its absence
-# must start failing. A control that does not fail means the test accepts the
+# The checks listed in plants() below are each removed, one at a time, in a
+# scratch copy of the tree, and the test that is meant to catch the absence
+# must start failing. Those are the ones planted, not every check in the
+# library. A control that does not fail means the test accepts the
 # very thing the check was there to refuse.
 #
 #   PREFIX=/path/to/prefix tools/controls.sh [name...]
@@ -42,6 +43,7 @@ message-size-cap	src/client/client.c	if (body > c->limits.max_handshake_message)
 wipe-on-failure	src/client/client.c	(void)gsec_wipe(\&c->sec, sizeof c->sec);\n}\n\nstatic GTLS_Result fail	(void)c;\n}\n\nstatic GTLS_Result fail	testNegative
 epoch-rule	src/client/client.c	if (epoch != expected_epoch(c->state)) {	if (0) {	testNegative
 share-group	src/client/client.c	if (sh.group != (unsigned)c->share_group) {	if (0) {	testNegative
+scalar-range	src/client/client.c	return (int)(borrow & (((acc | (0u - acc)) >> 31) & 1u));	return 1;	testClient
 chain-verdict	src/client/verify.c	case GCERT_ERR_MISMATCH:\n      switch (chain.failure) {	case GCERT_ERR_MISMATCH:\n      if (1) {\n        break;\n      }\n      switch (chain.failure) {	testNegative
 session-id-echo	src/client/client.c	sh.session_id_len != c->session_id_len \|\|	0 \|\|	testClient
 PLANTS

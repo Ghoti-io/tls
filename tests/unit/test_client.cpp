@@ -215,7 +215,8 @@ TEST(Conn, NullConnectionIsSafeToAskAbout) {
   EXPECT_EQ(gtls_conn_alert(nullptr), GTLS_ALERT_NONE);
   EXPECT_EQ(gtls_conn_suite(nullptr), GTLS_SUITE_NONE);
   EXPECT_EQ(gtls_conn_group(nullptr), GTLS_GROUP_NONE);
-  EXPECT_FALSE(gtls_conn_server_name_acknowledged(nullptr));
+  int ack = 0;
+  EXPECT_EQ(gtls_conn_server_name_acknowledged(nullptr, &ack), GTLS_ERR_INVALID);
   EXPECT_FALSE(gtls_conn_retried(nullptr));
   size_t n;
   const unsigned char * p;
@@ -379,7 +380,7 @@ TEST(RealHandshakeVariants, AlpnAndServerNameAreReported) {
   size_t n = 0;
   ASSERT_EQ(gtls_conn_alpn(w.conn, &p, &n), GTLS_OK);
   EXPECT_EQ(Bytes(p, p + n), (Bytes{'h', '2'}));
-  EXPECT_TRUE(gtls_conn_server_name_acknowledged(w.conn));
+  EXPECT_TRUE(sni_ack(w.conn));
 }
 
 TEST(RealHandshakeVariants, AServerThatAnswersNeitherIsStillAccepted) {
@@ -394,7 +395,7 @@ TEST(RealHandshakeVariants, AServerThatAnswersNeitherIsStillAccepted) {
   size_t n = 99;
   ASSERT_EQ(gtls_conn_alpn(w.conn, &p, &n), GTLS_OK);
   EXPECT_EQ(n, 0u);
-  EXPECT_FALSE(gtls_conn_server_name_acknowledged(w.conn));
+  EXPECT_FALSE(sni_ack(w.conn));
 }
 
 TEST(RealHandshakeVariants, CertificateVerifyByEcdsaAndEd25519SchemesBothWorkOrAreRefusedByFit) {
@@ -407,6 +408,265 @@ TEST(RealHandshakeVariants, CertificateVerifyByEcdsaAndEd25519SchemesBothWorkOrA
   SimServer s(o);
   EXPECT_EQ(w.run(s), GTLS_ERR_PROTOCOL);
   EXPECT_EQ(gtls_conn_alert(w.conn), GTLS_ALERT_ILLEGAL_PARAMETER);
+}
+
+/* ---------------------------------------------- what is readable, and when */
+
+TEST(Accessors, PeerCertificateWaitsForTheEndOfTheHandshake) {
+  World w;
+  w.build();
+  SimServer s(w.server_options());
+  ASSERT_EQ(gtls_conn_start(w.conn), GTLS_OK);
+  Bytes ch = w.out(GTLS_EPOCH_INITIAL);
+  w.drain(GTLS_EPOCH_INITIAL);
+  s.accept_hello(ch);
+  ASSERT_EQ(w.feed(GTLS_EPOCH_INITIAL, s.sh_msg), GTLS_OK);
+  const unsigned char * der = reinterpret_cast<const unsigned char *>("x");
+  size_t n = 7;
+  for (const Bytes * m : {&s.ee_wire, &s.cert_msg, &s.cv_msg}) {
+    ASSERT_EQ(w.feed(GTLS_EPOCH_HANDSHAKE, *m), GTLS_OK);
+    der = reinterpret_cast<const unsigned char *>("x");
+    n = 7;
+    ASSERT_EQ(gtls_conn_peer_certificate(w.conn, &der, &n), GTLS_OK);
+    EXPECT_EQ(der, nullptr) << "chain accepted is not yet trusted";
+    EXPECT_EQ(n, 0u);
+  }
+  ASSERT_EQ(w.feed(GTLS_EPOCH_HANDSHAKE, s.fin_msg), GTLS_OK);
+  ASSERT_EQ(gtls_conn_peer_certificate(w.conn, &der, &n), GTLS_OK);
+  EXPECT_EQ(Bytes(der, der + n), w.pki.leaf);
+}
+
+TEST(Accessors, CertificateAlpnAndServerNameAreRefusedAfterAFailure) {
+  World w;
+  w.alpn = {"h2"};
+  w.build();
+  SimOptions o = w.server_options();
+  o.alpn = Bytes{'h', '2'};
+  o.bad_finished = true;
+  SimServer s(o);
+  ASSERT_EQ(w.run(s), GTLS_ERR_FINISHED);
+  const unsigned char * p = nullptr;
+  size_t n = 0;
+  int ack = 5;
+  EXPECT_EQ(gtls_conn_alpn(w.conn, &p, &n), GTLS_ERR_FAILED);
+  EXPECT_EQ(gtls_conn_server_name_acknowledged(w.conn, &ack), GTLS_ERR_FAILED);
+  EXPECT_EQ(gtls_conn_peer_certificate(w.conn, &p, &n), GTLS_ERR_FAILED);
+}
+
+TEST(Accessors, InternalAccessorsCheckTheirArguments) {
+  unsigned char buf[GTLS_HASH_MAX];
+  size_t n = 0;
+  EXPECT_EQ(gtls_conn_state(nullptr), GTLS_STATE_FAILED);
+  EXPECT_EQ(gtls_conn_debug_secret(nullptr, GTLS_SECRET_EARLY, buf, sizeof buf, &n), GTLS_ERR_INVALID);
+  EXPECT_EQ(gtls_conn_debug_transcript(nullptr, buf, sizeof buf, &n), GTLS_ERR_INVALID);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(nullptr));
+  World w;
+  w.build();
+  EXPECT_EQ(gtls_conn_debug_secret(w.conn, GTLS_SECRET_EARLY, nullptr, 0, &n), GTLS_ERR_INVALID);
+  EXPECT_EQ(gtls_conn_debug_secret(w.conn, GTLS_SECRET_EARLY, buf, sizeof buf, nullptr), GTLS_ERR_INVALID);
+  EXPECT_EQ(gtls_conn_debug_transcript(w.conn, nullptr, 0, &n), GTLS_ERR_INVALID);
+}
+
+TEST(Conn, StartRawOnAFailedConnectionIsFailedLikeStart) {
+  World w;
+  w.limits.max_output_bytes = 16;
+  w.build();
+  ASSERT_EQ(gtls_conn_start(w.conn), GTLS_ERR_LIMIT);
+  const Bytes hello(40, 1);
+  const Bytes key(32, 2);
+  EXPECT_EQ(gtls_conn_start_raw(w.conn, hello.data(), hello.size(), key.data()), GTLS_ERR_FAILED);
+}
+
+TEST(Conn, HostsThatCannotBeSentOrCheckedAreInvalid) {
+  EmptyTrust trust;
+  GTLS_Context * ctx = nullptr;
+  GTLS_ContextConfig c;
+  gtls_context_config_default(&c);
+  c.trust = trust.store;
+  ASSERT_EQ(gtls_context_new(nullptr, &c, &ctx), GTLS_OK);
+  const std::string bad[] = {std::string("exa\0mple.test", 13), "caf\xc3\xa9.test", "example.test.",
+      "a.\x80", "."};
+  for (const std::string & h : bad) {
+    GTLS_Conn * conn = nullptr;
+    EXPECT_EQ(gtls_conn_new(ctx, h.data(), h.size(), &conn), GTLS_ERR_INVALID) << h;
+    EXPECT_EQ(conn, nullptr);
+  }
+  GTLS_Conn * conn = nullptr;
+  EXPECT_EQ(gtls_conn_new(ctx, "example.test", 12, &conn), GTLS_OK);
+  gtls_conn_free(conn);
+  gtls_context_free(ctx);
+}
+
+TEST(Context, SignatureSchemesNoServerCouldUseAreRefusedUpFront) {
+  EmptyTrust trust;
+  GTLS_Context * ctx = nullptr;
+  GTLS_ContextConfig c;
+  gtls_context_config_default(&c);
+  c.trust = trust.store;
+  static const GCERT_SigScheme pkcs1[2] = {GCERT_SIG_RSA_PKCS1_SHA256, GCERT_SIG_RSA_PKCS1_SHA384};
+  c.sig_algs = pkcs1;
+  c.sig_alg_count = 2;
+  EXPECT_EQ(gtls_context_new(nullptr, &c, &ctx), GTLS_ERR_INVALID)
+      << "TLS 1.3 forbids PKCS#1 in CertificateVerify";
+  static const GCERT_SigScheme mixed[2] = {GCERT_SIG_RSA_PKCS1_SHA256, GCERT_SIG_ED25519};
+  c.sig_algs = mixed;
+  EXPECT_EQ(gtls_context_new(nullptr, &c, &ctx), GTLS_OK);
+  gtls_context_free(ctx);
+}
+
+/* ------------------------------------------ ephemeral scalar rejection */
+
+namespace {
+
+const Bytes kP256Order = from_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+const Bytes kP384Order = from_hex(
+    "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973");
+
+/** The 04||x||y a P-256 or P-384 scalar yields. */
+Bytes point_for(GTLS_Group g, const Bytes & scalar) {
+  Bytes raw(g == GTLS_GROUP_SECP256R1 ? 64 : 96);
+  GSEC_Result r = g == GTLS_GROUP_SECP256R1 ? gsec_ecdh_p256_public(scalar.data(), raw.data())
+                                             : gsec_ecdh_p384_public(scalar.data(), raw.data());
+  EXPECT_EQ(r, GSEC_OK);
+  Bytes out{4};
+  out.insert(out.end(), raw.begin(), raw.end());
+  return out;
+}
+
+bool has(const Bytes & hay, const Bytes & needle) {
+  return std::search(hay.begin(), hay.end(), needle.begin(), needle.end()) != hay.end();
+}
+
+}  // namespace
+
+class ScalarRejection : public ::testing::TestWithParam<GTLS_Group> {};
+
+TEST_P(ScalarRejection, ZeroTheOrderAndAllOnesAreSkippedAndTheValidOneIsUsedOnStart) {
+  const GTLS_Group g = GetParam();
+  const size_t len = g == GTLS_GROUP_SECP256R1 ? 32 : 48;
+  const Bytes & order = g == GTLS_GROUP_SECP256R1 ? kP256Order : kP384Order;
+  const Bytes good(len, 0x22);
+  Bytes order_plus_one = order;
+  order_plus_one.back() += 1;
+  World w;
+  GTLS_Group groups[1] = {g};
+  w.cfg.groups = groups;
+  w.cfg.group_count = 1;
+  w.build();
+  ScriptedRandom rnd;
+  rnd.chunks = {Bytes(32, 0x61), Bytes(len, 0), order, order_plus_one, Bytes(len, 0xff), good};
+  gtls_conn_set_hooks(w.conn, ScriptedRandom::fn, &rnd, nullptr, nullptr);
+  ASSERT_EQ(gtls_conn_start(w.conn), GTLS_OK);
+  EXPECT_EQ(rnd.draws, 6);
+  EXPECT_TRUE(rnd.chunks.empty());
+  EXPECT_TRUE(has(w.out(GTLS_EPOCH_INITIAL), point_for(g, good))) << "the valid scalar's share";
+  EXPECT_TRUE(has(Bytes(w.conn->sec.p256, w.conn->sec.p256 + 32), Bytes(32, 0x22)) ||
+              has(Bytes(w.conn->sec.p384, w.conn->sec.p384 + 48), Bytes(48, 0x22)));
+}
+
+TEST_P(ScalarRejection, TheSameOnAHelloRetryRequestRetry) {
+  const GTLS_Group g = GetParam();
+  const size_t len = g == GTLS_GROUP_SECP256R1 ? 32 : 48;
+  const Bytes & order = g == GTLS_GROUP_SECP256R1 ? kP256Order : kP384Order;
+  const Bytes good(len, 0x23);
+  World w;
+  w.build();
+  ScriptedRandom rnd;
+  rnd.chunks = {Bytes(32, 0x61), Bytes(32, 0x66), Bytes(len, 0), order, Bytes(len, 0xff), good};
+  gtls_conn_set_hooks(w.conn, ScriptedRandom::fn, &rnd, nullptr, nullptr);
+  SimOptions o = w.server_options();
+  o.hrr = true;
+  o.hrr_group = g;
+  SimServer s(o);
+  ASSERT_EQ(gtls_conn_start(w.conn), GTLS_OK);
+  Bytes ch = w.out(GTLS_EPOCH_INITIAL);
+  w.drain(GTLS_EPOCH_INITIAL);
+  s.accept_hello(ch);
+  ASSERT_EQ(w.feed(GTLS_EPOCH_INITIAL, s.hrr_msg), GTLS_OK);
+  EXPECT_EQ(rnd.draws, 6);
+  EXPECT_TRUE(has(w.out(GTLS_EPOCH_INITIAL), point_for(g, good)));
+}
+
+TEST_P(ScalarRejection, EightBadDrawsInARowIsAnInternalErrorAndAWipedConnection) {
+  const GTLS_Group g = GetParam();
+  const size_t len = g == GTLS_GROUP_SECP256R1 ? 32 : 48;
+  World w;
+  GTLS_Group groups[1] = {g};
+  w.cfg.groups = groups;
+  w.cfg.group_count = 1;
+  w.build();
+  ScriptedRandom rnd;
+  rnd.chunks.push_back(Bytes(32, 0x61));
+  for (int i = 0; i < 8; i++) {
+    rnd.chunks.push_back(Bytes(len, 0));
+  }
+  gtls_conn_set_hooks(w.conn, ScriptedRandom::fn, &rnd, nullptr, nullptr);
+  EXPECT_EQ(gtls_conn_start(w.conn), GTLS_ERR_INTERNAL);
+  EXPECT_EQ(rnd.draws, 9) << "eight attempts, no more";
+  EXPECT_TRUE(gtls_conn_is_failed(w.conn));
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(w.conn));
+  EXPECT_EQ(w.out(GTLS_EPOCH_INITIAL), Bytes()) << "no ClientHello was queued";
+}
+
+INSTANTIATE_TEST_SUITE_P(Curves, ScalarRejection,
+    ::testing::Values(GTLS_GROUP_SECP256R1, GTLS_GROUP_SECP384R1),
+    [](const ::testing::TestParamInfo<GTLS_Group> & info) {
+      return info.param == GTLS_GROUP_SECP256R1 ? std::string("P256") : std::string("P384");
+    });
+
+/* --------------------------------------------- IP literals as hosts */
+
+TEST(IpHost, AnIpSanIsAcceptedForAnAddressAndNoServerNameIsSent) {
+  const struct {
+    const char * host;
+    Bytes ip;
+  } cases[] = {{"192.0.2.7", Bytes{192, 0, 2, 7}},
+      {"2001:db8::1", Bytes{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}};
+  for (const auto & c : cases) {
+    World w;
+    w.host = c.host;
+    CertSpec l;
+    l.ip = c.ip;
+    l.has_eku = true;
+    l.eku_server = true;
+    SimOptions o = w.server_options();
+    o.chain = {make_cert(l), w.pki.inter};
+    o.ack_sni = false;
+    w.build();
+    SimServer s(o);
+    ASSERT_EQ(w.run(s), GTLS_OK) << c.host;
+    EXPECT_TRUE(gtls_conn_is_connected(w.conn));
+    EXPECT_EQ(sni_ack(w.conn), 0);
+  }
+}
+
+TEST(IpHost, TheClientHelloForAnAddressHasNoServerNameAndAMismatchedSanIsRefused) {
+  World w;
+  w.host = "192.0.2.7";
+  CertSpec l;
+  l.ip = Bytes{192, 0, 2, 8};
+  l.has_eku = true;
+  l.eku_server = true;
+  SimOptions o = w.server_options();
+  o.chain = {make_cert(l), w.pki.inter};
+  o.ack_sni = false;
+  w.build();
+  SimServer s(o);
+  ASSERT_EQ(gtls_conn_start(w.conn), GTLS_OK);
+  Bytes ch = w.out(GTLS_EPOCH_INITIAL);
+  GTLS_Limits lim;
+  gtls_limits_default(&lim);
+  GTLS_ClientHello h;
+  ASSERT_EQ(gtls_msg_parse_client_hello(ch.data() + 4, ch.size() - 4, &lim, &h), GTLS_OK);
+  EXPECT_EQ(gtls_msg_find_ext(h.exts, h.ext_count, GTLS_EXT_SERVER_NAME), nullptr);
+  w.drain(GTLS_EPOCH_INITIAL);
+  s.accept_hello(ch);
+  ASSERT_EQ(w.feed(GTLS_EPOCH_INITIAL, s.sh_msg), GTLS_OK);
+  GTLS_Result r = GTLS_OK;
+  for (const Bytes * m : {&s.ee_wire, &s.cert_msg}) {
+    r = w.feed(GTLS_EPOCH_HANDSHAKE, *m);
+  }
+  EXPECT_EQ(r, GTLS_ERR_CERT_HOST);
 }
 
 int main(int argc, char ** argv) {

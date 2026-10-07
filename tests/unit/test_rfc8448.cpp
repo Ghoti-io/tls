@@ -126,7 +126,7 @@ TEST_P(Rfc8448, TheWholeHandshakeToApplicationSecrets) {
   ASSERT_EQ(gtls_conn_alpn(r.conn, &proto, &n), GTLS_OK);
   EXPECT_EQ(n, 0u);
   EXPECT_EQ(proto, nullptr);
-  EXPECT_TRUE(gtls_conn_server_name_acknowledged(r.conn))
+  EXPECT_TRUE(sni_ack(r.conn))
       << "the RFC's EncryptedExtensions ends with an empty server_name";
 }
 
