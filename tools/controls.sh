@@ -112,9 +112,25 @@ early-skip-cap	src/client/stream.c	if (cost > c->limits.max_early_skip_bytes - c
 early-skip-after-retry	src/client/stream.c	if (c->early_skip \&\& epoch == GTLS_EPOCH_INITIAL \&\& type == GTLS_CT_APPLICATION_DATA) {	if (0) {	testPsk
 early-skip-header	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	1	testPsk
 retry-early-data	src/server/server.c	if (o->early_data) {\n    return gtls_conn_illegal(c);	if (0) {\n    return gtls_conn_illegal(c);	testPsk
-retry-ends-skip	src/server/server.c	    c->early_skip = 0;\n  } else if (o.early_data) {	    (void)0;\n  } else if (o.early_data) {	testPsk
+retry-ends-skip	src/server/server.c	    c->early_skip = 0;\n  } else if (o.early_data \&\& o.psk) {	    (void)0;\n  } else if (o.early_data \&\& o.psk) {	testPsk
 retry-may-drop-early-data	src/server/server.c	a->type == GTLS_EXT_EARLY_DATA \|\|	0 \|\|	testPsk
 retry-may-refresh-psk	src/server/server.c	a->type == GTLS_EXT_PRE_SHARED_KEY) {	0) {	testPsk
+psk-count-cap-edge	src/msg/msg.c	++n_ids > limits->max_tickets	++n_ids >= limits->max_tickets	testPsk
+psk-binder-cap	src/msg/msg.c	++n_binders > limits->max_tickets	0	testPsk
+psk-binder-cap-edge	src/msg/msg.c	++n_binders > limits->max_tickets	++n_binders >= limits->max_tickets	testPsk
+psk-identity-cap-edge	src/msg/msg.c	identity.len > limits->max_ticket_bytes \|\|	identity.len >= limits->max_ticket_bytes \|\|	testPsk
+psk-empty-identity	src/msg/msg.c	gtls_reader_vector(\&ids, 2, 1, 0, \&identity)	gtls_reader_vector(\&ids, 2, 0, 0, \&identity)	testPsk
+psk-ids-min-high	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 8, 0, \&ids)	testPsk
+psk-ids-min-zero	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 0, 0, \&ids)	testPsk
+psk-binder-31	src/msg/msg.c	gtls_reader_vector(\&binders, 1, 32, 0, \&binder)	gtls_reader_vector(\&binders, 1, 31, 0, \&binder)	testPsk
+psk-modes-parse-result	src/server/server.c	result = gtls_msg_parse_ch_psk_modes(modes, \&dhe);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_psk_modes(modes, \&dhe);\n    if (0) {	testPsk
+early-data-parse-result	src/server/server.c	result = gtls_msg_parse_ch_early_data(e);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_early_data(e);\n    if (0) {	testPsk
+early-data-needs-psk	src/server/server.c	} else if (o.early_data \&\& o.psk) {	} else if (o.early_data) {	testPsk
+early-limit-resolve	src/core/core.c	  GTLS_RESOLVE(max_early_skip_bytes)\n	  (void)0;\n	testPsk
+early-skip-only-mismatch	src/client/stream.c	if (result == GTLS_ERR_MISMATCH \&\& c->early_skip	if (result != GTLS_OK \&\& c->early_skip	testPsk
+early-skip-header-type	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	!c->early_skip	testPsk
+early-skip-seq-advance	src/client/stream.c	(void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	c->sec.rd.seq++;\n      (void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	testPsk
+early-skip-pending-fragment	src/client/stream.c	and early data is not that. */\n    return gtls_conn_unexpected(c);	and early data is not that. */\n    (void)0;	testPsk
 PLANTS
 }
 
@@ -125,7 +141,7 @@ copy_tree() {
 }
 
 run_test() {
-  (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j4 >/dev/null 2>&1 &&
+  (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j2 >/dev/null 2>&1 &&
     LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
       "build/linux/release/apps/$1" --gtest_brief=1 >"$scratch/out.txt" 2>&1)
 }

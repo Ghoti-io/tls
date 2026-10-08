@@ -142,17 +142,30 @@ as each other (`illegal_parameter`), and fit `GTLS_Limits::max_tickets` and
 checked: they vouch for a PSK that is used, and none is. No `pre_shared_key`
 goes in the ServerHello and the full certificate handshake follows.
 `early_data` must have an empty body (`decode_error`) and is rejected by not
-echoing it in EncryptedExtensions, with or without a PSK beside it. The client
-then sends records protected by a key this server never had, and section
-4.2.10 has the server skip them: an `application_data` record that does not
-open is discarded, its bytes counted (`GTLS_Limits::max_early_skip_bytes`,
-default one maximal record; past it is `GTLS_ERR_LIMIT` and `unexpected_message`),
-and the first record that opens ends the skipping. It also covers the records
-that arrive between a HelloRetryRequest and the second ClientHello, where no
-key exists to try; the second ClientHello ends it, and may not carry
-`early_data` itself. Skipping is off unless `early_data` was offered, so a bad
-record is otherwise a fatal `bad_record_mac`. Skipped bytes never reach the
-application and the sequence number does not move for them. Accepting a PSK,
+echoing it in EncryptedExtensions. The client then sends records protected by
+a key this server never had, and section 4.2.10 has the server skip them, so
+the skip window opens only when `early_data` comes with a `pre_shared_key`
+(early data is encrypted under a key derived from a PSK; without one the
+extension is checked and ignored, and a bad record stays a fatal
+`bad_record_mac`). While the window is open an `application_data` record that
+does not open is discarded, its bytes counted
+(`GTLS_Limits::max_early_skip_bytes`, default one maximal record; past it is
+`GTLS_ERR_LIMIT` and `unexpected_message`), and the first record that opens
+ends it. A record that does authenticate but is malformed (padding past the
+cap, no content type) is not early data and is fatal as ever, and nothing is
+skipped while a handshake message is in pieces (`unexpected_message`). The
+window also covers the records that arrive between a HelloRetryRequest and
+the second ClientHello, where no key exists to try; the second ClientHello
+ends it, and may not carry `early_data` itself. Skipped bytes never reach the
+application and the sequence number does not move for them.
+
+**A damaged client Finished is not told from early data while the window is
+open** (RFC 8446 section 4.2.10): a Finished record that fails to open looks
+exactly like an early record, so it is discarded and the handshake stalls
+instead of failing at once. It stays discarded until the cap is reached
+(`GTLS_ERR_LIMIT`) or a record that opens arrives. The cap is what bounds it.
+
+Accepting a PSK,
 issuing tickets and accepting early data are later work (planning step 8).
 
 The server writes application data only once the client's Finished has

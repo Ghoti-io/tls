@@ -720,12 +720,14 @@ inline int server_one(const uint8_t * data, size_t size) {
   GTLS_Limits lim;
   gtls_limits_default(&lim);
   if ((opt & 0x40u) != 0) {
-    lim.max_client_hello = 300;
-    lim.max_extensions = 8;
+    lim.max_client_hello = 400;   /* the RFC's hello is 192 bytes and 9 extensions: room for a PSK offer */
+    lim.max_extensions = 16;
     lim.max_records_per_key = 3;
     lim.max_app_buffer = 20000;
     lim.max_key_updates = 2;
     lim.max_record_padding = 8;
+    lim.max_tickets = 1;        /* the PSK offer's caps: one identity of 12 bytes */
+    lim.max_ticket_bytes = 12;
   }
   cfg.limits = &lim;
   GTLS_Context * ctx = nullptr;

@@ -57,8 +57,8 @@ IMAGE = os.environ.get("GHOTI_TLS_ORACLE_IMAGE",
                        "localhost/ghoti-certificate-oracle-openssl:3.5.7")
 PIN = "OpenSSL 3.5.7"
 CASE_TIMEOUT = 40
-POPULATION_FLOOR = 67   # cases a full run must have run
-PASS_FLOOR = 57          # and how many of them must have interoperated
+POPULATION_FLOOR = 69   # cases a full run must have run
+PASS_FLOOR = 60          # and how many of them must have interoperated
 
 KINDS = {
     "ed": "ed.example.com",
@@ -93,7 +93,7 @@ class Case:
                  server_name=None, expect="ok", refusal=None, declared=None,
                  no_anchor=False, theirs_sigalgs=None, ours_sigalgs=None,
                  our_alert=None, peer_alert=None, theirs_extra=(), ours_extra=(),
-                 theirs_has=(), identities=None, resume=None, theirs_lacks=()):
+                 theirs_has=(), identities=None, resume=None, theirs_lacks=(), psk_count=1):
         self.role = role              # "client": our client, their s_server; "server": the reverse
         self.name = "%s/%s" % (role, name)
         self.kind = kind
@@ -129,6 +129,10 @@ class Case:
         # no early data, so it must answer with a full handshake.
         self.resume = resume
         self.theirs_lacks = list(theirs_lacks)  # text the peer's output must not contain
+        # How many messages of OpenSSL's trace carry its psk extension: the
+        # ClientHello, and the second one after a HelloRetryRequest when OpenSSL
+        # keeps the PSK in it. A ServerHello that selected one would add a message.
+        self.psk_count = psk_count
 
 
 def population():
@@ -207,6 +211,15 @@ def population():
     cases.append(Case("server", "early-data-fallback-retry", resume="early", group="p256",
                       groups=["x25519", "p256"], retried=1,
                       theirs_has=["extension_type=psk(41)", "extension_type=early_data", "Early data was rejected"] + full,
+                      theirs_lacks=["Reused, TLSv1.3"]))
+    # A retry in which OpenSSL keeps the PSK in the second ClientHello (the
+    # ticket is for SHA-384, so only a SHA-384 suite can use it again; with
+    # AES-128 OpenSSL drops it, which is why the case above sees one psk), so
+    # the server meets a refreshed pre_shared_key and no early_data.
+    cases.append(Case("server", "early-data-fallback-refresh", resume="early", group="p256",
+                      groups=["x25519", "p256"], retried=1, suite="aes256", psk_count=2,
+                      theirs_has=["extension_type=psk(41)", "extension_type=early_data",
+                                  "Early data was rejected"] + full,
                       theirs_lacks=["Reused, TLSv1.3"]))
     return cases
 
@@ -554,9 +567,11 @@ def judge(case, outcome):
     for text in case.theirs_has:
         if text not in outcome.theirs:
             errors.append("OpenSSL's output does not contain %r" % text)
-    if case.resume and outcome.theirs.count("extension_type=psk(41)") != 1:
-        errors.append("the PSK extension was in %d messages of the trace, wanted the ClientHello's alone "
-                      "(a ServerHello that selected it would make two)" % outcome.theirs.count("extension_type=psk(41)"))
+    if case.resume and outcome.theirs.count("extension_type=psk(41)") != case.psk_count:
+        errors.append("the PSK extension was in %d messages of the trace, wanted %d (the ClientHello%s; a "
+                      "ServerHello that selected it would add one)"
+                      % (outcome.theirs.count("extension_type=psk(41)"), case.psk_count,
+                         "s" if case.psk_count > 1 else ""))
     for text in case.theirs_lacks:
         if text in outcome.theirs:
             errors.append("OpenSSL's output contains %r" % text)
@@ -618,11 +633,13 @@ PLANTS = {
                              "type != GTLS_CT_CHANGE_CIPHER_SPEC) {",
                              ["server/refuse-wrong-name"]),
     "early-skip-off": ("src/server/server.c", "c->early_skip = 1;", "(void)0;",
-                       ["server/early-data-fallback", "server/early-data-fallback-retry"]),
+                       ["server/early-data-fallback", "server/early-data-fallback-retry",
+                       "server/early-data-fallback-refresh"]),
     "psk-refused": ("src/server/server.c",
                     "result = gtls_msg_parse_ch_psk_offer(e, &c->limits, &identities);",
                     "result = GTLS_ERR_UNSUPPORTED; (void)identities;",
-                    ["server/psk-ticket-fallback", "server/early-data-fallback"]),
+                    ["server/psk-ticket-fallback", "server/early-data-fallback",
+                     "server/early-data-fallback-refresh"]),
     "retry-skip-ends": ("src/client/stream.c",
                         "if (c->early_skip && epoch == GTLS_EPOCH_INITIAL && type == GTLS_CT_APPLICATION_DATA) {",
                         "if (0) {",
@@ -632,6 +649,32 @@ PLANTS = {
                       "if (0) {",
                       ["server/sni-second", "server/sni-third"]),
 }
+
+
+def plant_coverage_problems(cases):
+    """The fallback cases only mean something if a plant breaks them: every
+    case that offers a ticket must be one a plant is required to break, the
+    plants that cut our PSK path must exist, and `make interop-plants` must
+    run every plant there is."""
+    problems = []
+    broken = {m for (_, _, _, must) in PLANTS.values() for m in must}
+    for c in cases:
+        if c.resume and c.name not in broken:
+            problems.append("%s offers a ticket but no plant is required to break it" % c.name)
+    for need in ("psk-refused", "early-skip-off"):
+        if need not in PLANTS:
+            problems.append("the plant %s, which cuts this library's PSK path, is gone" % need)
+    try:
+        with open(os.path.join(ROOT, "Makefile")) as f:
+            text = f.read()
+        rule = text[text.index("\ninterop-plants:"):]
+        rule = rule[:rule.index("\n\n")]
+        for n in PLANTS:
+            if n not in rule.split():
+                problems.append("the plant %s is not run by `make interop-plants`" % n)
+    except (OSError, ValueError):
+        problems.append("could not read the interop-plants rule from the Makefile")
+    return problems
 
 
 def plant_run(name, args):
@@ -658,7 +701,7 @@ def plant_run(name, args):
             return 1
         open(path, "w").write(text.replace(old, new))
         prefix = os.environ.get("PREFIX")
-        build = subprocess.run(["make", "build/linux/release/apps/examples/echo", "PREFIX=%s" % prefix, "-j4"],
+        build = subprocess.run(["make", "build/linux/release/apps/examples/echo", "PREFIX=%s" % prefix, "-j2"],
                                cwd=scratch, capture_output=True, text=True)
         planted = os.path.join(scratch, "build/linux/release/apps/examples/echo")
         if build.returncode != 0 or not os.path.exists(planted):
@@ -721,7 +764,7 @@ def main():
         return 2
     declared = read_differences()
     in_code = {c.name for c in cases if c.declared}
-    problems = []
+    problems = plant_coverage_problems(cases)
     for n in sorted(in_code - set(declared)):
         problems.append("%s is declared in the code but not in DIFFERENCES" % n)
     for n in sorted(set(declared) - in_code):
@@ -758,6 +801,9 @@ def main():
                                            ("(" + detail + ")") if detail else ""), flush=True)
     finally:
         shutil.rmtree(pems, ignore_errors=True)
+    if args.only:
+        print("\nNOTE: --only ran a subset, so the population and pass floors, the declared-difference "
+              "check and the plant check were NOT applied: this is not a pass of the gate.")
     if not args.only:
         total = totals["client"][0] + totals["server"][0]
         passed = totals["client"][1] + totals["server"][1]

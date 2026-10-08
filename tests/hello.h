@@ -65,6 +65,7 @@ struct HelloSpec {
   int psk_binders = 0;
   size_t psk_identity_len = 16;
   size_t psk_binder_len = 32;
+  size_t psk_last_identity_len = static_cast<size_t>(-1);   /* the last identity's length, when not the same as the others' */
   size_t psk_first_binder_len = 0;   /* nonzero: the first binder's length, the others keeping psk_binder_len */
   std::vector<Bytes> extra;      /* whole extensions, appended */
   std::vector<Bytes> before;     /* whole extensions, put first */
@@ -73,7 +74,8 @@ struct HelloSpec {
   Bytes psk_body() const {
     Bytes ids, binders;
     for (int i = 0; i < psk_identities; i++) {
-      Bytes id(psk_identity_len, static_cast<unsigned char>(0x50 + i));
+      size_t n = (i == psk_identities - 1 && psk_last_identity_len != static_cast<size_t>(-1)) ? psk_last_identity_len : psk_identity_len;
+      Bytes id(n, static_cast<unsigned char>(0x50 + i));
       put16(ids, id.size());
       ids.insert(ids.end(), id.begin(), id.end());
       put16(ids, 0);

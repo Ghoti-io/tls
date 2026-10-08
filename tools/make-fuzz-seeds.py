@@ -172,25 +172,66 @@ def main():
         hs = hs[:1] + struct.pack(">I", len(hs) - 4)[1:] + hs[4:]
         return record[:3] + struct.pack(">H", len(hs)) + hs
 
-    def psk_body(identities, binders, binder_len=32):
-        ids = b"".join(struct.pack(">H", 8) + bytes([0x50 + i]) * 8 + b"\x00\x00\x12\x34" for i in range(identities))
-        bnd = b"".join(bytes([binder_len]) + bytes([0x60 + i]) * binder_len for i in range(binders))
+    def psk_body(identities, binders, binder_len=32, id_len=8, last_id_len=None, first_binder_len=None):
+        ids = b""
+        for i in range(identities):
+            n = last_id_len if (last_id_len is not None and i == identities - 1) else id_len
+            ids += struct.pack(">H", n) + bytes([0x50 + i]) * n + b"\x00\x00\x12\x34"
+        bnd = b""
+        for i in range(binders):
+            n = first_binder_len if (first_binder_len is not None and i == 0) else binder_len
+            bnd += bytes([n]) + bytes([0x60 + i]) * n
         return struct.pack(">H", len(ids)) + ids + struct.pack(">H", len(bnd)) + bnd
+
+    def strip_ext(record, ext_type):
+        """The record without every extension of this type, the three lengths fixed up."""
+        hs = record[5:]
+        sid = 4 + 2 + 32
+        at = sid + 1 + hs[sid]
+        at += 2 + struct.unpack(">H", hs[at:at + 2])[0]
+        at += 1 + hs[at]
+        ext_len = struct.unpack(">H", hs[at + 0:at + 2])[0]
+        exts = hs[at + 2:at + 2 + ext_len]
+        out, k = b"", 0
+        while k < len(exts):
+            t, n = struct.unpack(">HH", exts[k:k + 4])
+            if t != ext_type:
+                out += exts[k:k + 4 + n]
+            k += 4 + n
+        hs = hs[:at] + struct.pack(">H", len(out)) + out
+        hs = hs[:1] + struct.pack(">I", len(hs) - 4)[1:] + hs[4:]
+        return record[:3] + struct.pack(">H", len(hs)) + hs
 
     def early_record(n):
         return b"\x17\x03\x03" + struct.pack(">H", n) + b"\xa5" * n
 
     ch_psk = with_ext(c_ch, 0x29, psk_body(1, 1))
-    ch_psk_early = with_ext(with_ext(c_ch, 0x2a, b""), 0x29, psk_body(2, 2))
-    ch_early = with_ext(c_ch, 0x2a, b"")
+    ch_early_only = with_ext(c_ch, 0x2a, b"")
+    ch_early = with_ext(ch_early_only, 0x29, psk_body(1, 1))     # early_data beside a PSK: the window opens
+    ch_psk_early = with_ext(ch_early_only, 0x29, psk_body(2, 2))
     srv["psk-offer"] = bytes([0]) + ch_psk + c_fin
     srv["psk-offer-bad-count"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 1))
     srv["psk-offer-short-binder"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 2, 8))
+    srv["psk-offer-binder-31"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 2, first_binder_len=31))
+    srv["psk-offer-empty-identity"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(2, 2, last_id_len=0))
+    srv["psk-offer-no-identities"] = bytes([0]) + with_ext(c_ch, 0x29, psk_body(0, 1))
+    # The small-limits server allows one identity of 12 bytes: each cap's LIMIT return.
+    srv["psk-offer-too-many-identities"] = bytes([0x40]) + with_ext(c_ch, 0x29, psk_body(2, 2))
+    srv["psk-offer-identity-too-long"] = bytes([0x40]) + with_ext(c_ch, 0x29, psk_body(1, 1, id_len=13))
+    srv["psk-offer-too-many-binders"] = bytes([0x40]) + with_ext(c_ch, 0x29, psk_body(1, 2))
+    srv["psk-offer-at-the-limits"] = bytes([0x40]) + with_ext(c_ch, 0x29, psk_body(1, 1, id_len=12))
+    srv["psk-without-modes"] = bytes([0]) + with_ext(strip_ext(c_ch, 45), 0x29, psk_body(1, 1))
+    srv["psk-with-bad-modes"] = bytes([0]) + with_ext(edit(c_ch, bytes.fromhex("002d00020101"), bytes.fromhex("002d00020501")), 0x29, psk_body(1, 1))
+    srv["early-data-body"] = bytes([0]) + with_ext(c_ch, 0x2a, b"\x00\x00")
     srv["early-data-skipped"] = bytes([0]) + ch_early + early_record(40) + early_record(300) + c_fin + c_app
     srv["early-data-skipped-bytewise"] = bytes([0x02]) + ch_psk_early + early_record(60) + c_fin + c_app
     srv["early-data-small-limits"] = bytes([0x40]) + ch_early + early_record(40) + early_record(300) + c_fin
     srv["early-data-then-garbage"] = bytes([0]) + ch_early + early_record(40) + c_fin + early_record(20)
     srv["early-data-after-retry"] = bytes([0x10]) + ch_early + early_record(40) + early_record(16384 + 256) + c_ch
+    srv["early-data-retry-dropped"] = bytes([0x10]) + ch_early + early_record(40) + ch_psk
+    srv["early-data-in-second-hello"] = bytes([0x10]) + ch_early + early_record(40) + ch_early
+    srv["early-data-between-fragments"] = bytes([0x10]) + ch_early + early_record(40) + ch_psk[:5].replace(ch_psk[3:5], struct.pack(">H", 50)) + ch_psk[5:55] + early_record(40)
+    srv["early-data-without-psk"] = bytes([0]) + ch_early_only + early_record(40)
     srv["no-early-data-then-garbage"] = bytes([0]) + c_ch + early_record(40)
     srv["refuse-cookie"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("002c00024001"))
     srv["refuse-bad-alpn"] = bytes([0]) + edit(c_ch, bytes.fromhex("001c00024001"), bytes.fromhex("001000024001"))

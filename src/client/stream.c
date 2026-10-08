@@ -324,6 +324,11 @@ static GTLS_Result open_failed(GTLS_Conn * c, GTLS_Result result) {
 static GTLS_Result skip_early(GTLS_Conn * c, size_t body_len) {
   size_t cost = GTLS_RECORD_HEADER + body_len;
 
+  if (c->in.len != 0) {
+    /* A handshake message is in pieces: only its next piece may follow
+     * (RFC 8446 section 5.1), and early data is not that. */
+    return gtls_conn_unexpected(c);
+  }
   if (cost > c->limits.max_early_skip_bytes - c->early_skipped) {
     return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }

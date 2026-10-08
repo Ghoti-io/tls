@@ -382,7 +382,8 @@ TEST(PskRetry, TheSecondHelloIsStillCheckedForShape) {
 /* ---------------------------------------------------------- skipping, live */
 
 TEST(EarlySkip, RecordsThatDoNotOpenAreSkippedAndTheHandshakeCompletes) {
-  for (bool psk : {false, true}) {
+  for (int round = 0; round < 2; round++) {
+    bool psk = true;
     Offering o(true, psk);
     Bytes garbage = cat(early_record(300), early_record(40));
     ASSERT_EQ(o.hello_then(garbage), GTLS_OK) << "psk " << psk;
@@ -407,7 +408,7 @@ TEST(EarlySkip, AMaximumSizeRecordIsSkipped) {
 
 TEST(EarlySkip, AnyFeedSizeGivesTheSameResult) {
   for (size_t chunk : {1u, 7u, 100u}) {
-    Offering o(true, false);
+    Offering o(true, true);
     Bytes ch = take(o.p.c.conn);
     Bytes all = cat(ch, cat(early_record(100), early_record(17)));
     for (size_t at = 0; at < all.size(); at += chunk) {
@@ -422,23 +423,42 @@ TEST(EarlySkip, AnyFeedSizeGivesTheSameResult) {
 TEST(EarlySkip, TheCapIsInBytesHeadersIncludedAndExceedingItIsFatal) {
   /* Cap 100: one record of 95 body bytes costs exactly 100. */
   {
-    Offering o(true, false, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
+    Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
     EXPECT_EQ(o.hello_then(early_record(95)), GTLS_OK) << "exactly the cap";
     o.p.run();
     EXPECT_TRUE(o.p.connected());
   }
   {
-    Offering o(true, false, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
+    Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
     EXPECT_EQ(o.hello_then(early_record(96)), GTLS_ERR_LIMIT) << "one byte over";
     EXPECT_EQ(gtls_conn_alert(o.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
     EXPECT_TRUE(gtls_conn_secrets_are_wiped(o.p.s.conn));
   }
   {
-    Offering o(true, false, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
+    Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
     EXPECT_EQ(o.hello_then(cat(early_record(45), early_record(45))), GTLS_OK) << "two records, 100 in all";
     EXPECT_EQ(stream(o.p.s.conn, early_record(1)), GTLS_ERR_LIMIT) << "and a third";
     EXPECT_EQ(gtls_conn_alert(o.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
+}
+
+TEST(EarlySkip, IsNotActiveForEarlyDataWithoutAPsk) {
+  /* The extension is checked and ignored; nothing was sent under a key this
+   * server could be expected to skip, so a bad record stays fatal. */
+  Offering o(true, false);
+  EXPECT_EQ(o.hello_then(early_record(50)), GTLS_ERR_MISMATCH);
+  EXPECT_EQ(gtls_conn_alert(o.p.s.conn), GTLS_ALERT_BAD_RECORD_MAC);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(o.p.s.conn));
+}
+
+TEST(EarlySkip, AfterARetryEarlyDataWithoutAPskSkipsNothing) {
+  Retry r;
+  ASSERT_EQ(r.srv.build(), GTLS_OK);
+  HelloSpec first = r.first();
+  first.early_data = true;
+  ASSERT_EQ(stream(r.srv.conn, hs_record(first.build())), GTLS_OK);
+  EXPECT_EQ(stream(r.srv.conn, early_record(50)), GTLS_ERR_PROTOCOL);
+  EXPECT_EQ(r.srv.alert(), GTLS_ALERT_UNEXPECTED_MESSAGE);
 }
 
 TEST(EarlySkip, IsNotActiveWhenEarlyDataWasNotOffered) {
@@ -465,7 +485,7 @@ TEST(EarlySkip, EndsAtTheFirstRecordThatOpens) {
 }
 
 TEST(EarlySkip, GarbageAfterTheSkipWindowIsFatalInTheSameFeedToo) {
-  Offering o(true, false);
+  Offering o(true, true);
   ASSERT_EQ(o.hello_then(early_record(60)), GTLS_OK);
   ASSERT_EQ(stream(o.p.c.conn, take(o.p.s.conn)), GTLS_OK);
   Bytes fin = take(o.p.c.conn);
@@ -478,6 +498,7 @@ TEST(EarlySkip, AfterARetryTheRecordsBeforeTheSecondHelloAreSkipped) {
   ASSERT_EQ(r.srv.build(), GTLS_OK);
   HelloSpec first = r.first();
   first.early_data = true;
+  first.psk_identities = first.psk_binders = 1;
   ASSERT_EQ(stream(r.srv.conn, hs_record(first.build())), GTLS_OK);
   EXPECT_EQ(r.srv.state(), GTLS_STATE_S_WAIT_CH2);
   /* the client has not seen the retry yet: its early records are still coming */
@@ -493,6 +514,7 @@ TEST(EarlySkip, AfterARetryNothingIsSkippedOnceTheSecondHelloIsIn) {
   ASSERT_EQ(r.srv.build(), GTLS_OK);
   HelloSpec first = r.first();
   first.early_data = true;
+  first.psk_identities = first.psk_binders = 1;
   ASSERT_EQ(stream(r.srv.conn, hs_record(first.build())), GTLS_OK);
   ASSERT_EQ(stream(r.srv.conn, hs_record(r.second().build())), GTLS_OK);
   EXPECT_EQ(stream(r.srv.conn, early_record(50)), GTLS_ERR_MISMATCH)
@@ -519,11 +541,172 @@ TEST(EarlySkip, AnOversizeRecordBeforeAnyKeyIsStillAnOverflowWithoutEarlyData) {
 
 TEST(EarlySkip, OnlyApplicationDataRecordsAreSkipped) {
   /* An alert, a handshake record or a bad record of another kind is not early data. */
-  Offering o(true, false);
+  Offering o(true, true);
   ASSERT_EQ(o.hello_then(Bytes()), GTLS_OK);
   Bytes junk{22, 3, 3, 0, 20};
   junk.insert(junk.end(), 20, 0x11);
   EXPECT_NE(stream(o.p.s.conn, junk), GTLS_OK) << "a handshake-typed record in the clear under keys";
+}
+
+
+/* ------------------------------------------- the review's surviving mutants */
+
+TEST(PskLists, TheCapsPassExactlyAtTheLimitAndFailOneOver) {
+  struct Case {
+    const char * what;
+    std::function<void(HelloSpec &, GTLS_Limits &)> change;
+    GTLS_Result result;
+  };
+  const Case cases[] = {
+      {"as many identities and binders as the limit",
+          [](HelloSpec & h, GTLS_Limits & l) { l.max_tickets = 3; h.psk_identities = h.psk_binders = 3; },
+          GTLS_OK},
+      {"one identity over the limit",
+          [](HelloSpec & h, GTLS_Limits & l) { l.max_tickets = 3; h.psk_identities = h.psk_binders = 4; },
+          GTLS_ERR_LIMIT},
+      {"the identities at the limit and one binder over it (the binder cap, not the mismatch)",
+          [](HelloSpec & h, GTLS_Limits & l) { l.max_tickets = 3; h.psk_identities = 3; h.psk_binders = 4; },
+          GTLS_ERR_LIMIT},
+      {"an identity exactly as long as the limit",
+          [](HelloSpec & h, GTLS_Limits & l) {
+            l.max_ticket_bytes = 20; h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 20; },
+          GTLS_OK},
+      {"an identity one byte over the limit",
+          [](HelloSpec & h, GTLS_Limits & l) {
+            l.max_ticket_bytes = 20; h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 21; },
+          GTLS_ERR_LIMIT},
+      {"the shortest identity there is (the identities list is exactly its minimum)",
+          [](HelloSpec & h, GTLS_Limits &) { h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 1; },
+          GTLS_OK},
+      {"binders and no identities",
+          [](HelloSpec & h, GTLS_Limits &) { h.psk_identities = 0; h.psk_binders = 1; },
+          GTLS_ERR_CORRUPT},
+      {"a good identity and an empty one",
+          [](HelloSpec & h, GTLS_Limits &) {
+            h.psk_identities = h.psk_binders = 2; h.psk_last_identity_len = 0; },
+          GTLS_ERR_CORRUPT},
+      {"a binder of 31 bytes beside one of 32",
+          [](HelloSpec & h, GTLS_Limits &) {
+            h.psk_identities = h.psk_binders = 2; h.psk_first_binder_len = 31; },
+          GTLS_ERR_CORRUPT},
+      {"a binder of 32 bytes beside one of 32",
+          [](HelloSpec & h, GTLS_Limits &) {
+            h.psk_identities = h.psk_binders = 2; h.psk_first_binder_len = 32; },
+          GTLS_OK},
+  };
+  for (const Case & k : cases) {
+    One t;
+    HelloSpec h;
+    k.change(h, t.srv.limits);
+    ASSERT_EQ(t.srv.build(), GTLS_OK) << k.what;
+    EXPECT_EQ(t.srv.hello(h.build()), k.result) << k.what;
+  }
+}
+
+TEST(PskOffer, AMalformedKeyExchangeModesBesideAPskIsADecodeError) {
+  const Bytes bodies[] = {Bytes{0}, Bytes{5, 1}, Bytes{1, 1, 0}, Bytes()};
+  for (const Bytes & body : bodies) {
+    One t;
+    ASSERT_EQ(t.srv.build(), GTLS_OK);
+    HelloSpec h;
+    h.psk_modes = false;
+    h.extra.push_back(ext_of(GTLS_EXT_PSK_KEY_EXCHANGE_MODES, body));
+    h.psk_identities = h.psk_binders = 1;
+    EXPECT_EQ(t.srv.hello(h.build()), GTLS_ERR_CORRUPT) << body.size();
+    EXPECT_EQ(t.srv.alert(), GTLS_ALERT_DECODE_ERROR);
+  }
+}
+
+TEST(EarlySkip, AHandshakeFragmentInFlightRefusesEarlyData) {
+  Retry r;
+  ASSERT_EQ(r.srv.build(), GTLS_OK);
+  HelloSpec first = r.first();
+  first.early_data = true;
+  first.psk_identities = first.psk_binders = 1;
+  ASSERT_EQ(stream(r.srv.conn, hs_record(first.build())), GTLS_OK);
+  Bytes second = r.second().build();
+  Bytes head(second.begin(), second.begin() + 50);
+  ASSERT_EQ(stream(r.srv.conn, hs_record(head)), GTLS_OK) << "the first piece of the second hello";
+  EXPECT_EQ(stream(r.srv.conn, early_record(40)), GTLS_ERR_PROTOCOL)
+      << "a message in pieces: only its next piece may follow";
+  EXPECT_EQ(r.srv.alert(), GTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+TEST(EarlySkip, ARecordThatIsNotHandshakeSizedIsRefusedWhileTheWindowIsOpen) {
+  Retry r;
+  ASSERT_EQ(r.srv.build(), GTLS_OK);
+  HelloSpec first = r.first();
+  first.early_data = true;
+  first.psk_identities = first.psk_binders = 1;
+  ASSERT_EQ(stream(r.srv.conn, hs_record(first.build())), GTLS_OK);
+  Bytes big{22, 3, 3};
+  put16(big, 16384 + 100);
+  EXPECT_EQ(stream(r.srv.conn, big), GTLS_ERR_LIMIT) << "only application_data may be that large";
+  EXPECT_EQ(r.srv.alert(), GTLS_ALERT_RECORD_OVERFLOW);
+}
+
+namespace {
+
+/** Early-data window open, the server's flight sent, and the client handshake key in hand. */
+struct Window {
+  std::unique_ptr<Cred> cred = ed_cred();
+  Pair p;
+  GTLS_Suite suite = GTLS_SUITE_AES_128_GCM_SHA256;
+  GTLS_RecordKeys keys;
+  Window() : p(*cred) {
+    HelloSpec h;
+    h.early_data = true;
+    h.psk_identities = h.psk_binders = 1;
+    p.raw_hello = h.build();
+    p.scfg.suites = &suite;
+    p.scfg.suite_count = 1;
+    p.slimits.max_record_padding = 10;
+    EXPECT_EQ(p.build(), GTLS_OK);
+    Bytes ch = take(p.c.conn);
+    EXPECT_EQ(stream(p.s.conn, ch), GTLS_OK);
+    EXPECT_EQ(gtls_record_keys_from_secret(&keys, suite, p.s.conn->sec.schedule.c_hs, 0), GTLS_OK);
+  }
+};
+
+}  // namespace
+
+TEST(EarlySkip, OnlyARecordThatDoesNotAuthenticateIsSkipped) {
+  {
+    /* sealed under the right key with more padding than is accepted */
+    Window w;
+    GTLS_Buf b;
+    gtls_buf_init(&b, nullptr, 4096);
+    Bytes pt(10, 7);
+    ASSERT_EQ(gtls_record_seal(&w.keys, 23, pt.data(), pt.size(), 11, &b), GTLS_OK);
+    EXPECT_EQ(stream(w.p.s.conn, Bytes(b.data, b.data + b.len)), GTLS_ERR_LIMIT);
+    EXPECT_EQ(gtls_conn_alert(w.p.s.conn), GTLS_ALERT_RECORD_OVERFLOW);
+    gtls_buf_free(&b);
+  }
+  {
+    /* sealed under the right key, and nothing inside it but zeros: no content type */
+    Window w;
+    Bytes zeros(20, 0), ct(20), tag(16);
+    Bytes hdr{23, 3, 3, 0, 36};
+    unsigned char nonce[GTLS_IV_LEN];
+    std::memcpy(nonce, w.keys.iv, sizeof nonce);   /* sequence number 0 */
+    ASSERT_EQ(gsec_aes_gcm_encrypt(w.keys.key, 16, nonce, GTLS_IV_LEN, hdr.data(), 5, zeros.data(),
+                  zeros.size(), ct.data(), tag.data(), 16), GSEC_OK);
+    Bytes rec = cat(hdr, cat(ct, tag));
+    EXPECT_EQ(stream(w.p.s.conn, rec), GTLS_ERR_PROTOCOL);
+    EXPECT_EQ(gtls_conn_alert(w.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  {
+    /* and a record that does authenticate, with the right padding, is read as what it is */
+    Window w;
+    GTLS_Buf b;
+    gtls_buf_init(&b, nullptr, 4096);
+    Bytes pt(10, 7);
+    ASSERT_EQ(gtls_record_seal(&w.keys, 23, pt.data(), pt.size(), 10, &b), GTLS_OK);
+    EXPECT_EQ(stream(w.p.s.conn, Bytes(b.data, b.data + b.len)), GTLS_ERR_PROTOCOL)
+        << "application data before the handshake is done";
+    EXPECT_EQ(gtls_conn_alert(w.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+    gtls_buf_free(&b);
+  }
 }
 
 int main(int argc, char ** argv) {

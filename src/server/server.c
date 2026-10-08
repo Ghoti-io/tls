@@ -143,6 +143,7 @@ typedef struct Offer {
   int has_alpn;
   GTLS_Name host;
   int early_data;   /* early_data was offered */
+  int psk;          /* pre_shared_key was offered */
 } Offer;
 
 static GTLS_Result missing(GTLS_Conn * c) {
@@ -210,10 +211,13 @@ static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
     if (result != GTLS_OK) {
       return gtls_conn_fail_parse(c, result);
     }
+    o->psk = 1;
   }
-  /* early_data is offered, and rejected by not echoing it in
-   * EncryptedExtensions (section 4.2.10); with or without a PSK beside it. The
-   * client's early records are then skipped by the record layer. */
+  /* early_data is rejected by not echoing it in EncryptedExtensions (section
+   * 4.2.10). Its body is checked either way, but the client's early records
+   * are skipped only when a PSK was offered with it: early data is encrypted
+   * under a key derived from a PSK, so without one nothing was sent that this
+   * server could be expected to skip, and a bad record stays fatal. */
   e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_EARLY_DATA);
   if (e != NULL) {
     result = gtls_msg_parse_ch_early_data(e);
@@ -841,7 +845,7 @@ static GTLS_Result on_client_hello(GTLS_Conn * c, const unsigned char * msg,
     }
     /* The early data came before the retry was answered, so none follows. */
     c->early_skip = 0;
-  } else if (o.early_data) {
+  } else if (o.early_data && o.psk) {
     c->early_skip = 1;
   }
   result = copy_sni(c, &o.host);
