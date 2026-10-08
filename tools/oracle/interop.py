@@ -313,6 +313,21 @@ def free_port():
     return port
 
 
+def wait_free(port, seconds=10):
+    """True once nothing holds the port: the next server cannot bind while the last one's container is going."""
+    end = time.time() + seconds
+    while time.time() < end:
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            time.sleep(0.1)
+        finally:
+            probe.close()
+    return False
+
+
 def wait_listening(port, proc, seconds=25):
     """True once something listens on the port. Asked by trying to bind it:
     a connection would be taken for the one the server is waiting for."""
@@ -647,6 +662,7 @@ def run_resume_case(case, echo, pems, tmp):
                     proc.wait(timeout=CASE_TIMEOUT)
                 except subprocess.TimeoutExpired:
                     pass
+                wait_free(port)
                 proc2, name2 = server(1, outs[1])
                 procs.append(proc2)
                 names.append(name2)
@@ -875,7 +891,7 @@ PLANTS = {
                            "  tls13 = 1;\n  if (!tls13) {",
                            ["server/refuse-tls12-only"]),
     "no-common-scheme": ("src/server/server.c",
-                         "  if (c->scheme == 0) {\n    return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);\n  }\n\n  /* ALPN",
+                         "  if (c->scheme == 0 && !r->active) {\n    /* A resumed handshake signs nothing, so it needs no scheme. */\n    return gtls_conn_fail(c, GTLS_ERR_NO_COMMON, GTLS_ALERT_HANDSHAKE_FAILURE);\n  }\n\n  /* ALPN",
                          "  if (c->scheme == 0) {\n    c->scheme = GCERT_SIG_ED25519;\n  }\n\n  /* ALPN",
                          ["server/refuse-no-common-scheme"]),
     "plaintext-alert-rule": ("src/client/stream.c",
