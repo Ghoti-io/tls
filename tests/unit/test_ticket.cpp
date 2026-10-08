@@ -393,6 +393,23 @@ TEST(PskOfferParser, EveryIdentityAndBinderIsReturnedAndTheCountsAreChecked) {
 
   l.max_tickets = 2;
   EXPECT_EQ(gtls_msg_parse_ch_psk_offer(&e, &l, &o), GTLS_ERR_LIMIT);
+  {
+    /* Three identities and one binder: the count of identities is judged first, so past the cap it
+     * is a limit and not a mismatch of the two lists. */
+    Bytes one_binder(bind.begin(), bind.begin() + 33);
+    Bytes body2;
+    body2.push_back(static_cast<unsigned char>(ids.size() >> 8));
+    body2.push_back(static_cast<unsigned char>(ids.size()));
+    body2.insert(body2.end(), ids.begin(), ids.end());
+    body2.push_back(0);
+    body2.push_back(static_cast<unsigned char>(one_binder.size()));
+    body2.insert(body2.end(), one_binder.begin(), one_binder.end());
+    GTLS_Ext e2 = {GTLS_EXT_PRE_SHARED_KEY, body2.data(), body2.size()};
+    EXPECT_EQ(gtls_msg_parse_ch_psk_offer(&e2, &l, &o), GTLS_ERR_LIMIT);
+    l = limits();
+    EXPECT_EQ(gtls_msg_parse_ch_psk_offer(&e2, &l, &o), GTLS_ERR_PROTOCOL) << "within the cap the lists differ";
+    l.max_tickets = 2;
+  }
   l = limits();
   l.max_ticket_bytes = 3;
   EXPECT_EQ(gtls_msg_parse_ch_psk_offer(&e, &l, &o), GTLS_ERR_LIMIT);
