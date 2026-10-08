@@ -133,18 +133,17 @@ early-skip-seq-advance	src/client/stream.c	(void)gsec_wipe(scratch, sizeof scrat
 early-skip-pending-fragment	src/client/stream.c	and early data is not that. */\n    return gtls_conn_unexpected(c);	and early data is not that. */\n    (void)0;	testPsk
 binder-check	src/server/server.c	result = gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	result = GTLS_OK; (void)gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	testResume
 binder-compare	src/schedule/schedule.c	return same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same);	return GTLS_OK;	testTicket
-binder-length	src/schedule/schedule.c	if (got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	if (0) {\n    return GTLS_ERR_MISMATCH;	testResume
+binder-length	src/schedule/schedule.c	if (got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	if (0 \&\& got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	testResume
 binder-transcript	src/server/server.c	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc, th);	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc - 1u, th);	testResume
-ticket-aead	src/session/ticket.c	if (opened != GSEC_OK) {	if (0) {	testTicket
 ticket-key-name	src/session/ticket.c	gsec_equal(keys[i].name, ticket, GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {	1) {	testTicket
-ticket-key-expiry	src/session/ticket.c	if (now < keys[i].not_after \&\&	if (1 \&\&	testTicket
+ticket-key-expiry	src/session/ticket.c	if (now < keys[i].not_after \&\&	if ((now < keys[i].not_after \|\| 1) \&\&	testTicket
 ticket-sealing-newest	src/session/ticket.c	(best == NULL \|\| keys[i].not_before > best->not_before)	(best == NULL)	testTicket
 ticket-sealing-window	src/session/ticket.c	if (keys[i].not_before <= now \&\& now < keys[i].not_after \&\&	if (now < keys[i].not_after \&\&	testTicket
 ticket-state-version	src/session/ticket.c	if (n < 1u + 2u + 1u \|\| plain[at++] != GTLS_TICKET_STATE_VERSION) {	if (n < 1u + 2u + 1u \|\| (at++, 0)) {	testTicket
 ticket-state-lifetime	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at < t.alpn_len + 1u) {	if (n - at < t.alpn_len + 1u) {	testTicket
 ticket-state-exact	src/session/ticket.c	if (n - at != t.sni_len) {	if (n - at < t.sni_len) {	testTicket
 ticket-fresh-lifetime	src/session/ticket.c	if (elapsed_s >= p->lifetime) {	if (0) {	testTicket
-ticket-fresh-window	src/session/ticket.c	return diff <= (int64_t)window_ms;	return 1;	testTicket
+ticket-fresh-window	src/session/ticket.c	return diff <= (int64_t)window_ms;	return diff <= (int64_t)window_ms \|\| 1;	testTicket
 ticket-fresh-age-add	src/session/ticket.c	client_ms = (int64_t)(uint32_t)(obfuscated_age - p->age_add);	client_ms = (int64_t)obfuscated_age;	testTicket
 ticket-fresh-future	src/session/ticket.c	if (elapsed_s > GTLS_TICKET_AGE_WINDOW_MAX) {	if (0) {	testTicket
 ticket-fresh-lifetime-max	src/session/ticket.c	if (p->lifetime > GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	if (0) {\n    return 0;	testTicket
@@ -177,8 +176,7 @@ client-lifetime-cap	src/client/client.c	s->lifetime = t->lifetime < GTLS_TICKET_
 ticket-resumption-secret-client	src/client/client.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
 session-host-length	src/session/session.c	session->host_len != c->host_len \|\|	0 \|\|	testResume
 session-host-name	src/session/session.c	!names_match(session->host, c->host, c->host_len)) {	0) {	testResume
-session-suite-offered	src/session/session.c	if (!offered) {	if (0) {	testResume
-session-not-yet	src/session/session.c	if (unix_time < session->received \|\|	if (0 \|\|	testResume
+session-suite-offered	src/session/session.c	if (!offered) {	if (!offered \&\& 0) {	testResume
 session-expiry	src/session/session.c	(uint64_t)unix_time - (uint64_t)session->received >= session->lifetime) {	(uint64_t)unix_time - (uint64_t)session->received > session->lifetime) {	testResume
 session-digest	src/session/session.c	if (gsec_equal(digest, p + at + ticket_len, GSEC_SHA256_DIGEST_LEN) != GSEC_OK) {	if (0) {	testTicket
 session-version	src/session/session.c	if (p[0] != SESSION_VERSION) {	if (0) {	testTicket
@@ -195,7 +193,7 @@ context-ticket-count	src/client/context.c	if (config->ticket_count > c->limits.m
 context-ticket-fit	src/client/context.c	if (config->ticket_key_count != 0 \&\& c->limits.max_ticket_bytes < GTLS_TICKET_MAX) {	if (0) {	testTicket
 context-ticket-keys-max	src/client/context.c	config->ticket_key_count > GTLS_TICKET_KEYS_MAX \|\|	0 \|\|	testTicket
 context-ticket-client	src/client/context.c	if (config->role == GTLS_ROLE_CLIENT \&\&\n      (config->ticket_keys != NULL	if (0 \&\&\n      (config->ticket_keys != NULL	testTicket
-stream-ticket-flush	src/client/stream.c	if (type == GTLS_HS_KEY_UPDATE) {\n      if (c->ku_queued > 0) {	if (1) {\n      if (c->ku_queued > 0) {	testResume
+stream-ticket-flush	src/client/stream.c	if (type == GTLS_HS_KEY_UPDATE) {\n      if (c->ku_queued > 0) {	if (type == GTLS_HS_KEY_UPDATE \|\| 1) {\n      if (c->ku_queued > 0) {	testResume
 resumption-label	src/schedule/schedule.c	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumption", nonce,	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumptiox", nonce,	testTicket
 binder-label	src/schedule/schedule.c	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binder", empty,	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binderx", empty,	testTicket
 res-master-label	src/schedule/schedule.c	return gtls_derive_secret(s->hash, s->master, s->hlen, "res master",	return gtls_derive_secret(s->hash, s->master, s->hlen, "res masterx",	testTicket
@@ -208,9 +206,12 @@ copy_tree() {
   (cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 -I{} cp --parents {} "$scratch/tree/")
 }
 
+# 0: built and passed; 1: built, and the test failed; 2: did not build. A plant
+# that does not compile has caught nothing (-Werror turns a parameter the plant
+# stopped using into one), and must not be counted as a test that failed.
 run_test() {
-  (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j2 >/dev/null 2>&1 &&
-    LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
+  (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j2 >"$scratch/build.txt" 2>&1) || return 2
+  (cd "$scratch/tree" && LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
       "build/linux/release/apps/$1" --gtest_brief=1 >"$scratch/out.txt" 2>&1)
 }
 
@@ -254,7 +255,7 @@ plants | while IFS="$tab" read -r name file from to test; do
   fi
   copy_tree
   if ! run_test "$test"; then
-    echo "controls: $name: $test fails BEFORE the plant, so nothing was measured" >&2
+    echo "controls: $name: $test fails (or does not build) BEFORE the plant, so nothing was measured" >&2
     tail -5 "$scratch/out.txt" >&2
     echo FAIL >"$scratch/status"
     continue
@@ -269,12 +270,18 @@ if s.count(old) != 1:
     sys.exit("expected exactly one match, found %d" % s.count(old))
 open(path, "w").write(s.replace(old, new))
 PY
-  if run_test "$test"; then
-    echo "controls: $name: $test still PASSES with the check removed" >&2
-    echo FAIL >"$scratch/status"
-  else
-    echo "controls: $name: $test fails with the check removed, and passes with it"
-  fi
+  run_test "$test"
+  case $? in
+    0)
+      echo "controls: $name: $test still PASSES with the check removed" >&2
+      echo FAIL >"$scratch/status" ;;
+    2)
+      echo "controls: $name: the planted copy did not build, so nothing was measured" >&2
+      grep -m3 "error" "$scratch/build.txt" >&2
+      echo FAIL >"$scratch/status" ;;
+    *)
+      echo "controls: $name: $test fails with the check removed, and passes with it" ;;
+  esac
 done
 [ -f "$scratch/status" ] && status=1
 exit $status

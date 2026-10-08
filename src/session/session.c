@@ -357,9 +357,10 @@ GTLS_Result gtls_conn_set_session(GTLS_Conn * c, const GTLS_Session * session,
   if (!offered) {
     return GTLS_ERR_INVALID;
   }
-  /* Used before it was received, or after it has run out: no use to offer. */
-  if (unix_time < session->received ||
-      (uint64_t)unix_time - (uint64_t)session->received >= session->lifetime) {
+  /* Not yet received, or run out: no use to offer. The difference is unsigned,
+   * so a time before the arrival comes out enormous and one comparison refuses
+   * both. */
+  if ((uint64_t)unix_time - (uint64_t)session->received >= session->lifetime) {
     return GTLS_ERR_INVALID;
   }
   c->offer = gtls_session_copy(c->allocator, session);
