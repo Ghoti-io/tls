@@ -460,6 +460,11 @@ Certificate; no signature scheme needed), the number and the nonce of the
 tickets, the client's binder (first hello and retry), the age it reports, the hash
 it drops an offer for, what it takes of a ServerHello's PSK, what a session is
 bound to, and every check of a session blob and of a ticket configuration.
+A planted copy that does not compile has caught nothing, and `controls.sh` says
+so rather than counting it. The one check on a ticket with no plant is the AEAD
+tag: `security` wipes the plaintext of a ciphertext whose tag fails, so the
+strict decode of the state refuses it with the check removed or not, and the
+tests that change every bit of a ticket are what cover it.
 
 `make check-controls` runs all of it (slow: it builds a copy per plant; needs
 `PREFIX`). `make test` runs `check-controls-anchors`, which needs no build and
