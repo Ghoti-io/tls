@@ -670,7 +670,7 @@ def plant_coverage_problems(cases):
         rule = text[text.index("\ninterop-plants:"):]
         rule = rule[:rule.index("\n\n")]
         for n in PLANTS:
-            if n not in rule.split():
+            if n not in re.findall(r"[\w-]+", rule):
                 problems.append("the plant %s is not run by `make interop-plants`" % n)
     except (OSError, ValueError):
         problems.append("could not read the interop-plants rule from the Makefile")
