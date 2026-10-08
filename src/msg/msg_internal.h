@@ -183,6 +183,24 @@ typedef struct GTLS_KeyShare {
   size_t pub_len;
 } GTLS_KeyShare;
 
+/**
+ * A pre_shared_key to offer in a ClientHello (RFC 8446 section 4.2.11): one
+ * identity, its obfuscated age, and the length of its binder. The builder
+ * writes the binder as zeros and it is the last @p binder_len bytes of the
+ * message; the caller computes the real one over the message cut before the
+ * binders list (::GTLS_PSK_BINDERS_TAIL bytes plus the binder) and writes it
+ * in place. Offering one also writes psk_key_exchange_modes (psk_dhe_ke).
+ */
+typedef struct GTLS_PskParams {
+  const unsigned char * identity;
+  size_t identity_len;
+  uint32_t obfuscated_age;
+  size_t binder_len;
+} GTLS_PskParams;
+
+/** Bytes at the end of a ClientHello that offered a PSK and are not truncated away: the binders list's length (2) and the binder's (1), plus the binder itself. */
+#define GTLS_PSK_BINDERS_TAIL(binder_len) (2u + 1u + (size_t)(binder_len))
+
 /** Everything a first ClientHello is built from. */
 typedef struct GTLS_HelloParams {
   unsigned char random[32];
@@ -199,6 +217,7 @@ typedef struct GTLS_HelloParams {
   const GCERT_SigScheme * sig_algs;
   size_t sig_alg_count;
   GTLS_KeyShare share;
+  const GTLS_PskParams * psk;       /* a session to resume, or NULL */
 } GTLS_HelloParams;
 
 /** Build a whole ClientHello message, header included, into @p out. */
@@ -208,6 +227,16 @@ GTLS_Result gtls_msg_build_client_hello(const GTLS_HelloParams * params,
 /** Parse a ClientHello body. */
 GTLS_Result gtls_msg_parse_client_hello(const void * body, size_t len,
     const GTLS_Limits * limits, GTLS_ClientHello * out);
+
+/**
+ * As ::gtls_msg_retry_client_hello, with the pre_shared_key the first hello
+ * carried replaced by @p psk (a new age, a binder to be recomputed over the
+ * second hello's transcript) or, when @p psk is NULL, dropped (the
+ * HelloRetryRequest chose a suite whose hash the PSK does not fit).
+ */
+GTLS_Result gtls_msg_retry_client_hello_psk(const void * hello1, size_t hello1_len,
+    const GTLS_KeyShare * share, const void * cookie, size_t cookie_len,
+    const GTLS_PskParams * psk, const GTLS_Limits * limits, GTLS_Buf * out);
 
 /**
  * Build the second ClientHello from the first (RFC 8446 section 4.1.2): the
@@ -247,6 +276,7 @@ typedef struct GTLS_ServerHello {
   const unsigned char * cookie;
   size_t cookie_len;
   unsigned unknown_ext;             /* first extension type not understood */
+  unsigned psk_identity;            /* pre_shared_key: the identity selected */
 } GTLS_ServerHello;
 
 /** 1 when @p random is the fixed value that marks a HelloRetryRequest. */
@@ -306,6 +336,13 @@ typedef struct GTLS_NewSessionTicket {
 
 GTLS_Result gtls_msg_parse_new_session_ticket(const void * body, size_t len,
     const GTLS_Limits * limits, GTLS_NewSessionTicket * out);
+
+/**
+ * Build a whole NewSessionTicket (section 4.6.1). The early_data extension
+ * is written when @p t has ::GTLS_NewSessionTicket::early_data set.
+ */
+GTLS_Result gtls_msg_build_new_session_ticket(const GTLS_NewSessionTicket * t,
+    GTLS_Buf * out);
 
 /* ------------------------------------------- ClientHello, as a server reads it */
 
@@ -381,11 +418,31 @@ GTLS_Result gtls_msg_parse_ch_cookie(const GTLS_Ext * e, GTLS_Name * cookie);
  */
 GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke);
 
+/** Most identities of one offer whose views are kept; the rest are counted and not looked at. */
+#define GTLS_PSK_MAX 16u
+
+/** One identity of a PSK offer and its binder, views into the message. */
+typedef struct GTLS_PskEntry {
+  const unsigned char * identity;
+  size_t identity_len;
+  uint32_t age;                     /* obfuscated_ticket_age */
+  const unsigned char * binder;
+  size_t binder_len;
+} GTLS_PskEntry;
+
+/** A parsed pre_shared_key offer. */
+typedef struct GTLS_PskOffer {
+  size_t count;                     /* identities in the offer */
+  size_t stored;                    /* entries[] filled: count, at most ::GTLS_PSK_MAX */
+  GTLS_PskEntry entries[GTLS_PSK_MAX];
+  /** Offset in the extension's data of the binders list (its length field), so the message is truncated there. */
+  size_t binders_off;
+} GTLS_PskOffer;
+
 /**
  * A ClientHello's pre_shared_key (section 4.2.11): the identities (each 1 to
  * 65535 bytes, with a 4-byte age) and the binders (each 32 to 255 bytes).
- * Nothing is checked against a key; the shape is. @p count receives the
- * number of identities.
+ * Nothing is checked against a key; the shape is.
  *
  * @return ::GTLS_ERR_CORRUPT for a list that does not parse or has bytes
  *   left over; ::GTLS_ERR_PROTOCOL when the two lists differ in length;
@@ -393,7 +450,7 @@ GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke);
  *   one longer than ::GTLS_Limits::max_ticket_bytes.
  */
 GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
-    const GTLS_Limits * limits, size_t * count);
+    const GTLS_Limits * limits, GTLS_PskOffer * out);
 
 /** early_data in a ClientHello (section 4.2.10): an empty body, else ::GTLS_ERR_CORRUPT. */
 GTLS_Result gtls_msg_parse_ch_early_data(const GTLS_Ext * e);
@@ -412,6 +469,8 @@ typedef struct GTLS_ServerHelloParams {
   size_t key_exchange_len;
   const unsigned char * cookie;     /* HRR only; NULL for none */
   size_t cookie_len;
+  int psk;                          /* a ServerHello that resumes: select pre_shared_key identity @p psk_identity */
+  unsigned psk_identity;
 } GTLS_ServerHelloParams;
 
 /** Build a whole ServerHello or HelloRetryRequest, header included. */

@@ -98,10 +98,20 @@ typedef struct GTLS_Schedule {
   unsigned char s_hs[GTLS_HASH_MAX];
   unsigned char c_ap[GTLS_HASH_MAX];
   unsigned char s_ap[GTLS_HASH_MAX];
+  unsigned char res[GTLS_HASH_MAX];   /* resumption_master_secret, once the client's Finished is in the transcript */
+  int has_res;
 } GTLS_Schedule;
 
 /** Begin: Early Secret = HKDF-Extract(0, 0^Hash.length), no PSK. */
 GTLS_Result gtls_schedule_early(GTLS_Schedule * s, GTLS_Hash hash);
+
+/**
+ * Begin a resumed handshake: Early Secret = HKDF-Extract(0, @p psk), where
+ * the PSK is one digest of @p hash (RFC 8446 section 7.1; a resumption PSK
+ * is Hash.length long). A PSK of any other length is ::GTLS_ERR_INVALID.
+ */
+GTLS_Result gtls_schedule_early_psk(GTLS_Schedule * s, GTLS_Hash hash,
+    const void * psk, size_t psk_len);
 
 /**
  * Handshake Secret from the (EC)DHE shared secret, and the two handshake
@@ -125,6 +135,54 @@ GTLS_Result gtls_schedule_exporter(const GTLS_Schedule * s,
 /** resumption_master_secret, from the hash through the client's Finished. */
 GTLS_Result gtls_schedule_resumption(const GTLS_Schedule * s,
     const void * th_client_finished, void * out);
+
+/**
+ * Compute and keep resumption_master_secret in the schedule (it is wiped with
+ * it), from the transcript hash through the client's Finished.
+ */
+GTLS_Result gtls_schedule_keep_resumption(GTLS_Schedule * s,
+    const void * th_client_finished);
+
+/**
+ * The PSK one ticket stands for (RFC 8446 section 4.6.1):
+ * HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce,
+ * Hash.length). @p out is one digest of @p hash.
+ */
+GTLS_Result gtls_resumption_psk(GTLS_Hash hash, const void * res_master,
+    const void * nonce, size_t nonce_len, void * out);
+
+/**
+ * The binder key of a PSK (section 7.1): Derive-Secret(Early Secret,
+ * "res binder", ""), with the Early Secret taken from @p s, which must hold
+ * a PSK's early stage. @p out is one digest.
+ */
+GTLS_Result gtls_schedule_binder_key(const GTLS_Schedule * s, void * out);
+
+/**
+ * The binder for @p psk over @p th, the transcript hash of everything the
+ * binder covers (section 4.2.11.2): HMAC(finished_key(binder_key), th).
+ * Self-contained: the Early Secret is derived and wiped here. @p out is one
+ * digest.
+ */
+GTLS_Result gtls_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len,
+    const void * th, void * out);
+
+/**
+ * Check a received binder without branching on it. A binder of the wrong
+ * length is ::GTLS_ERR_MISMATCH (the length is public); one that differs is
+ * ::GTLS_ERR_MISMATCH too.
+ */
+GTLS_Result gtls_binder_check(GTLS_Hash hash, const void * psk, size_t psk_len,
+    const void * th, const void * got, size_t got_len);
+
+/**
+ * The transcript hash a binder covers: @p t as it stands with the truncated
+ * ClientHello (@p trunc, @p trunc_len, the message cut before the binders
+ * list) absorbed, which leaves @p t itself untouched. @p t must have its
+ * hash chosen; @p out is one digest of it.
+ */
+GTLS_Result gtls_binder_transcript(const GTLS_Transcript * t, const void * trunc,
+    size_t trunc_len, void * out);
 
 /** Wipe every secret. */
 void gtls_schedule_wipe(GTLS_Schedule * s);

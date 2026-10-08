@@ -82,6 +82,32 @@ int main(void) {
     if (result != GTLS_ERR_FINISHED) {
       return 6;
     }
+    /* The binder of a PSK, which is checked the same way, with the PSK in the
+     * key's place: the PSK is the secret, the transcript hash is not. */
+    {
+      unsigned char psk[GTLS_HASH_MAX];
+
+      memset(psk, 0x3C, sizeof psk);
+      if (gtls_binder_compute(hash, psk, hlen, th, good) != GTLS_OK) {
+        return 7;
+      }
+      VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
+      if (gtls_binder_check(hash, psk, hlen, th, good, hlen) != GTLS_OK) {
+        return 8;
+      }
+      memcpy(bad, good, hlen);
+      bad[hlen - 1u] ^= 1u;
+      VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
+      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen) != GTLS_ERR_MISMATCH) {
+        return 9;
+      }
+      memcpy(bad, good, hlen);
+      bad[0] ^= 1u;
+      VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
+      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen) != GTLS_ERR_MISMATCH) {
+        return 10;
+      }
+    }
   }
   return 0;
 }

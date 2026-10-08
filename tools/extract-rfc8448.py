@@ -13,6 +13,7 @@
 Reads tests/data/rfc8448/rfc8448.txt (pinned by tools/fetch.sh) and writes
 
   tests/data/rfc8448/simple-1rtt.vec   section 3, Simple 1-RTT Handshake
+  tests/data/rfc8448/resumed.vec       section 4, Resumed 0-RTT Handshake
   tests/data/rfc8448/hrr.vec           section 5, HelloRetryRequest
   src/core/selftest_kat.h              two secrets from section 3
 
@@ -40,6 +41,8 @@ PIN = "6564d1376d1ec744fc7a9993da15ebc1b9be361908b166091f47ef605c537fba"
 SECTIONS = [
     ("3", "3.  Simple 1-RTT Handshake", "4.  Resumed 0-RTT Handshake",
      "simple-1rtt.vec", "RFC 8448 section 3, Simple 1-RTT Handshake"),
+    ("4", "4.  Resumed 0-RTT Handshake", "5.  HelloRetryRequest",
+     "resumed.vec", "RFC 8448 section 4, Resumed 0-RTT Handshake"),
     ("5", "5.  HelloRetryRequest", "6.  Client Authentication",
      "hrr.vec", "RFC 8448 section 5, HelloRetryRequest"),
 ]

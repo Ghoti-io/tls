@@ -317,6 +317,28 @@ GTLS_Result gtls_schedule_early(GTLS_Schedule * s, GTLS_Hash hash) {
   return GTLS_OK;
 }
 
+GTLS_Result gtls_schedule_early_psk(GTLS_Schedule * s, GTLS_Hash hash,
+    const void * psk, size_t psk_len) {
+  GTLS_Result result;
+
+  if (s == NULL || gtls_hash_len(hash) == 0 || psk == NULL ||
+      psk_len != gtls_hash_len(hash)) {
+    return GTLS_ERR_INVALID;
+  }
+  memset(s, 0, sizeof *s);
+  s->hash = hash;
+  s->hlen = gtls_hash_len(hash);
+  /* A salt of length zero is HashLen zero bytes: the RFC's "0". */
+  result = gtls_from_gsec(gsec_hkdf_extract(hkdf_id(hash), NULL, 0, psk,
+      psk_len, s->early));
+  if (result != GTLS_OK) {
+    gtls_schedule_wipe(s);
+    return result;
+  }
+  s->stage = 1;
+  return GTLS_OK;
+}
+
 GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
     size_t ecdhe_len, const void * th_server_hello) {
   unsigned char derived[GTLS_HASH_MAX];
@@ -406,6 +428,111 @@ GTLS_Result gtls_schedule_resumption(const GTLS_Schedule * s,
   }
   return gtls_derive_secret(s->hash, s->master, s->hlen, "res master",
       th_client_finished, out);
+}
+
+GTLS_Result gtls_schedule_keep_resumption(GTLS_Schedule * s,
+    const void * th_client_finished) {
+  GTLS_Result result = gtls_schedule_resumption(s, th_client_finished, s == NULL ? NULL : s->res);
+
+  if (s != NULL) {
+    s->has_res = result == GTLS_OK;
+  }
+  return result;
+}
+
+GTLS_Result gtls_resumption_psk(GTLS_Hash hash, const void * res_master,
+    const void * nonce, size_t nonce_len, void * out) {
+  size_t hlen = gtls_hash_len(hash);
+
+  if (hlen == 0 || res_master == NULL || out == NULL ||
+      (nonce == NULL && nonce_len != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  return gtls_hkdf_expand_label(hash, res_master, hlen, "resumption", nonce,
+      nonce_len, out, hlen);
+}
+
+GTLS_Result gtls_schedule_binder_key(const GTLS_Schedule * s, void * out) {
+  unsigned char empty[GTLS_HASH_MAX];
+  GTLS_Result result;
+
+  if (s == NULL || s->stage != 1 || out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  result = empty_hash(s->hash, empty);
+  if (result == GTLS_OK) {
+    result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binder", empty,
+        out);
+  }
+  return result;
+}
+
+GTLS_Result gtls_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len,
+    const void * th, void * out) {
+  GTLS_Schedule s;
+  unsigned char key[GTLS_HASH_MAX];
+  GTLS_Result result;
+
+  if (th == NULL || out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  result = gtls_schedule_early_psk(&s, hash, psk, psk_len);
+  if (result != GTLS_OK) {
+    return result;
+  }
+  result = gtls_schedule_binder_key(&s, key);
+  if (result == GTLS_OK) {
+    result = gtls_finished_verify_data(hash, key, th, out);
+  }
+  gtls_schedule_wipe(&s);
+  (void)gsec_wipe(key, sizeof key);
+  return result;
+}
+
+GTLS_Result gtls_binder_check(GTLS_Hash hash, const void * psk, size_t psk_len,
+    const void * th, const void * got, size_t got_len) {
+  unsigned char want[GTLS_HASH_MAX];
+  size_t hlen = gtls_hash_len(hash);
+  GSEC_Result same;
+  GTLS_Result result;
+
+  if (hlen == 0 || got == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  if (got_len != hlen) {
+    return GTLS_ERR_MISMATCH;
+  }
+  result = gtls_binder_compute(hash, psk, psk_len, th, want);
+  if (result != GTLS_OK) {
+    return result;
+  }
+#ifdef GTLS_CT_TEST
+  /* As for Finished: tracking stops at the door of gsec_equal. */
+  VALGRIND_MAKE_MEM_DEFINED(want, hlen);
+#endif
+  same = gsec_equal(want, got, hlen);
+  (void)gsec_wipe(want, sizeof want);
+  if (same == GSEC_OK) {
+    return GTLS_OK;
+  }
+  return same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same);
+}
+
+GTLS_Result gtls_binder_transcript(const GTLS_Transcript * t, const void * trunc,
+    size_t trunc_len, void * out) {
+  GTLS_Transcript copy;
+  GTLS_Result result;
+
+  if (t == NULL || trunc == NULL || out == NULL || t->hash == GTLS_HASH_NONE) {
+    return GTLS_ERR_INVALID;
+  }
+  copy = *t;
+  result = gtls_transcript_update(&copy, trunc, trunc_len);
+  if (result == GTLS_OK) {
+    result = gtls_transcript_snapshot(&copy, t->hash, out);
+  }
+  gtls_transcript_wipe(&copy);
+  return result;
 }
 
 void gtls_schedule_wipe(GTLS_Schedule * s) {

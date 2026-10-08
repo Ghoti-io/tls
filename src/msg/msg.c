@@ -293,8 +293,12 @@ static void ext_begin(GTLS_Buf * b, unsigned type, size_t * at) {
   *at = gtls_buf_begin(b, 2);
 }
 
-/** RFC 7685: a ClientHello of 256 to 511 bytes upsets some servers. */
-static void pad_hello(GTLS_Buf * b) {
+/**
+ * RFC 7685: a ClientHello of 256 to 511 bytes upsets some servers. @p extra
+ * is what will follow the padding (a pre_shared_key must be the last
+ * extension, so the padding goes before it).
+ */
+static void pad_hello(GTLS_Buf * b, size_t extra) {
   size_t total;
   size_t data;
   size_t at;
@@ -303,7 +307,7 @@ static void pad_hello(GTLS_Buf * b) {
   if (b->err != GTLS_OK) {
     return;
   }
-  total = b->len;
+  total = b->len + extra;
   if (total < 256u || total > 511u) {
     return;
   }
@@ -314,20 +318,58 @@ static void pad_hello(GTLS_Buf * b) {
   gtls_buf_end(b, at, 2);
 }
 
-/** Fix the three header lengths of a ClientHello once its end is known. */
-static void finish_hello(GTLS_Buf * b, size_t ext_at) {
+/** The bytes a pre_shared_key extension offering @p p takes, header included. */
+static size_t psk_ext_size(const GTLS_PskParams * p) {
+  return p == NULL ? 0u : 4u + 2u + (2u + p->identity_len + 4u) + 2u + (1u + p->binder_len);
+}
+
+/** psk_key_exchange_modes offering psk_dhe_ke alone (section 4.2.9). */
+static void write_psk_modes(GTLS_Buf * b) {
+  size_t at;
+
+  ext_begin(b, GTLS_EXT_PSK_KEY_EXCHANGE_MODES, &at);
+  gtls_buf_u8(b, 1);
+  gtls_buf_u8(b, 1);
+  gtls_buf_end(b, at, 2);
+}
+
+/** pre_shared_key with one identity and a zero binder, to be filled in place. */
+static void write_psk(GTLS_Buf * b, const GTLS_PskParams * p) {
+  size_t at;
+  size_t ids;
+  size_t binders;
+  unsigned char zeros[GTLS_HASH_MAX];
+
+  memset(zeros, 0, sizeof zeros);
+  ext_begin(b, GTLS_EXT_PRE_SHARED_KEY, &at);
+  ids = gtls_buf_begin(b, 2);
+  gtls_buf_u16(b, (unsigned)p->identity_len);
+  (void)gtls_buf_append(b, p->identity, p->identity_len);
+  gtls_buf_u16(b, (unsigned)(p->obfuscated_age >> 16));
+  gtls_buf_u16(b, (unsigned)(p->obfuscated_age & 0xffffu));
+  gtls_buf_end(b, ids, 2);
+  binders = gtls_buf_begin(b, 2);
+  gtls_buf_u8(b, (unsigned)p->binder_len);
+  (void)gtls_buf_append(b, zeros, p->binder_len);
+  gtls_buf_end(b, binders, 2);
+  gtls_buf_end(b, at, 2);
+}
+
+/**
+ * Fix the three header lengths of a ClientHello once its end is known, after
+ * the padding and then the pre_shared_key (which has to be last).
+ */
+static void finish_hello(GTLS_Buf * b, size_t ext_at, const GTLS_PskParams * psk) {
+  pad_hello(b, psk_ext_size(psk));
+  if (psk != NULL) {
+    write_psk(b, psk);
+  }
   gtls_buf_end(b, ext_at, 2);
-  pad_hello(b);
-  /* The padding extension, when one was added, is inside the extension
-   * block, so its length is written again. */
   if (b->err == GTLS_OK) {
-    gtls_buf_end(b, ext_at, 2);
-    if (b->err == GTLS_OK) {
-      size_t body = b->len - 4u;
-      b->data[1] = (unsigned char)(body >> 16);
-      b->data[2] = (unsigned char)(body >> 8);
-      b->data[3] = (unsigned char)body;
-    }
+    size_t body = b->len - 4u;
+    b->data[1] = (unsigned char)(body >> 16);
+    b->data[2] = (unsigned char)(body >> 8);
+    b->data[3] = (unsigned char)body;
   }
 }
 
@@ -354,7 +396,10 @@ GTLS_Result gtls_msg_build_client_hello(const GTLS_HelloParams * p,
   if (p == NULL || out == NULL || p->suites == NULL || p->suite_count == 0 ||
       p->groups == NULL || p->group_count == 0 || p->sig_algs == NULL ||
       p->sig_alg_count == 0 || (p->session_id_len != 0 && p->session_id_len != 32u) ||
-      (p->host == NULL && p->host_len != 0)) {
+      (p->host == NULL && p->host_len != 0) ||
+      (p->psk != NULL && (p->psk->identity == NULL || p->psk->identity_len == 0 ||
+          p->psk->identity_len > 0xffffu || p->psk->binder_len < 32u ||
+          p->psk->binder_len > GTLS_HASH_MAX))) {
     return GTLS_ERR_INVALID;
   }
   gtls_buf_u8(out, GTLS_HS_CLIENT_HELLO);
@@ -409,7 +454,10 @@ GTLS_Result gtls_msg_build_client_hello(const GTLS_HelloParams * p,
   gtls_buf_end(out, at, 2);
 
   write_key_share(out, &p->share);
-  finish_hello(out, ext_at);
+  if (p->psk != NULL) {
+    write_psk_modes(out);
+  }
+  finish_hello(out, ext_at, p->psk);
   return out->err;
 }
 
@@ -467,6 +515,13 @@ GTLS_Result gtls_msg_parse_client_hello(const void * body, size_t len,
 GTLS_Result gtls_msg_retry_client_hello(const void * hello1, size_t hello1_len,
     const GTLS_KeyShare * share, const void * cookie, size_t cookie_len,
     const GTLS_Limits * limits, GTLS_Buf * out) {
+  return gtls_msg_retry_client_hello_psk(hello1, hello1_len, share, cookie,
+      cookie_len, NULL, limits, out);
+}
+
+GTLS_Result gtls_msg_retry_client_hello_psk(const void * hello1, size_t hello1_len,
+    const GTLS_KeyShare * share, const void * cookie, size_t cookie_len,
+    const GTLS_PskParams * psk, const GTLS_Limits * limits, GTLS_Buf * out) {
   const unsigned char * m = hello1;
   GTLS_ClientHello h;
   size_t ext_at;
@@ -491,8 +546,8 @@ GTLS_Result gtls_msg_retry_client_hello(const void * hello1, size_t hello1_len,
   for (i = 0; i < h.ext_count; i++) {
     const GTLS_Ext * e = &h.exts[i];
 
-    if (e->type == GTLS_EXT_PADDING) {
-      continue;
+    if (e->type == GTLS_EXT_PADDING || e->type == GTLS_EXT_PRE_SHARED_KEY) {
+      continue; /* the padding is recomputed, the PSK rewritten last */
     }
     if (e->type == GTLS_EXT_COOKIE) {
       continue; /* replaced below, or dropped */
@@ -518,7 +573,7 @@ GTLS_Result gtls_msg_retry_client_hello(const void * hello1, size_t hello1_len,
     (void)gtls_buf_append(out, cookie, cookie_len);
     gtls_buf_end(out, at, 2);
   }
-  finish_hello(out, ext_at);
+  finish_hello(out, ext_at, psk);
   return out->err;
 }
 
@@ -627,8 +682,11 @@ GTLS_Result gtls_msg_parse_server_hello(const void * body, size_t len,
         s.flags |= GTLS_SH_FLAG_COOKIE;
         break;
       case GTLS_EXT_PRE_SHARED_KEY:
+        result = gtls_reader_u16(&e, &s.psk_identity);
+        if (result == GTLS_OK) {
+          result = gtls_reader_end(&e);
+        }
         s.flags |= GTLS_SH_FLAG_PSK;
-        result = GTLS_OK;
         break;
       default:
         if ((s.flags & GTLS_SH_FLAG_UNKNOWN) == 0) {
@@ -1080,17 +1138,22 @@ GTLS_Result gtls_msg_parse_ch_psk_modes(const GTLS_Ext * e, int * has_dhe_ke) {
 }
 
 GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
-    const GTLS_Limits * limits, size_t * count) {
+    const GTLS_Limits * limits, GTLS_PskOffer * out) {
   GTLS_Reader r;
   GTLS_Reader ids;
   GTLS_Reader binders;
   GTLS_Result result;
+  GTLS_PskOffer o;
   size_t n_ids = 0;
   size_t n_binders = 0;
+  size_t ids_len;
 
+  memset(&o, 0, sizeof o);
   gtls_reader_init(&r, e->data, e->len);
   result = gtls_reader_vector(&r, 2, 7, 0, &ids);
   if (result == GTLS_OK) {
+    ids_len = ids.len;
+    o.binders_off = 2u + ids_len;
     result = gtls_reader_vector(&r, 2, 33, 0, &binders);
   }
   if (result == GTLS_OK) {
@@ -1113,6 +1176,14 @@ GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
     if (identity.len > limits->max_ticket_bytes || ++n_ids > limits->max_tickets) {
       return GTLS_ERR_LIMIT;
     }
+    if (n_ids <= GTLS_PSK_MAX) {
+      GTLS_PskEntry * en = &o.entries[n_ids - 1u];
+
+      en->identity = identity.p;
+      en->identity_len = identity.len;
+      en->age = ((uint32_t)age[0] << 24) | ((uint32_t)age[1] << 16) |
+          ((uint32_t)age[2] << 8) | age[3];
+    }
   }
   while (gtls_reader_left(&binders) != 0) {
     GTLS_Reader binder;
@@ -1124,11 +1195,17 @@ GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
     if (++n_binders > limits->max_tickets) {
       return GTLS_ERR_LIMIT;
     }
+    if (n_binders <= GTLS_PSK_MAX) {
+      o.entries[n_binders - 1u].binder = binder.p;
+      o.entries[n_binders - 1u].binder_len = binder.len;
+    }
   }
   if (n_ids != n_binders) {
     return GTLS_ERR_PROTOCOL;
   }
-  *count = n_ids;
+  o.count = n_ids;
+  o.stored = n_ids < GTLS_PSK_MAX ? n_ids : GTLS_PSK_MAX;
+  *out = o;
   return GTLS_OK;
 }
 
@@ -1183,6 +1260,12 @@ GTLS_Result gtls_msg_build_server_hello(const GTLS_ServerHelloParams * p,
   gtls_buf_u16(out, p->suite);
   gtls_buf_u8(out, 0);
   ext_at = gtls_buf_begin(out, 2);
+  if (p->psk && !p->is_hrr) {
+    /* The RFC's own trace puts the selected identity first. */
+    ext_begin(out, GTLS_EXT_PRE_SHARED_KEY, &at);
+    gtls_buf_u16(out, p->psk_identity);
+    gtls_buf_end(out, at, 2);
+  }
   if (p->group != 0) {
     ext_begin(out, GTLS_EXT_KEY_SHARE, &at);
     gtls_buf_u16(out, p->group);
@@ -1274,6 +1357,38 @@ GTLS_Result gtls_msg_build_certificate_verify(unsigned scheme,
   gtls_buf_u16(out, scheme);
   gtls_buf_u16(out, (unsigned)signature_len);
   (void)gtls_buf_append(out, signature, signature_len);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_new_session_ticket(const GTLS_NewSessionTicket * t,
+    GTLS_Buf * out) {
+  size_t start;
+  size_t ext_at;
+  size_t at;
+
+  if (t == NULL || out == NULL || t->nonce_len > 255u || t->ticket == NULL ||
+      t->ticket_len == 0 || t->ticket_len > 0xffffu ||
+      (t->nonce == NULL && t->nonce_len != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_NEW_SESSION_TICKET);
+  gtls_buf_u16(out, (unsigned)(t->lifetime >> 16));
+  gtls_buf_u16(out, (unsigned)(t->lifetime & 0xffffu));
+  gtls_buf_u16(out, (unsigned)(t->age_add >> 16));
+  gtls_buf_u16(out, (unsigned)(t->age_add & 0xffffu));
+  gtls_buf_u8(out, (unsigned)t->nonce_len);
+  (void)gtls_buf_append(out, t->nonce, t->nonce_len);
+  gtls_buf_u16(out, (unsigned)t->ticket_len);
+  (void)gtls_buf_append(out, t->ticket, t->ticket_len);
+  ext_at = gtls_buf_begin(out, 2);
+  if (t->early_data) {
+    ext_begin(out, GTLS_EXT_EARLY_DATA, &at);
+    gtls_buf_u16(out, (unsigned)(t->max_early_data >> 16));
+    gtls_buf_u16(out, (unsigned)(t->max_early_data & 0xffffu));
+    gtls_buf_end(out, at, 2);
+  }
+  gtls_buf_end(out, ext_at, 2);
   return finish_message(out, start);
 }
 

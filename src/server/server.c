@@ -193,7 +193,7 @@ static GTLS_Result read_offer(GTLS_Conn * c, const unsigned char * msg,
   e = gtls_msg_find_ext(ch->exts, ch->ext_count, GTLS_EXT_PRE_SHARED_KEY);
   if (e != NULL) {
     int dhe = 0;
-    size_t identities = 0;
+    GTLS_PskOffer identities;
     const GTLS_Ext * modes = gtls_msg_find_ext(ch->exts, ch->ext_count,
         GTLS_EXT_PSK_KEY_EXCHANGE_MODES);
 
