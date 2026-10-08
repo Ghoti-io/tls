@@ -128,6 +128,9 @@ struct Pair {
   int64_t now = kNow;
   bool auto_read = true;   /* read what arrives into Endpoint::got as it comes */
   Bytes raw_hello;         /* when set, the client starts from this ClientHello (its X25519 private key is 0x33 repeated) */
+  std::vector<GTLS_TicketKey> keys;   /* the server's ticket keyring */
+  const GTLS_Session * offer = nullptr;   /* a session the client offers when it starts */
+  int64_t offer_time = 0;              /* ... at this second (0: now) */
   Endpoint c, s;
 
   explicit Pair(std::vector<Cred *> cs) : creds(cs) {
@@ -179,6 +182,10 @@ struct Pair {
     }
     scfg.identities = ids.data();
     scfg.identity_count = ids.size();
+    if (!keys.empty()) {
+      scfg.ticket_keys = keys.data();
+      scfg.ticket_key_count = keys.size();
+    }
     GTLS_Result r = gtls_context_new(allocator, &ccfg, &c.ctx);
     if (r != GTLS_OK) {
       return r;
@@ -194,6 +201,18 @@ struct Pair {
     r = gtls_conn_new_server(s.ctx, &s.conn);
     if (r != GTLS_OK) {
       return r;
+    }
+    return begin();
+  }
+
+  /** Offer the session if there is one, and start both connections. */
+  GTLS_Result begin() {
+    GTLS_Result r = GTLS_OK;
+    if (offer != nullptr) {
+      r = gtls_conn_set_session(c.conn, offer, offer_time != 0 ? offer_time : now);
+      if (r != GTLS_OK) {
+        return r;
+      }
     }
     r = raw_hello.empty() ? gtls_conn_start(c.conn)
                           : gtls_conn_start_raw(c.conn, raw_hello.data(), raw_hello.size(),
@@ -244,6 +263,28 @@ struct Pair {
 
   bool connected() const {
     return gtls_conn_is_connected(c.conn) && gtls_conn_is_connected(s.conn);
+  }
+
+  /**
+   * Replace both connections with new ones from the same contexts and start
+   * them, the client offering @p session (if any) at @p at (0: now). The
+   * contexts, and so the keyring, are the ones the first handshake used.
+   */
+  GTLS_Result again(const GTLS_Session * session, int64_t at = 0) {
+    gtls_conn_free(c.conn);
+    gtls_conn_free(s.conn);
+    c.conn = nullptr;
+    s.conn = nullptr;
+    c.got.clear();
+    s.got.clear();
+    c.feed_result = s.feed_result = GTLS_OK;
+    offer = session;
+    offer_time = at;
+    GTLS_Result r = gtls_conn_new(c.ctx, host.data(), host.size(), &c.conn);
+    if (r == GTLS_OK) {
+      r = gtls_conn_new_server(s.ctx, &s.conn);
+    }
+    return r == GTLS_OK ? begin() : r;
   }
 
   /** Write all of @p data from @p from, draining the output as it goes. */

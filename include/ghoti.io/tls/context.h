@@ -47,6 +47,7 @@
 #include <ghoti.io/tls/core.h>
 #include <ghoti.io/tls/macros.h>
 #include <ghoti.io/tls/schedule.h>
+#include <ghoti.io/tls/session.h>
 
 #include <ghoti.io/certificate/certificate.h>
 
@@ -140,6 +141,20 @@ typedef struct GTLS_ContextConfig {
   const size_t * chain_lens;      ///< Length of each entry of @p chain.
   size_t chain_count;             ///< Length of @p chain.
   const GCERT_Key * key;          ///< The private key for @p chain.
+  /**
+   * @name Session tickets (server)
+   * A server seals the state of a session into the ticket it sends, under a
+   * key it is given here, and keeps nothing (session.h). With no key, or with
+   * ::ticket_count of 0, it issues none and accepts none: a ClientHello that
+   * offers a ticket gets the full handshake. A client context refuses these
+   * fields (::GTLS_ERR_INVALID); a client's tickets are in the connection.
+   * @{ */
+  const GTLS_TicketKey * ticket_keys; ///< The keyring, copied. The newest key valid at the time seals; every unexpired one opens. NULL with a count of 0: no tickets.
+  size_t ticket_key_count;        ///< Length of @p ticket_keys: at most ::GTLS_TICKET_KEYS_MAX, names distinct.
+  unsigned ticket_count;          ///< NewSessionTicket messages sent after each handshake (the default of 1 is set by ::gtls_context_config_default; 0 disables them). At most ::GTLS_Limits::max_tickets.
+  uint32_t ticket_lifetime;       ///< Seconds a ticket is good for, sent to the client. 0: ::GTLS_TICKET_LIFETIME_DEFAULT. At most ::GTLS_TICKET_LIFETIME_MAX.
+  uint32_t ticket_age_window;     ///< Seconds the age a client reports may differ from the server's own. 0: ::GTLS_TICKET_AGE_WINDOW_DEFAULT. At most ::GTLS_TICKET_AGE_WINDOW_MAX.
+  /** @} */
   /** @name Reserved for later pieces; must be zero or NULL today.
    * @{ */
   const void * psk;               ///< A pre-shared key.
@@ -168,10 +183,15 @@ GTLS_API void gtls_context_config_default(GTLS_ContextConfig * config);
  * @return ::GTLS_OK; ::GTLS_ERR_INVALID for a client with no trust store, a
  *   server with no identity (or with both forms of one), an identity whose key
  *   does not match its leaf or whose names are empty or oversized, a server with a max_client_hello above 65536, an empty
- *   or oversized name, an unknown suite or group, or a count with a NULL
- *   list; ::GTLS_ERR_UNSUPPORTED for a reserved field or a version other
+ *   or oversized name, an unknown suite or group, a count with a NULL
+ *   list, a ticket key list that is too long, repeats a name or has a window
+ *   that ends before it begins, a ticket count above ::GTLS_Limits::max_tickets,
+ *   a lifetime or a window above its maximum, or ticket fields on a client;
+ *   ::GTLS_ERR_UNSUPPORTED for a reserved field or a version other
  *   than TLS 1.3; ::GTLS_ERR_LIMIT for an ALPN list that does not fit in the
- *   extension or a chain too large to send within ::GTLS_Limits::max_output_bytes;
+ *   extension, a chain too large to send within ::GTLS_Limits::max_output_bytes,
+ *   or a ticket key list with ::GTLS_Limits::max_ticket_bytes too small for
+ *   the largest ticket this library seals;
  *   ::GTLS_ERR_OOM.
  */
 GTLS_API GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,

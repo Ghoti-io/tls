@@ -56,6 +56,7 @@
 #include <ghoti.io/tls/core.h>
 #include <ghoti.io/tls/macros.h>
 #include <ghoti.io/tls/schedule.h>
+#include <ghoti.io/tls/session.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -283,6 +284,60 @@ GTLS_API int gtls_conn_retried(const GTLS_Conn * conn);
  */
 GTLS_API GTLS_Result gtls_conn_peer_certificate(const GTLS_Conn * conn,
     const unsigned char ** der, size_t * len);
+
+/**
+ * @brief Offer a session to resume (client role, before ::gtls_conn_start).
+ *
+ * The ClientHello will carry the session's ticket as a `pre_shared_key` with
+ * `psk_key_exchange_modes` of psk_dhe_ke, its obfuscated age computed from
+ * @p unix_time, and a binder. The connection copies the session; the caller
+ * keeps its own. If the server accepts, the handshake is the abbreviated one
+ * (no Certificate, no CertificateVerify: ::gtls_conn_resumed says so);
+ * if it does not, it continues as a full handshake with the certificate
+ * checks it always makes. A HelloRetryRequest does not lose the offer: the
+ * binder is computed again for the second ClientHello (or the PSK is
+ * dropped, when the suite the server chose has another hash).
+ *
+ * @param session The session, from ::gtls_conn_session or ::gtls_session_parse.
+ * @param unix_time Seconds since 1970-01-01 UTC, now.
+ * @return ::GTLS_OK; ::GTLS_ERR_INVALID for a server connection, one already
+ *   started, a second session, a session for another host name, one whose
+ *   suite this connection does not offer, or one that has not arrived yet or
+ *   has run out; ::GTLS_ERR_FAILED; ::GTLS_ERR_OOM.
+ */
+GTLS_API GTLS_Result gtls_conn_set_session(GTLS_Conn * conn,
+    const GTLS_Session * session, int64_t unix_time);
+
+/**
+ * @brief 1 when this handshake was an abbreviated one, resumed from a ticket.
+ *
+ * Meaningful once the ServerHello has been accepted (a client) or built (a
+ * server); 0 before, and for a full handshake.
+ */
+GTLS_API int gtls_conn_resumed(const GTLS_Conn * conn);
+
+/**
+ * @brief How many sessions this connection has been sent (client role).
+ *
+ * One for each NewSessionTicket received after the handshake, at most
+ * ::GTLS_Limits::max_tickets; tickets with a lifetime of 0, which the server
+ * asks to be discarded, are not kept. 0 for a server and for a failed
+ * connection (which has wiped them).
+ */
+GTLS_API size_t gtls_conn_session_count(const GTLS_Conn * conn);
+
+/**
+ * @brief A copy of one of the sessions the server sent (client role).
+ *
+ * @param index From 0 to ::gtls_conn_session_count minus one, in the order
+ *   they arrived.
+ * @param out Receives a session the caller frees with ::gtls_session_free.
+ *   Not NULL; written only on success.
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID (a server, or no such session),
+ *   ::GTLS_ERR_FAILED or ::GTLS_ERR_OOM.
+ */
+GTLS_API GTLS_Result gtls_conn_session(const GTLS_Conn * conn, size_t index,
+    GTLS_Session ** out);
 
 #ifdef __cplusplus
 }

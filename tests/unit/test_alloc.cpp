@@ -234,6 +234,155 @@ TEST(AllocationSweepControl, TheAllocatorSeesALeakAndAFailure) {
   a.fail_at = -1;
 }
 
+
+/* Resumption: a ticket is issued, kept, handed out, offered and used. The
+ * first handshake is swept in one run (the sealing of the ticket, the
+ * session the client keeps and copies out) and the second in another (the
+ * copy the connection makes of the session, the abbreviated flight). */
+
+namespace {
+
+struct ResumeRun {
+  GTLS_Result create = GTLS_OK;
+  bool clean = false;
+  bool any_oom = false;
+};
+
+ResumeRun resume_with_failure_at(long n, TestAlloc & alloc, Cred & cred, int phase, bool retry) {
+  ResumeRun out;
+  const GTLS_TicketKey key = [] {
+    GTLS_TicketKey k;
+    std::memset(&k, 0, sizeof k);
+    std::memset(k.name, 0x11, sizeof k.name);
+    std::memset(k.key, 0x22, sizeof k.key);
+    k.not_before = kNow - 100;
+    k.not_after = kNow + 100000;
+    return k;
+  }();
+  GTLS_Group want = GTLS_GROUP_SECP256R1;
+  GTLS_Session * session = nullptr;
+
+  alloc.count = 0;
+  alloc.fail_at = -1;
+  {
+    /* First handshake: swept when phase is 0. */
+    Pair p1(cred);
+    p1.keys = {key};
+    if (retry) {
+      p1.scfg.groups = &want;
+      p1.scfg.group_count = 1;
+    }
+    if (phase == 0) {
+      p1.allocator = &alloc.a;
+      alloc.fail_at = n;
+    }
+    out.create = p1.build();
+    if (out.create != GTLS_OK) {
+      return out;
+    }
+    p1.run();
+    if (!p1.connected()) {
+      for (GTLS_Conn * c : {p1.c.conn, p1.s.conn}) {
+        if (gtls_conn_is_failed(c)) {
+          out.any_oom |= gtls_conn_failure(c) == GTLS_ERR_OOM;
+          EXPECT_TRUE(gtls_conn_secrets_are_wiped(c)) << "failure at allocation " << n;
+          EXPECT_EQ(gtls_conn_session_count(c), 0u) << "a failed connection holds no sessions";
+        }
+      }
+      return out;
+    }
+    GTLS_Result r = gtls_conn_session(p1.c.conn, 0, &session);
+    if (r != GTLS_OK) {
+      out.any_oom |= r == GTLS_ERR_OOM;
+      return out;
+    }
+    if (phase == 0) {
+      /* The session is the caller's: free it, and nothing remains. */
+      gtls_session_free(session);
+      out.clean = true;
+      return out;
+    }
+  }
+  /* Second handshake: swept when phase is 1. */
+  alloc.count = 0;
+  alloc.fail_at = n;
+  {
+    Pair p2(cred);
+    p2.keys = {key};
+    if (retry) {
+      p2.scfg.groups = &want;
+      p2.scfg.group_count = 1;
+    }
+    p2.allocator = &alloc.a;
+    p2.offer = session;
+    out.create = p2.build();
+    if (out.create != GTLS_OK) {
+      gtls_session_free(session);
+      return out;
+    }
+    p2.run();
+    bool resumed = p2.connected() && gtls_conn_resumed(p2.c.conn) && gtls_conn_resumed(p2.s.conn);
+    GTLS_Session * again = nullptr;
+    if (resumed) {
+      GTLS_Result r = gtls_conn_session(p2.c.conn, 0, &again);
+      if (r != GTLS_OK) {
+        out.any_oom |= r == GTLS_ERR_OOM;
+        resumed = false;
+      }
+      gtls_session_free(again);
+    }
+    out.clean = resumed;
+    for (GTLS_Conn * c : {p2.c.conn, p2.s.conn}) {
+      if (gtls_conn_is_failed(c)) {
+        out.any_oom |= gtls_conn_failure(c) == GTLS_ERR_OOM;
+        EXPECT_TRUE(gtls_conn_secrets_are_wiped(c)) << "failure at allocation " << n;
+      }
+    }
+  }
+  gtls_session_free(session);
+  return out;
+}
+
+}  // namespace
+
+class ResumeAllocationSweep : public ::testing::TestWithParam<std::tuple<int, bool>> {};
+
+TEST_P(ResumeAllocationSweep, FailingEachAllocationLeaksNothingAndIsNeverSilent) {
+  const int phase = std::get<0>(GetParam());
+  const bool retry = std::get<1>(GetParam());
+  std::unique_ptr<Cred> cred = ed_cred();
+  TestAlloc probe;
+  ResumeRun clean = resume_with_failure_at(-1, probe, *cred, phase, retry);
+  ASSERT_EQ(clean.create, GTLS_OK);
+  ASSERT_TRUE(clean.clean);
+  EXPECT_EQ(probe.live, 0) << "the clean run frees everything";
+  const long total = probe.count;
+  ASSERT_GT(total, 10);
+  ASSERT_LT(total, 600);
+  for (long n = 0; n < total; n++) {
+    TestAlloc alloc;
+    ResumeRun r = resume_with_failure_at(n, alloc, *cred, phase, retry);
+    EXPECT_EQ(alloc.live, 0) << "allocation " << n << " of " << total << " leaked";
+    EXPECT_FALSE(r.clean) << "allocation " << n << " failed and nothing noticed";
+    if (r.create != GTLS_OK) {
+      EXPECT_EQ(r.create, GTLS_ERR_OOM) << n;
+    } else {
+      EXPECT_TRUE(r.any_oom) << "allocation " << n << " failed and no one reported out-of-memory";
+    }
+  }
+  TestAlloc past;
+  ResumeRun after = resume_with_failure_at(total, past, *cred, phase, retry);
+  EXPECT_TRUE(after.clean);
+  EXPECT_EQ(past.live, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(Flows, ResumeAllocationSweep,
+    ::testing::Combine(::testing::Values(0, 1), ::testing::Bool()),
+    [](const ::testing::TestParamInfo<std::tuple<int, bool>> & info) {
+      return std::string(std::get<0>(info.param) == 0 ? "Issue" : "Resume") +
+          (std::get<1>(info.param) ? "Retry" : "Plain");
+    });
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

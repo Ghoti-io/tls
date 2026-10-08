@@ -94,12 +94,27 @@ GTLS_Result gtls_conn_fail(GTLS_Conn * c, GTLS_Result result, unsigned alert) {
     c->failure = result;
     c->alert = alert;
     wipe_secrets(c);
+    gtls_conn_drop_sessions(c);
     if (c->app_in.data != NULL) {
       (void)gsec_wipe(c->app_in.data, c->app_in.cap);
     }
     c->app_in.len = 0;
   }
   return result;
+}
+
+void gtls_conn_drop_sessions(GTLS_Conn * c) {
+  size_t i;
+
+  for (i = 0; i < c->session_count; i++) {
+    gtls_session_free(c->sessions[i]);
+  }
+  gcu_allocator_free(c->allocator, c->sessions);
+  c->sessions = NULL;
+  c->session_count = 0;
+  c->session_cap = 0;
+  gtls_session_free(c->offer);
+  c->offer = NULL;
 }
 
 /** Failure of a parser or a buffer, with the alert its result calls for. */
@@ -214,6 +229,7 @@ void gtls_conn_free(GTLS_Conn * c) {
   }
   allocator = c->allocator;
   wipe_secrets(c);
+  gtls_conn_drop_sessions(c);
   gtls_buf_free(&c->in);
   gtls_buf_free(&c->hello);
   for (i = 0; i < GTLS_EPOCH_COUNT; i++) {
@@ -476,6 +492,52 @@ GTLS_Result gtls_conn_queue(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
 
 /* ------------------------------------------------------------------- start */
 
+/** The hash of the PSK on offer, or ::GTLS_HASH_NONE when none is, which no suite's hash equals. */
+static GTLS_Hash offered_hash(const GTLS_Conn * c) {
+  return c->offer != NULL ? gtls_suite_hash(c->offer->suite) : GTLS_HASH_NONE;
+}
+
+/** The age to report for @p s at @p now: milliseconds since it arrived, plus its age_add, modulo 2^32 (RFC 8446 section 4.2.11.1). */
+static uint32_t obfuscated_age(const GTLS_Session * s, int64_t now) {
+  /* gtls_conn_set_session checked now is within [received, received + lifetime), and
+   * a lifetime is at most seven days, so the product is under 2^32. */
+  uint64_t elapsed = now > s->received ? (uint64_t)now - (uint64_t)s->received : 0u;
+
+  return (uint32_t)(elapsed * 1000u) + s->age_add;
+}
+
+/**
+ * Compute the binder of the offer in @p hello, whose last bytes are the zero
+ * binder the builder wrote, over @p base (the transcript the binder covers
+ * before this hello: empty for the first, the restarted one with the
+ * HelloRetryRequest for the second) and the hello cut before the binders
+ * list, and write it in place.
+ */
+static GTLS_Result patch_binder(const GTLS_Conn * c, const GTLS_Transcript * base,
+    GTLS_Buf * hello) {
+  const GTLS_Session * o = c->offer;
+  GTLS_Hash hash = gtls_suite_hash(o->suite);
+  size_t hlen = o->psk_len;
+  unsigned char th[GTLS_HASH_MAX];
+  unsigned char binder[GTLS_HASH_MAX];
+  GTLS_Result result;
+
+  if (hello->len < GTLS_PSK_BINDERS_TAIL(hlen)) {
+    return GTLS_ERR_INTERNAL;
+  }
+  result = gtls_binder_transcript(base, hello->data,
+      hello->len - GTLS_PSK_BINDERS_TAIL(hlen), th);
+  if (result == GTLS_OK) {
+    result = gtls_binder_compute(hash, o->psk, hlen, th, binder);
+  }
+  if (result == GTLS_OK) {
+    memcpy(hello->data + hello->len - hlen, binder, hlen);
+  }
+  (void)gsec_wipe(th, sizeof th);
+  (void)gsec_wipe(binder, sizeof binder);
+  return result;
+}
+
 static GTLS_Result begin_handshake(GTLS_Conn * c) {
   GTLS_Result result = gtls_transcript_init(&c->sec.transcript);
 
@@ -495,6 +557,7 @@ static GTLS_Result begin_handshake(GTLS_Conn * c) {
 
 GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   GTLS_HelloParams p;
+  GTLS_PskParams psk;
   GTLS_Result result;
 
   if (c == NULL) {
@@ -535,8 +598,29 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   p.sig_alg_count = c->context->sig_alg_count;
   memcpy(c->session_id, p.session_id, 32);
   c->session_id_len = p.session_id_len;
+  if (c->offer != NULL) {
+    memset(&psk, 0, sizeof psk);
+    psk.identity = c->offer->ticket;
+    psk.identity_len = c->offer->ticket_len;
+    psk.obfuscated_age = obfuscated_age(c->offer, c->offer_time);
+    psk.binder_len = c->offer->psk_len;
+    p.psk = &psk;
+  }
   result = gtls_msg_build_client_hello(&p, &c->hello);
   (void)gsec_wipe(&p, sizeof p);
+  if (result == GTLS_OK && c->offer != NULL) {
+    /* Nothing precedes the first ClientHello in the transcript. */
+    GTLS_Transcript empty;
+
+    result = gtls_transcript_init(&empty);
+    if (result == GTLS_OK) {
+      result = gtls_transcript_select(&empty, gtls_suite_hash(c->offer->suite));
+    }
+    if (result == GTLS_OK) {
+      result = patch_binder(c, &empty, &c->hello);
+    }
+    gtls_transcript_wipe(&empty);
+  }
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
@@ -575,10 +659,12 @@ GTLS_Result gtls_conn_start_raw(GTLS_Conn * c, const void * hello,
 /* ------------------------------------------------------------- the messages */
 
 static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
-    const unsigned char * msg, size_t msg_len) {
+    const unsigned char * msg, size_t msg_len, int64_t now) {
   GTLS_Hash hash = gtls_suite_hash(sh->suite);
   GTLS_KeyShare share;
   const GTLS_KeyShare * sp = NULL;
+  GTLS_PskParams psk;
+  const GTLS_PskParams * pp = NULL;
   GTLS_Buf h2;
   GTLS_Result result;
   size_t i;
@@ -619,13 +705,33 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
     sp = &share;
     c->share_group = (GTLS_Group)sh->group;
   }
+  /* A PSK is for one hash. The suite the server chose decides whether the
+   * offer goes on: with the same hash it is made again, with a fresh age and
+   * a binder over the new transcript; with another it is dropped, and the
+   * handshake that follows is a full one (section 4.1.2 and 4.2.11). */
+  if (c->offer != NULL) {
+    if (hash == gtls_suite_hash(c->offer->suite)) {
+      memset(&psk, 0, sizeof psk);
+      psk.identity = c->offer->ticket;
+      psk.identity_len = c->offer->ticket_len;
+      psk.obfuscated_age = obfuscated_age(c->offer, now);
+      psk.binder_len = c->offer->psk_len;
+      pp = &psk;
+    } else {
+      gtls_session_free(c->offer);
+      c->offer = NULL;
+    }
+  }
   gtls_buf_init(&h2, c->allocator, GTLS_HELLO_MAX);
   {
     GTLS_Limits l = gtls_conn_own_limits(c);
 
-    result = gtls_msg_retry_client_hello(c->hello.data, c->hello.len, sp,
+    result = gtls_msg_retry_client_hello_psk(c->hello.data, c->hello.len, sp,
         (sh->flags & GTLS_SH_FLAG_COOKIE) != 0 ? sh->cookie : NULL,
-        (sh->flags & GTLS_SH_FLAG_COOKIE) != 0 ? sh->cookie_len : 0, &l, &h2);
+        (sh->flags & GTLS_SH_FLAG_COOKIE) != 0 ? sh->cookie_len : 0, pp, &l, &h2);
+  }
+  if (result == GTLS_OK && pp != NULL) {
+    result = patch_binder(c, &c->sec.transcript, &h2);
   }
   if (result == GTLS_OK) {
     result = gtls_transcript_update(&c->sec.transcript, h2.data, h2.len);
@@ -648,7 +754,7 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
 }
 
 static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
-    size_t msg_len) {
+    size_t msg_len, int64_t now) {
   const unsigned char * body = msg + 4;
   size_t len = msg_len - 4u;
   GTLS_ServerHello sh;
@@ -679,7 +785,8 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   if (sh.selected_version != 0x0304u) {
     return gtls_conn_illegal(c);
   }
-  if ((sh.flags & (GTLS_SH_FLAG_PSK | GTLS_SH_FLAG_UNKNOWN)) != 0 ||
+  if ((sh.flags & GTLS_SH_FLAG_UNKNOWN) != 0 ||
+      (sh.is_hrr && (sh.flags & GTLS_SH_FLAG_PSK) != 0) ||
       (!sh.is_hrr && (sh.flags & GTLS_SH_FLAG_COOKIE) != 0)) {
     return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
   }
@@ -687,10 +794,19 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
     return gtls_conn_illegal(c);
   }
   if (sh.is_hrr) {
-    return on_hrr(c, &sh, msg, msg_len);
+    return on_hrr(c, &sh, msg, msg_len, now);
   }
   if (c->retried && sh.suite != (unsigned)c->suite) {
     return gtls_conn_illegal(c);
+  }
+  if ((sh.flags & GTLS_SH_FLAG_PSK) != 0) {
+    /* RFC 8446 section 4.2.11: a PSK that was not offered, an identity out
+     * of the range of those offered (one was), and a suite whose hash is not
+     * the PSK's are each illegal_parameter. */
+    if (sh.psk_identity != 0 || gtls_suite_hash(sh.suite) != offered_hash(c)) {
+      return gtls_conn_illegal(c);
+    }
+    c->resumed = 1;
   }
   if ((sh.flags & GTLS_SH_FLAG_KEY_SHARE) == 0) {
     return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
@@ -717,7 +833,11 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
     result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_early(&c->sec.schedule, hash);
+    const GTLS_Session * psk = c->resumed ? c->offer : NULL;
+
+    result = psk != NULL
+        ? gtls_schedule_early_psk(&c->sec.schedule, hash, psk->psk, psk->psk_len)
+        : gtls_schedule_early(&c->sec.schedule, hash);
   }
   if (result == GTLS_OK) {
     result = gtls_schedule_handshake(&c->sec.schedule, ecdhe, ecdhe_len, th);
@@ -725,6 +845,9 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   (void)gsec_wipe(ecdhe, sizeof ecdhe);
   (void)gsec_wipe(th, sizeof th);
   gtls_conn_wipe_kx(c);
+  /* The offered PSK has done its work, or been passed over. */
+  gtls_session_free(c->offer);
+  c->offer = NULL;
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
@@ -784,7 +907,8 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  c->state = GTLS_STATE_WAIT_CERT;
+  /* A resumed handshake authenticates with the PSK: no Certificate follows. */
+  c->state = c->resumed ? GTLS_STATE_WAIT_FIN : GTLS_STATE_WAIT_CERT;
   return GTLS_OK;
 }
 
@@ -930,6 +1054,13 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
     memcpy(fin + 4, verify, hlen);
     result = gtls_transcript_update(&c->sec.transcript, fin, 4u + hlen);
   }
+  /* The resumption secret is over the transcript through this Finished. */
+  if (result == GTLS_OK) {
+    result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_schedule_keep_resumption(&c->sec.schedule, th);
+  }
   if (result == GTLS_OK) {
     result = gtls_conn_queue(c, GTLS_EPOCH_HANDSHAKE, fin, 4u + hlen);
     if (result != GTLS_OK) {
@@ -947,8 +1078,54 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
   return GTLS_OK;
 }
 
+/** Keep the session a NewSessionTicket makes. */
+static GTLS_Result keep_ticket(GTLS_Conn * c, const GTLS_NewSessionTicket * t, int64_t now) {
+  GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
+  GTLS_Session * s;
+  GTLS_Result result;
+
+  s = gtls_session_alloc(c->allocator, t->ticket_len);
+  if (s == NULL) {
+    return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  s->suite = (uint32_t)c->suite;
+  s->psk_len = gtls_hash_len(hash);
+  result = gtls_resumption_psk(hash, c->sec.schedule.res, t->nonce, t->nonce_len, s->psk);
+  if (result != GTLS_OK) {
+    gtls_session_free(s);
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  /* A client must not keep a ticket longer than seven days (section 4.6.1). */
+  s->lifetime = t->lifetime < GTLS_TICKET_LIFETIME_MAX ? t->lifetime : GTLS_TICKET_LIFETIME_MAX;
+  s->age_add = t->age_add;
+  s->max_early_data = t->early_data ? t->max_early_data : 0u;
+  s->received = now;
+  memcpy(s->host, c->host, c->host_len);
+  s->host_len = c->host_len;
+  memcpy(s->alpn, c->alpn_selected, c->alpn_selected_len);
+  s->alpn_len = c->alpn_selected_len;
+  memcpy(s->ticket, t->ticket, t->ticket_len);
+  if (c->session_count == c->session_cap) {
+    size_t cap = c->session_cap == 0 ? 4u : 2u * c->session_cap;
+    GTLS_Session ** grown = gcu_allocator_calloc(c->allocator, cap, sizeof *grown);
+
+    if (grown == NULL) {
+      gtls_session_free(s);
+      return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
+    }
+    if (c->session_count != 0) {
+      memcpy(grown, c->sessions, c->session_count * sizeof *grown);
+    }
+    gcu_allocator_free(c->allocator, c->sessions);
+    c->sessions = grown;
+    c->session_cap = cap;
+  }
+  c->sessions[c->session_count++] = s;
+  return GTLS_OK;
+}
+
 static GTLS_Result on_post_handshake(GTLS_Conn * c, unsigned type,
-    const unsigned char * msg, size_t msg_len) {
+    const unsigned char * msg, size_t msg_len, int64_t now) {
   GTLS_NewSessionTicket t;
   GTLS_Result result;
 
@@ -971,9 +1148,11 @@ static GTLS_Result on_post_handshake(GTLS_Conn * c, unsigned type,
   if (result != GTLS_OK) {
     return gtls_conn_fail_parse(c, result);
   }
-  /* Parsed, checked, and discarded: resumption is a later piece. */
   c->tickets++;
-  return GTLS_OK;
+  if (t.lifetime == 0) {
+    return GTLS_OK; /* the server asks that it be discarded (section 4.6.1) */
+  }
+  return keep_ticket(c, &t, now);
 }
 
 static GTLS_Result on_message(GTLS_Conn * c, const unsigned char * msg,
@@ -986,7 +1165,7 @@ static GTLS_Result on_message(GTLS_Conn * c, const unsigned char * msg,
       if (type != GTLS_HS_SERVER_HELLO) {
         return gtls_conn_unexpected(c);
       }
-      return on_server_hello(c, msg, msg_len);
+      return on_server_hello(c, msg, msg_len, now);
     case GTLS_STATE_WAIT_EE:
       if (type != GTLS_HS_ENCRYPTED_EXTENSIONS) {
         return gtls_conn_unexpected(c);
@@ -1013,7 +1192,7 @@ static GTLS_Result on_message(GTLS_Conn * c, const unsigned char * msg,
       }
       return on_finished(c, msg, msg_len);
     case GTLS_STATE_CONNECTED:
-      return on_post_handshake(c, type, msg, msg_len);
+      return on_post_handshake(c, type, msg, msg_len, now);
     case GTLS_STATE_S_WAIT_CH:
     case GTLS_STATE_S_WAIT_CH2:
     case GTLS_STATE_S_WAIT_FIN:

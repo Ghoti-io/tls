@@ -46,6 +46,7 @@
 #include "../msg/msg_internal.h"
 #include "../record/record_internal.h"
 #include "../schedule/schedule_internal.h"
+#include "../session/session_internal.h"
 
 /** The most a ClientHello can come to, header included, and so the most a server accepts. */
 #define GTLS_HELLO_MAX 65540u
@@ -87,6 +88,12 @@ struct GTLS_Context {
   size_t alpn_len;
   int middlebox_compat;
   GTLS_Limits limits;
+  /* A server's tickets. */
+  GTLS_TicketKey ticket_keys[GTLS_TICKET_KEYS_MAX];
+  size_t ticket_key_count;
+  unsigned ticket_count;            /* sent after each handshake; 0 sends none */
+  uint32_t ticket_lifetime;         /* seconds */
+  uint32_t ticket_age_window;       /* seconds */
 };
 
 /**
@@ -213,6 +220,14 @@ struct GTLS_Conn {
   unsigned key_updates;             /* KeyUpdates received, in all */
   unsigned ku_run;                  /* ... since application data last arrived */
   unsigned ku_queued;               /* KeyUpdate messages queued, not yet sealed */
+
+  /* Resumption. */
+  int resumed;                      /* the handshake is an abbreviated one */
+  GTLS_Session * offer;             /* client: the session on offer in the ClientHello in flight, until the ServerHello decides (NULL: none is) */
+  int64_t offer_time;               /* client: the second it was handed over */
+  GTLS_Session ** sessions;         /* client: the sessions the server has sent */
+  size_t session_count;
+  size_t session_cap;
 };
 
 /* ------------------------------------------------ shared by the two roles */
@@ -276,6 +291,9 @@ void gtls_stream_free(GTLS_Conn * c);
 GTLS_Result gtls_stream_flush(GTLS_Conn * c);
 /** Seal and queue @p alert under the keys in use; for failure, best effort. */
 GTLS_Result gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description);
+
+/** Wipe and free the sessions a connection holds and the one it offered. */
+void gtls_conn_drop_sessions(GTLS_Conn * c);
 
 /** The default chain and name check, which is what ships. */
 GTLS_Result gtls_verify_chain(void * user, const GTLS_Conn * conn,

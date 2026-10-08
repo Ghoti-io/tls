@@ -503,7 +503,7 @@ static std::vector<Case> hello_cases() {
   c.push_back({"PreSharedKeyWasNotOffered", replace([kx](const Bytes &) {
         return hand_hello({}, 0x1301, {key_share_ext(0x1d, kx), versions13(),
             put_ext(GTLS_EXT_PRE_SHARED_KEY, Bytes{0, 0})});
-      }), GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION});
+      }), GTLS_ERR_PROTOCOL, GTLS_ALERT_ILLEGAL_PARAMETER});
   c.push_back({"AnExtensionThatWasNotOffered", replace([kx](const Bytes &) {
         return hand_hello({}, 0x1301, {key_share_ext(0x1d, kx), versions13(), put_ext(0x7a7a, {})});
       }), GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION});

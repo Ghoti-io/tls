@@ -62,6 +62,7 @@ void gtls_context_config_default(GTLS_ContextConfig * config) {
   memset(config, 0, sizeof *config);
   config->role = GTLS_ROLE_CLIENT;
   config->versions = GTLS_VERSION_TLS13;
+  config->ticket_count = 1;
 }
 
 static int sig_scheme_known(unsigned v) {
@@ -266,6 +267,28 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
       config->limits->max_client_hello > GTLS_HELLO_MAX - 4u) {
     return GTLS_ERR_INVALID; /* a hello it accepted could not be kept for a retry */
   }
+  if ((config->ticket_keys == NULL) != (config->ticket_key_count == 0) ||
+      config->ticket_key_count > GTLS_TICKET_KEYS_MAX ||
+      config->ticket_lifetime > GTLS_TICKET_LIFETIME_MAX ||
+      config->ticket_age_window > GTLS_TICKET_AGE_WINDOW_MAX) {
+    return GTLS_ERR_INVALID;
+  }
+  if (config->role == GTLS_ROLE_CLIENT &&
+      (config->ticket_keys != NULL || config->ticket_lifetime != 0 ||
+          config->ticket_age_window != 0)) {
+    return GTLS_ERR_INVALID; /* tickets are a server's; a client holds the ones it is sent */
+  }
+  for (i = 0; i < config->ticket_key_count; i++) {
+    if (config->ticket_keys[i].not_after <= config->ticket_keys[i].not_before) {
+      return GTLS_ERR_INVALID;
+    }
+    for (j = 0; j < i; j++) {
+      if (gsec_equal(config->ticket_keys[j].name, config->ticket_keys[i].name,
+              GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {
+        return GTLS_ERR_INVALID;
+      }
+    }
+  }
   c = gcu_allocator_calloc(allocator, 1, sizeof *c);
   if (c == NULL) {
     return GTLS_ERR_OOM;
@@ -277,6 +300,26 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   c->trust = config->trust;
   c->middlebox_compat = config->middlebox_compat != 0;
   gtls_limits_resolve(config->limits, &c->limits);
+  if (config->role == GTLS_ROLE_SERVER) {
+    if (config->ticket_count > c->limits.max_tickets) {
+      gcu_allocator_free(allocator, c);
+      return GTLS_ERR_INVALID;
+    }
+    if (config->ticket_key_count != 0 && c->limits.max_ticket_bytes < GTLS_TICKET_MAX) {
+      gcu_allocator_free(allocator, c);
+      return GTLS_ERR_LIMIT; /* a ticket it seals could be refused by the very caps it was given */
+    }
+    if (config->ticket_key_count != 0) {
+      memcpy(c->ticket_keys, config->ticket_keys,
+          config->ticket_key_count * sizeof config->ticket_keys[0]);
+    }
+    c->ticket_key_count = config->ticket_key_count;
+    c->ticket_count = config->ticket_count;
+    c->ticket_lifetime = config->ticket_lifetime != 0 ? config->ticket_lifetime
+                                                      : GTLS_TICKET_LIFETIME_DEFAULT;
+    c->ticket_age_window = config->ticket_age_window != 0 ? config->ticket_age_window
+                                                          : GTLS_TICKET_AGE_WINDOW_DEFAULT;
+  }
 
   if (config->suite_count == 0) {
     memcpy(c->suites, default_suites, sizeof default_suites);

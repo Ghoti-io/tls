@@ -29,7 +29,8 @@
  * the traffic secrets by epoch for a caller that carries messages itself
  * (QUIC), and the record layer over a byte stream with key update,
  * close_notify and a truncation check for a caller that carries a stream.
- * Client authentication, TLS 1.2, resumption and early data are later pieces.
+ * Session tickets and PSK resumption are built, in both roles (session.h);
+ * client authentication, TLS 1.2 and early data are later pieces.
  * See documentation/design.md.
  */
 
@@ -44,5 +45,6 @@
 #include <ghoti.io/tls/record.h>
 #include <ghoti.io/tls/schedule.h>
 #include <ghoti.io/tls/selftest.h>
+#include <ghoti.io/tls/session.h>
 
 #endif /* GHOTI_IO_GTLS_TLS_H */

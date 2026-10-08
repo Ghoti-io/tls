@@ -194,8 +194,8 @@ TEST(Rfc8448Split, ServerHelloCutAtEveryOffset) {
 }
 
 /* The NewSessionTicket the RFC's server sends after the handshake is parsed
- * and thrown away. */
-TEST(Rfc8448Post, NewSessionTicketIsAcceptedAndDiscarded) {
+ * and kept as a session (test_resume.cpp checks what it holds). */
+TEST(Rfc8448Post, NewSessionTicketIsAcceptedAndKept) {
   Flow r(simple_trace());
   r.start();
   r.take(GTLS_EPOCH_INITIAL);
@@ -207,7 +207,8 @@ TEST(Rfc8448Post, NewSessionTicketIsAcceptedAndDiscarded) {
   ASSERT_EQ(r.feed(GTLS_EPOCH_APPLICATION, nst, 5), GTLS_OK) << "and one byte at a time";
   EXPECT_TRUE(gtls_conn_is_connected(r.conn));
   EXPECT_EQ(r.conn->tickets, 2u);
-  EXPECT_EQ(r.pending(GTLS_EPOCH_APPLICATION), Bytes()) << "nothing is stored or sent";
+  EXPECT_EQ(gtls_conn_session_count(r.conn), 2u) << "each one is a session";
+  EXPECT_EQ(r.pending(GTLS_EPOCH_APPLICATION), Bytes()) << "and nothing is sent";
 }
 
 TEST(Rfc8448Post, TooManyTicketsIsALimit) {

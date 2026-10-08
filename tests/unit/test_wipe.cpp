@@ -391,6 +391,133 @@ TEST(WipeStream, PlaintextNotYetReadIsGoneAfterAFailureToo) {
   EXPECT_EQ(watch.found, 0);
 }
 
+
+
+/* A resumed handshake: the PSK, the early secret it seeds, every secret
+ * after it and the resumption secret and PSKs of the new tickets are gone
+ * from every block the library frees, on success and on a refused binder. */
+
+namespace {
+
+GTLS_TicketKey wipe_key() {
+  GTLS_TicketKey k;
+  std::memset(&k, 0, sizeof k);
+  std::memset(k.name, 0x31, sizeof k.name);
+  std::memset(k.key, 0x32, sizeof k.key);
+  k.not_before = kNow - 100;
+  k.not_after = kNow + 100000;
+  return k;
+}
+
+}  // namespace
+
+TEST(WipeResume, NoSecretOfAResumedHandshakeReachesAFreedBlock) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  GTLS_Session * session = nullptr;
+  {
+    Pair p1(*cred);
+    p1.keys = {wipe_key()};
+    ASSERT_EQ(p1.build(), GTLS_OK);
+    p1.run();
+    ASSERT_TRUE(p1.connected());
+    ASSERT_EQ(gtls_conn_session(p1.c.conn, 0, &session), GTLS_OK);
+  }
+  const Bytes psk(session->psk, session->psk + session->psk_len);
+  TestAlloc alloc;
+  Watch watch;
+  {
+    Pair p2(*cred);
+    p2.keys = {wipe_key()};
+    p2.allocator = &alloc.a;
+    p2.offer = session;
+    ASSERT_EQ(p2.build(), GTLS_OK);
+    p2.run();
+    ASSERT_TRUE(p2.connected());
+    ASSERT_EQ(gtls_conn_resumed(p2.c.conn), 1);
+    watch.secrets.push_back(psk);
+    for (GTLS_Conn * c : {p2.c.conn, p2.s.conn}) {
+      for (GTLS_SecretId id : {GTLS_SECRET_EARLY, GTLS_SECRET_HANDSHAKE, GTLS_SECRET_MASTER,
+               GTLS_SECRET_CLIENT_HS, GTLS_SECRET_SERVER_HS, GTLS_SECRET_CLIENT_AP,
+               GTLS_SECRET_SERVER_AP}) {
+        Bytes out(GTLS_HASH_MAX);
+        size_t n = 0;
+        ASSERT_EQ(gtls_conn_debug_secret(c, id, out.data(), out.size(), &n), GTLS_OK);
+        out.resize(n);
+        watch.secrets.push_back(out);
+      }
+      watch.secrets.push_back(Bytes(c->sec.schedule.res, c->sec.schedule.res + c->sec.schedule.hlen));
+    }
+    GTLS_Session * fresh = nullptr;
+    ASSERT_EQ(gtls_conn_session(p2.c.conn, 0, &fresh), GTLS_OK);
+    watch.secrets.push_back(Bytes(fresh->psk, fresh->psk + fresh->psk_len));
+    gtls_session_free(fresh);
+    EXPECT_TRUE(contains(reinterpret_cast<const unsigned char *>(p2.c.conn), sizeof(GTLS_Conn),
+        Bytes(p2.c.conn->sec.schedule.early, p2.c.conn->sec.schedule.early + 32)))
+        << "so the scan is looking for something that was there";
+    watch.install(alloc);
+  }
+  EXPECT_EQ(watch.found, 0) << "a secret was in a block when it was freed";
+  EXPECT_EQ(alloc.live, 0);
+  gtls_session_free(session);
+}
+
+TEST(WipeResume, ARefusedBinderLeavesNoSecretBehindEither) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  GTLS_Session * session = nullptr;
+  {
+    Pair p1(*cred);
+    p1.keys = {wipe_key()};
+    ASSERT_EQ(p1.build(), GTLS_OK);
+    p1.run();
+    ASSERT_EQ(gtls_conn_session(p1.c.conn, 0, &session), GTLS_OK);
+  }
+  TestAlloc alloc;
+  Watch watch;
+  watch.secrets.push_back(Bytes(session->psk, session->psk + session->psk_len));
+  watch.install(alloc);
+  {
+    Pair p2(*cred);
+    p2.keys = {wipe_key()};
+    p2.allocator = &alloc.a;
+    p2.offer = session;
+    ASSERT_EQ(p2.build(), GTLS_OK);
+    Bytes hello = stream_out(p2.c.conn);
+    hello[hello.size() - 1] ^= 1;
+    size_t used = 0;
+    EXPECT_EQ(gtls_conn_stream_feed(p2.s.conn, hello.data(), hello.size(), kNow, &used), GTLS_ERR_MISMATCH);
+    EXPECT_TRUE(gtls_conn_secrets_are_wiped(p2.s.conn));
+  }
+  EXPECT_EQ(watch.found, 0);
+  EXPECT_EQ(alloc.live, 0);
+  gtls_session_free(session);
+}
+
+TEST(WipeResume, AFreedSessionLeavesNeitherThePskNorTheTicketBehind) {
+  TestAlloc alloc;
+  Watch watch;
+  GTLS_Session * s = gtls_session_alloc(&alloc.a, 64);
+  ASSERT_NE(s, nullptr);
+  s->suite = GTLS_SUITE_AES_128_GCM_SHA256;
+  s->psk_len = 32;
+  std::memset(s->psk, 0x5d, 32);
+  std::memset(s->ticket, 0x6e, 64);
+  watch.secrets = {Bytes(32, 0x5d), Bytes(64, 0x6e)};
+  watch.install(alloc);
+  gtls_session_free(s);
+  EXPECT_EQ(watch.found, 0);
+  EXPECT_EQ(alloc.live, 0);
+  GTLS_Session * c = gtls_session_alloc(&alloc.a, 64);
+  std::memset(c->psk, 0x5d, 32);
+  watch.install(alloc);
+  /* Control: a block that is freed without a wipe is seen by the scan. */
+  unsigned char * leak = static_cast<unsigned char *>(alloc.a.malloc_fn(alloc.a.ctx, 64));
+  std::memset(leak, 0x5d, 32);
+  alloc.a.free_fn(alloc.a.ctx, leak);
+  EXPECT_EQ(watch.found, 1);
+  gtls_session_free(c);
+  EXPECT_EQ(watch.found, 1) << "and the session's own free adds nothing";
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

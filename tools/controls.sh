@@ -73,7 +73,7 @@ fragment-app-data	src/client/stream.c	if (c->state != GTLS_STATE_CONNECTED \|\| 
 key-update-last	src/client/client.c	        (was_key_update \&\& c->mode == GTLS_MODE_STREAM))) {	        0)) {	testEdges
 key-update-after-close	src/client/stream.c	c->ku_queued == 0 \&\& !c->local_closed) {	c->ku_queued == 0) {	testEdges
 key-update-run-reset	src/client/stream.c	c->ku_run = 0; /* data between updates: they are not a flood */	(void)0;	testEdges
-key-update-queued-count	src/client/stream.c	    if (c->ku_queued > 0) {\n      c->ku_queued--;\n    }	    if (c->ku_queued > 0) {\n    }	testEdges
+key-update-queued-count	src/client/stream.c	      if (c->ku_queued > 0) {\n        c->ku_queued--;\n      }	      if (c->ku_queued > 0) {\n      }	testEdges
 key-update-answer-once	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0 \&\& !c->local_closed) {	if (request == 1u \&\& !c->local_closed) {	testEdges
 server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	(c->state == GTLS_STATE_CONNECTED)) {	testEdges
 client-dummy-record	src/client/stream.c	if (c->role == GTLS_ROLE_CLIENT \&\& c->context->middlebox_compat) {	if (0) {	testEdges
@@ -99,7 +99,7 @@ oom-in-flight	src/server/server.c	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe)
 oom-in-record-buffer	src/client/stream.c	      *consumed = pos;\n      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	      *consumed = pos;\n      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
 psk-last	src/server/server.c	if (ch->exts[ch->ext_count - 1u].type != GTLS_EXT_PRE_SHARED_KEY) {	if (0) {	testPsk
 psk-modes-present	src/server/server.c	if (modes == NULL) {\n      return missing(c);	if (modes == NULL) {\n      return gtls_conn_illegal(c);	testPsk
-psk-offer-parsed	src/server/server.c	result = gtls_msg_parse_ch_psk_offer(e, \&c->limits, \&identities);	result = GTLS_OK; (void)identities;	testPsk
+psk-offer-parsed	src/server/server.c	result = gtls_msg_parse_ch_psk_offer(e, \&c->limits, \&o->psk_offer);	result = GTLS_OK; (void)o->psk_offer;	testPsk
 psk-count-equal	src/msg/msg.c	if (n_ids != n_binders) {	if (0) {	testPsk
 psk-identity-cap	src/msg/msg.c	identity.len > limits->max_ticket_bytes \|\|	0 \|\|	testPsk
 psk-count-cap	src/msg/msg.c	++n_ids > limits->max_tickets	0	testPsk
@@ -123,7 +123,7 @@ psk-empty-identity	src/msg/msg.c	gtls_reader_vector(\&ids, 2, 1, 0, \&identity)	
 psk-ids-min-high	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 8, 0, \&ids)	testPsk
 psk-ids-min-zero	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 0, 0, \&ids)	testPsk
 psk-binder-31	src/msg/msg.c	gtls_reader_vector(\&binders, 1, 32, 0, \&binder)	gtls_reader_vector(\&binders, 1, 31, 0, \&binder)	testPsk
-psk-modes-parse-result	src/server/server.c	result = gtls_msg_parse_ch_psk_modes(modes, \&dhe);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_psk_modes(modes, \&dhe);\n    if (0) {	testPsk
+psk-modes-parse-result	src/server/server.c	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (0) {	testPsk
 early-data-parse-result	src/server/server.c	result = gtls_msg_parse_ch_early_data(e);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_early_data(e);\n    if (0) {	testPsk
 early-data-needs-psk	src/server/server.c	} else if (o.early_data \&\& o.psk) {	} else if (o.early_data) {	testPsk
 early-limit-resolve	src/core/core.c	  GTLS_RESOLVE(max_early_skip_bytes)\n	  (void)0;\n	testPsk

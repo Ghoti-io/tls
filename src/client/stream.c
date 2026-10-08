@@ -233,8 +233,9 @@ GTLS_Result gtls_stream_flush(GTLS_Conn * c) {
       return result;
     }
   }
-  /* What is queued at the application epoch is KeyUpdate, one message at a
-   * time: sealed under the key it is replacing, and the key then moves. */
+  /* What is queued at the application epoch is, a message at a time,
+   * KeyUpdate (sealed under the key it is replacing, and the key then moves)
+   * and NewSessionTicket (sealed under the key in use). */
   q = &c->out[GTLS_EPOCH_APPLICATION];
   if (q->len > 0 && c->wr_epoch < GTLS_EPOCH_APPLICATION) {
     result = install_keys(c, GTLS_EPOCH_APPLICATION, 1);
@@ -242,18 +243,26 @@ GTLS_Result gtls_stream_flush(GTLS_Conn * c) {
       return result;
     }
   }
-  while (q->len >= 5u) {
-    result = put_sealed(c, GTLS_CT_HANDSHAKE, q->data, 5u);
+  while (q->len >= 4u) {
+    size_t mlen = 4u + (((size_t)q->data[1] << 16) | ((size_t)q->data[2] << 8) | q->data[3]);
+    unsigned type = q->data[0];
+
+    if (mlen > q->len || mlen > GTLS_RECORD_PLAIN_MAX) {
+      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+    }
+    result = put_sealed(c, GTLS_CT_HANDSHAKE, q->data, mlen);
     if (result != GTLS_OK) {
       return result;
     }
-    gtls_buf_consume(q, 5u);
-    if (c->ku_queued > 0) {
-      c->ku_queued--;
-    }
-    result = rotate(c, 1);
-    if (result != GTLS_OK) {
-      return result;
+    gtls_buf_consume(q, mlen);
+    if (type == GTLS_HS_KEY_UPDATE) {
+      if (c->ku_queued > 0) {
+        c->ku_queued--;
+      }
+      result = rotate(c, 1);
+      if (result != GTLS_OK) {
+        return result;
+      }
     }
   }
   return GTLS_OK;
