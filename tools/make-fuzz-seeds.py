@@ -24,6 +24,7 @@ change_cipher_spec, an alert) that need no key.
 `--check` fails if a committed seed differs from what this writes.
 """
 
+import hashlib
 import struct
 import sys
 from pathlib import Path
@@ -62,7 +63,9 @@ def main():
     simple = load("simple-1rtt")
     hrr = load("hrr")
     nst = simple["server.construct-a-newsessionticket-handshake-message.newsessionticket"]
-    seeds = {"client": {}, "msg": {}, "server": {}, "stream": {}, "record": {}, "pump": {}}
+    resumed = load("resumed")
+    seeds = {"client": {}, "msg": {}, "server": {}, "stream": {}, "record": {}, "pump": {},
+             "resume": {}, "session": {}}
 
     def flight(v, name, extra_initial):
         sh = v["server.construct-a-serverhello-handshake-message%s.serverhello" % ("@2" if extra_initial else "")]
@@ -112,6 +115,19 @@ def main():
     ]
     for opt, name, body in named:
         seeds["msg"][name] = bytes([opt]) + body
+
+    # Resumption: the RFC's resumed ClientHello (a PSK of one identity and one
+    # binder, beside early_data) and ServerHello (the PSK selected). The high
+    # nibble of the option byte is the cap on extensions, which has to be big
+    # enough for the hello's eleven; bits 6 and 7 of the retry's option give it
+    # a PSK to write, with a binder of 32 or 48 bytes.
+    r_ch = resumed["client.send-handshake-record.payload"]
+    r_sh = resumed["server.construct-a-serverhello-handshake-message.serverhello"]
+    seeds["msg"]["psk-client-hello-extensions"] = bytes([0xf7]) + r_ch[4:]
+    seeds["msg"]["psk-retry-client-hello"] = bytes([0xe6]) + r_ch[4:]
+    seeds["msg"]["psk-retry-client-hello-share"] = bytes([0xf6]) + r_ch[4:]
+    seeds["msg"]["psk-retry-client-hello-plain"] = bytes([0xb6]) + r_ch[4:]
+    seeds["msg"]["psk-server-hello"] = bytes([0x30]) + r_sh[4:]
 
     # The server, fed the RFC's client records. Option bits: 0 the retry trace,
     # 1-3 the feed size, 4 a server that wants P-256 only, 5 act when done,
@@ -304,6 +320,61 @@ def main():
     pm["flip-client-finished-record"] = bytes([0x0f]) + flip(0, 260, 1)
     pm["flip-late-data"] = bytes([0x0f]) + flip(0, 400, 0x10)
     pm["flip-two"] = bytes([0x0f]) + flip(0, 20, 1) + flip(1, 300, 2)
+
+    # The resuming pump: a first handshake, then the mutated second one.
+    # Same option bits as the pump. The second ClientHello is about 330 bytes
+    # of the client's stream (the offset is into the second connection), its
+    # binder is the last 33, and the server's first flight is a ServerHello
+    # and the encrypted EncryptedExtensions, Finished and a ticket.
+    rs = seeds["resume"]
+    rs["clean"] = bytes([0x0f])
+    rs["clean-aes128"] = bytes([0x00])
+    rs["clean-aes256-p384"] = bytes([0x09])
+    rs["clean-chacha-p256"] = bytes([0x06])
+    rs["clean-retry"] = bytes([0x1f])
+    rs["clean-bytewise"] = bytes([0x2f])
+    rs["clean-threes"] = bytes([0x4f])
+    rs["flip-hello-random"] = bytes([0x0f]) + flip(0, 20, 1)
+    rs["flip-hello-name"] = bytes([0x0f]) + flip(0, 80, 1)
+    rs["flip-hello-ticket"] = bytes([0x0f]) + flip(0, 300, 1)
+    rs["flip-hello-age"] = bytes([0x0f]) + flip(0, 420, 1)
+    rs["flip-hello-binder"] = bytes([0x0f]) + flip(0, 470, 1)
+    rs["flip-hello-last-byte"] = bytes([0x0f]) + flip(0, 508, 1)
+    rs["flip-server-hello"] = bytes([0x0f]) + flip(1, 60, 1)
+    rs["flip-server-flight"] = bytes([0x0f]) + flip(1, 120, 1)
+    rs["flip-retry-hello"] = bytes([0x1f]) + flip(0, 100, 1)
+    rs["flip-retry-second-hello"] = bytes([0x1f]) + flip(0, 700, 1)
+    rs["flip-retry-second-binder"] = bytes([0x1f]) + flip(0, 1000, 1)
+    rs["flip-two"] = bytes([0x0f]) + flip(0, 300, 1) + flip(1, 200, 2)
+
+    # The session blob and the ticket. The blob is the format in session.h:
+    # version 1, the fields, the ticket and PSK, and a SHA-256 of all of it.
+    def blob(suite=0x1301, psk=b"\x11" * 32, ticket=b"\x22" * 120, host=b"example.test",
+             alpn=b"h2", lifetime=7200, age_add=0xa1b2c3d4, early=0, received=1700000000):
+        body = bytes([1]) + struct.pack(">HIII", suite, lifetime, age_add, early)
+        body += struct.pack(">q", received)
+        body += bytes([len(host)]) + host + bytes([len(alpn)]) + alpn
+        body += bytes([len(psk)]) + psk + struct.pack(">H", len(ticket)) + ticket
+        return body + hashlib.sha256(body).digest()
+
+    se = seeds["session"]
+    good = blob()
+    se["blob"] = bytes([0x70]) + good
+    se["blob-sha384"] = bytes([0x70 | 4]) + blob(0x1302, psk=b"\x33" * 48)
+    se["blob-no-alpn"] = bytes([0x70]) + blob(alpn=b"")
+    se["blob-tight-limit"] = bytes([0x00]) + good
+    se["blob-bad-digest"] = bytes([0x70]) + good[:-1] + bytes([good[-1] ^ 1])
+    se["blob-wrong-version"] = bytes([0x70, 2]) + good[1:]
+    se["blob-cut"] = bytes([0x70]) + good[:len(good) // 2]
+    se["blob-lifetime-too-long"] = bytes([0x70]) + blob(lifetime=700000)
+    se["blob-bad-psk-size"] = bytes([0x70]) + blob(psk=b"\x44" * 31)
+    se["ticket-garbage"] = bytes([0x71]) + resumed["client.calculate-psk-binder.finished"]
+    se["ticket-rfc"] = bytes([0x71]) + nst[17:17 + 178]   # the ticket RFC 8448 sends: not one of ours
+    se["seal-sha256"] = bytes([0x72]) + bytes(range(1, 120))
+    se["seal-sha384"] = bytes([0x76]) + bytes(range(1, 90))
+    se["seal-chacha-empty-names"] = bytes([0x7a])
+    se["serialise"] = bytes([0x73]) + bytes(range(1, 150))
+    se["serialise-sha384"] = bytes([0x77]) + bytes(range(1, 30))
 
     bad = 0
     for kind, files in seeds.items():

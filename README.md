@@ -8,10 +8,14 @@ over one connection type: **the record layer over a byte stream** (what TLS
 over TCP needs: HTTP/2, `wss`), and **handshake messages by epoch with the
 traffic secrets** (what QUIC needs). It is built on `certificate` (chains,
 names, signatures) and `security` (the primitives). Client authentication,
-TLS 1.2, resumption and early data are later pieces; see [Status](#status).
-A server that is offered a PSK or early data (a client that remembers a
-ticket from elsewhere) ignores the offer, skips the early records, and does the
-full handshake.
+TLS 1.2 and early data are later pieces; see [Status](#status). **Session
+tickets and resumption are built, in both roles, and stateless**: a server seals
+the state of a session into the ticket under a key the caller supplies and
+keeps nothing, a client keeps each ticket as a `GTLS_Session` the caller can
+serialise and hand to a later connection, and a ticket that does not qualify is
+a full handshake, not an error ([`session.h`](include/ghoti.io/tls/session.h),
+[design](documentation/design.md#tickets-and-resumption)). A server that is
+offered early data does not accept it: it skips the early records.
 
 ## Example
 
@@ -122,6 +126,12 @@ fail. `make test` runs no container. `make fuzz` runs the six fuzzers
   server's Finished has gone out or verified, the direction being the local one.
   `gtls_traffic_keys`, `gtls_hkdf_expand_label` and `gtls_derive_secret` are
   exported for QUIC's own labels (RFC 9001 section 5).
+- **Tickets and resumption** (`session.h`): a server's context takes a keyring
+  of `GTLS_TicketKey` (`ticket_keys`) and sends `ticket_count` tickets after
+  each handshake; a client's connection holds a `GTLS_Session` for each
+  (`gtls_conn_session_count`, `gtls_conn_session`), which `gtls_session_serialize`
+  writes and `gtls_session_parse` reads, and offers one with
+  `gtls_conn_set_session` before start; `gtls_conn_resumed` says what happened.
 - **What was negotiated**: `gtls_conn_suite`, `_group`, `_alpn`,
   `_server_name_acknowledged`, `_retried`; a server's `gtls_conn_server_name`
   (what the client sent) and `gtls_conn_identity` (which was chosen); a
@@ -160,9 +170,16 @@ constant-time gate for `Finished`, six fuzzers (messages, client, server,
 records, record streams, and two endpoints with mutated bytes), and the
 sanitizer matrix.
 
+**Built (2026-10-08):** session tickets and PSK resumption in both roles
+(`psk_dhe_ke`, binders, the age window, rotating ticket keys, a client session
+that serialises), checked against RFC 8448's resumed trace, against OpenSSL in
+both roles for every suite and group, a HelloRetryRequest and ALPN, with the
+cases that must fall back to a full handshake, and with two more fuzzers (a
+resuming pair with mutated bytes, and the session blob and ticket).
+
 **Not built, in the order the plan takes them** (`planning/tls.md`): the `http`
 adapter; mutual authentication and revocation in the handshake; TLS 1.2;
-session tickets and resumption, then early data; QUIC hardening and DTLS.
+early data (and its replay protection); QUIC hardening and DTLS.
 Nothing here has run on macOS, and Windows only under wine
 (`suite/tools/xwin/tls.sh`; `TODO(windows)` in the Makefile). A server never asks for
 a client certificate, and a client that is asked (`CertificateRequest`) is

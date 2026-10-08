@@ -578,7 +578,7 @@ check-interop: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Run the OpenSSL inter
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION)
 
 interop-plants: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Plant a defect, one at a time, and require the interop cases to fail
-	@status=0; for p in record-nonce key-update-label server-cv-label client-finished alpn-failure supported-versions no-common-scheme plaintext-alert-rule sni-selection early-skip-off psk-refused retry-skip-ends; do \
+	@status=0; for p in record-nonce key-update-label server-cv-label client-finished alpn-failure supported-versions no-common-scheme plaintext-alert-rule sni-selection early-skip-off psk-refused retry-skip-ends resume-binder-transcript resume-client-binder resume-client-binder-retry resume-age-window resume-sni resume-alpn resume-key-name resume-client-assumes resume-selected; do \
 		LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION) --plant $$p || status=1; \
 	done; exit $$status
 
@@ -629,12 +629,12 @@ $(CT_APP)/leak: tools/ct/leak.c $(CT_FLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(CC) $(CT_CFLAGS) -o $@ $<
 
-check-ct: $(CT_APP)/clean $(CT_APP)/leak ## Fail unless memcheck sees a planted leak and not the check of Finished
+check-ct: $(CT_APP)/clean $(CT_APP)/leak ## Fail unless memcheck sees a planted leak and not the checks of Finished and of a binder
 ifeq ($(OS_NAME), Linux)
 	@out=$$(LD_LIBRARY_PATH="$(TEST_LD_PATH)" valgrind --error-exitcode=1 --leak-check=no --undef-value-errors=yes $(CT_APP)/clean 2>&1); \
 	rc=$$?; \
 	if [ $$rc -ne 0 ]; then \
-		printf 'check-ct: the check of Finished was reported (or the harness failed, rc %s):\n%s\n' "$$rc" "$$out" >&2; \
+		printf 'check-ct: the check of Finished or of a binder was reported (or the harness failed, rc %s):\n%s\n' "$$rc" "$$out" >&2; \
 		exit 1; \
 	fi
 	@out=$$(valgrind --error-exitcode=1 --leak-check=no --undef-value-errors=yes $(CT_APP)/leak 2>&1); \
@@ -643,7 +643,7 @@ ifeq ($(OS_NAME), Linux)
 		printf 'check-ct: the planted secret branch was not reported, so this gate is measuring nothing\n%s\n' "$$out" >&2; \
 		exit 1; \
 	fi
-	@printf 'check-ct: a secret branch is reported, and the check of Finished is not\n'
+	@printf 'check-ct: a secret branch is reported, and the checks of Finished and of a binder are not\n'
 else
 	@printf 'check-ct: skipped (Linux only)\n'
 endif
@@ -913,8 +913,10 @@ $(eval $(call fuzz-rule,fuzz_server,server))
 $(eval $(call fuzz-rule,fuzz_record,record))
 $(eval $(call fuzz-rule,fuzz_pump,pump))
 $(eval $(call fuzz-rule,fuzz_stream,stream))
+$(eval $(call fuzz-rule,fuzz_resume,resume))
+$(eval $(call fuzz-rule,fuzz_session,session))
 
-FUZZERS := client msg server record pump stream
+FUZZERS := client msg server record pump stream resume session
 
 fuzz: $(addprefix fuzz-run-,$(FUZZERS)) ## Build and run every fuzzer
 

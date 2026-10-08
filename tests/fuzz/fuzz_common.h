@@ -331,8 +331,28 @@ inline int msg_one(const uint8_t * data, size_t size) {
       share.pub_len = 65;
       share.pub[0] = 4;
       unsigned char cookie[4] = {1, 2, 3, 4};
-      GTLS_Result r = gtls_msg_retry_client_hello(m.data(), m.size(),
-          (opt & 16u) ? &share : nullptr, cookie, (opt & 32u) ? 4 : 0, &lim, &out);
+      /* With bit 6 the transform is also given a PSK to put in the second hello. */
+      GTLS_PskParams pp = {body, len > 0 ? (len % 29) + 1 : 0, 0xdeadbeefu, (opt & 128u) ? 48u : 32u};
+      const bool with_psk = (opt & 64u) != 0 && len > 0 && pp.identity_len <= len;
+      GTLS_Result r = gtls_msg_retry_client_hello_psk(m.data(), m.size(),
+          (opt & 16u) ? &share : nullptr, cookie, (opt & 32u) ? 4 : 0, with_psk ? &pp : nullptr,
+          &lim, &out);
+      if (r == GTLS_OK && with_psk) {
+        GTLS_ClientHello h3;
+        GTLS_Limits wide3;
+        GTLS_PskOffer offer3;
+        gtls_limits_default(&wide3);
+        wide3.max_extensions = GTLS_EXT_MAX;
+        if (gtls_msg_parse_client_hello(out.data + 4, out.len - 4, &wide3, &h3) != GTLS_OK ||
+            h3.ext_count == 0 || h3.exts[h3.ext_count - 1].type != GTLS_EXT_PRE_SHARED_KEY ||
+            gtls_msg_parse_ch_psk_offer(&h3.exts[h3.ext_count - 1], &wide3, &offer3) != GTLS_OK ||
+            offer3.count != 1 || offer3.entries[0].identity_len != pp.identity_len ||
+            offer3.entries[0].age != pp.obfuscated_age ||
+            out.len - GTLS_PSK_BINDERS_TAIL(pp.binder_len) !=
+                static_cast<size_t>(h3.exts[h3.ext_count - 1].data - (out.data + 4)) + 4 + offer3.binders_off) {
+          die("the retry transform's PSK is not the one it was given, last, with the binders where they should be");
+        }
+      }
       if (r == GTLS_OK) {
         GTLS_ClientHello h2;
         GTLS_Limits wide;
@@ -418,6 +438,25 @@ inline int msg_one(const uint8_t * data, size_t size) {
           case GTLS_EXT_PSK_KEY_EXCHANGE_MODES: {
             int dhe = 0;
             (void)gtls_msg_parse_ch_psk_modes(e, &dhe);
+            break;
+          }
+          case GTLS_EXT_PRE_SHARED_KEY: {
+            GTLS_PskOffer o;
+            if (gtls_msg_parse_ch_psk_offer(e, &lim, &o) == GTLS_OK) {
+              if (o.count > lim.max_tickets || o.stored > GTLS_PSK_MAX || o.stored > o.count ||
+                  (o.count <= GTLS_PSK_MAX && o.stored != o.count) || o.count == 0) {
+                die("a PSK offer's counts");
+              }
+              if (o.binders_off < 2 || o.binders_off > e->len) die("the binders offset is outside the extension");
+              for (size_t k = 0; k < o.stored; k++) {
+                const GTLS_PskEntry & en = o.entries[k];
+                if (!inside(en.identity, en.identity_len) || en.identity_len == 0 ||
+                    en.identity_len > lim.max_ticket_bytes || !inside(en.binder, en.binder_len) ||
+                    en.binder_len < 32) {
+                  die("a PSK entry view");
+                }
+              }
+            }
             break;
           }
           default:
@@ -730,6 +769,16 @@ inline int server_one(const uint8_t * data, size_t size) {
     lim.max_ticket_bytes = 12;
   }
   cfg.limits = &lim;
+  /* A keyring, so that a ticket in an offer is opened (and refused: no input can
+   * seal one). The small-limits server has a ticket cap too small for one. */
+  GTLS_TicketKey ticket_key;
+  std::memset(&ticket_key, 0x6b, sizeof ticket_key);
+  ticket_key.not_before = 1699990000;
+  ticket_key.not_after = 1700100000;
+  if ((opt & 0x40u) == 0) {
+    cfg.ticket_keys = &ticket_key;
+    cfg.ticket_key_count = 1;
+  }
   GTLS_Context * ctx = nullptr;
   GTLS_Conn * conn = nullptr;
   if (gtls_context_new(nullptr, &cfg, &ctx) != GTLS_OK || gtls_conn_new_server(ctx, &conn) != GTLS_OK) {
@@ -917,7 +966,7 @@ struct PumpRandom {
  * wants P-256 only), bit 4 a server that wants P-256 only, bits 5-7 the
  * feed size.
  */
-inline int pump_one(const uint8_t * data, size_t size) {
+inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   if (size < 1) {
     return 0;
   }
@@ -981,6 +1030,12 @@ inline int pump_one(const uint8_t * data, size_t size) {
   lim.max_records_per_key = 6;
   ccfg.limits = &lim;
   scfg.limits = &lim;
+  GTLS_TicketKey ticket_key;
+  std::memset(&ticket_key, 0x6c, sizeof ticket_key);
+  ticket_key.not_before = 1699990000;
+  ticket_key.not_after = 1700100000;
+  scfg.ticket_keys = &ticket_key;      /* every pump server issues tickets; resume mode uses one */
+  scfg.ticket_key_count = 1;
   GTLS_Context * cctx = nullptr;
   GTLS_Context * sctx = nullptr;
   GTLS_Conn * c = nullptr;
@@ -989,6 +1044,46 @@ inline int pump_one(const uint8_t * data, size_t size) {
       gtls_conn_new(cctx, "ed.example.com", 14, &c) != GTLS_OK || gtls_conn_new_server(sctx, &s) != GTLS_OK) {
     die("contexts or connections");
   }
+  /* Resume mode: a first handshake, untouched, gives the session the mutated
+   * one offers. */
+  GTLS_Session * session = nullptr;
+  if (resume) {
+    GTLS_Conn * c1 = nullptr;
+    GTLS_Conn * s1 = nullptr;
+    PumpRandom r1, r2;
+    r1.pcg.state = 0xabcdef1;
+    r2.pcg.state = 0x1fedcba;
+    if (gtls_conn_new(cctx, "ed.example.com", 14, &c1) != GTLS_OK || gtls_conn_new_server(sctx, &s1) != GTLS_OK) {
+      die("first connections");
+    }
+    gtls_conn_set_hooks(c1, PumpRandom::fn, &r1, nullptr, nullptr);
+    gtls_conn_set_hooks(s1, PumpRandom::fn, &r2, nullptr, nullptr);
+    if (gtls_conn_start(c1) != GTLS_OK || gtls_conn_start(s1) != GTLS_OK) die("first start");
+    GTLS_Conn * pair[2] = {c1, s1};
+    for (int round = 0; round < 20; round++) {
+      bool moved = false;
+      for (int dir = 0; dir < 2; dir++) {
+        const unsigned char * p = nullptr;
+        size_t n = 0;
+        if (gtls_conn_stream_output(pair[dir], &p, &n) != GTLS_OK) die("first output");
+        if (n == 0) continue;
+        moved = true;
+        Bytes wire(p, p + n);
+        (void)gtls_conn_stream_consume(pair[dir], n);
+        size_t used = 0;
+        if (gtls_conn_stream_feed(pair[1 - dir], wire.data(), wire.size(), 1700000000, &used) != GTLS_OK) {
+          die("the first handshake of a resume run failed");
+        }
+      }
+      if (!moved) break;
+    }
+    if (!gtls_conn_is_connected(c1) || !gtls_conn_is_connected(s1) || gtls_conn_session_count(c1) != 1 ||
+        gtls_conn_session(c1, 0, &session) != GTLS_OK) {
+      die("the first handshake of a resume run gave no session");
+    }
+    gtls_conn_free(c1);
+    gtls_conn_free(s1);
+  }
   PumpRandom crnd, srnd;
   crnd.pcg.state = 0x1234567;
   srnd.pcg.state = 0x7654321;
@@ -996,6 +1091,7 @@ inline int pump_one(const uint8_t * data, size_t size) {
   gtls_conn_set_hooks(s, PumpRandom::fn, &srnd, nullptr, nullptr);
   note(c);
   note(s);
+  if (session != nullptr && gtls_conn_set_session(c, session, 1700000000) != GTLS_OK) die("set session");
   if (gtls_conn_start(c) != GTLS_OK || gtls_conn_start(s) != GTLS_OK) die("start");
   note(c);
   note(s);
@@ -1062,6 +1158,7 @@ inline int pump_one(const uint8_t * data, size_t size) {
   if (flips.empty()) {
     if (!gtls_conn_is_connected(c) || !gtls_conn_is_connected(s)) die("an unmutated pump did not connect");
     if (got_up.size() != 12 * expect_up.size()) die("an unmutated pump lost data");
+    if (resume && (!gtls_conn_resumed(c) || !gtls_conn_resumed(s))) die("an unmutated resume did not resume");
     (void)gtls_conn_close(c);
     (void)gtls_conn_close(s);
   }
@@ -1082,10 +1179,159 @@ inline int pump_one(const uint8_t * data, size_t size) {
   check_end_state(s);
   gtls_conn_free(c);
   gtls_conn_free(s);
+  gtls_session_free(session);
   gtls_context_free(cctx);
   gtls_context_free(sctx);
   gcert_key_free(key);
   gcert_trust_free(store);
+  return 0;
+}
+
+inline int pump_one(const uint8_t * data, size_t size) {
+  return pump_core(data, size, false);
+}
+
+/** The pump, with a first handshake that gives the client a session to offer in the one that is mutated. */
+inline int resume_one(const uint8_t * data, size_t size) {
+  return pump_core(data, size, true);
+}
+
+/* ---------------------------------------------------- sessions and tickets */
+
+/**
+ * The session blob and the ticket. Input: an options byte (bits 0-1 which:
+ * 0 a blob to parse, 1 bytes to open as a ticket, 2 a state to seal and open,
+ * 3 a session to serialise and parse; bits 2-3 the suite; bits 4-6 the cap on
+ * a ticket), then bytes.
+ */
+inline int session_one(const uint8_t * data, size_t size) {
+  if (size < 1) {
+    return 0;
+  }
+  const unsigned opt = data[0];
+  const uint8_t * body = data + 1;
+  const size_t len = size - 1;
+  static const uint32_t suites[3] = {0x1301, 0x1302, 0x1303};
+  const uint32_t suite = suites[((opt >> 2) & 3u) % 3u];
+  GTLS_Limits lim;
+  gtls_limits_default(&lim);
+  lim.max_ticket_bytes = 64u << ((opt >> 4) & 7u);
+  GTLS_TicketKey key;
+  std::memset(&key, 0, sizeof key);
+  std::memset(key.name, 0x42, sizeof key.name);
+  std::memset(key.key, 0x24, sizeof key.key);
+  key.not_before = 0;
+  key.not_after = 1000;
+
+  switch (opt & 3u) {
+    case 0: {
+      GTLS_Session * s = nullptr;
+      if (gtls_session_parse(nullptr, &lim, body, len, &s) == GTLS_OK) {
+        Bytes out(len + 1);
+        size_t n = 0;
+        GTLS_SessionInfo info;
+        if (gtls_session_serialize(s, out.data(), out.size(), &n) != GTLS_OK || n != len ||
+            (len != 0 && std::memcmp(out.data(), body, len) != 0)) {
+          die("a parsed session does not serialise to its input");
+        }
+        if (gtls_session_info(s, &info) != GTLS_OK || info.host_len == 0 ||
+            info.lifetime > GTLS_TICKET_LIFETIME_MAX || info.expires < info.received) {
+          die("a parsed session's description");
+        }
+        gtls_session_free(s);
+      } else if (s != nullptr) {
+        die("a failed parse wrote a session");
+      }
+      break;
+    }
+    case 1: {
+      GTLS_TicketPlain p;
+      if (gtls_ticket_open(&key, 1, 100, body, len, &p) == GTLS_OK) {
+        die("arbitrary bytes opened as a ticket");
+      }
+      /* The same bytes behind the key's own name, which is the one thing a forger has. */
+      Bytes named(key.name, key.name + sizeof key.name);
+      named.insert(named.end(), body, body + len);
+      if (gtls_ticket_open(&key, 1, 100, named.data(), named.size(), &p) == GTLS_OK) {
+        die("bytes behind a key's name opened as a ticket");
+      }
+      break;
+    }
+    case 2: {
+      GTLS_TicketPlain p;
+      std::memset(&p, 0, sizeof p);
+      p.suite = suite;
+      p.psk_len = gtls_hash_len(gtls_suite_hash(suite));
+      for (size_t i = 0; i < p.psk_len && i < len; i++) p.psk[i] = body[i];
+      p.age_add = len >= 4 ? (static_cast<uint32_t>(body[0]) << 24) | (static_cast<uint32_t>(body[1]) << 16) |
+                                 (static_cast<uint32_t>(body[2]) << 8) | body[3]
+                           : 7u;
+      p.issued = 500;
+      p.lifetime = 1u + static_cast<uint32_t>(len % 1000u);
+      p.alpn_len = len < 100 ? len : 100;
+      std::memcpy(p.alpn, body, p.alpn_len);
+      p.sni_len = len < 200 ? len / 2 : 100;
+      std::memcpy(p.sni, body, p.sni_len);
+      unsigned char nonce[12];
+      for (size_t i = 0; i < sizeof nonce; i++) nonce[i] = static_cast<unsigned char>(len + i);
+      unsigned char ticket[GTLS_TICKET_MAX];
+      size_t n = 0;
+      GTLS_TicketPlain back;
+      if (gtls_ticket_seal(&key, 1, 500, nonce, &p, ticket, sizeof ticket, &n) != GTLS_OK ||
+          n > GTLS_TICKET_MAX || n < GTLS_TICKET_MIN) {
+        die("a state could not be sealed");
+      }
+      if (gtls_ticket_open(&key, 1, 500, ticket, n, &back) != GTLS_OK || back.suite != p.suite ||
+          back.psk_len != p.psk_len || std::memcmp(back.psk, p.psk, p.psk_len) != 0 ||
+          back.age_add != p.age_add || back.issued != p.issued || back.lifetime != p.lifetime ||
+          back.alpn_len != p.alpn_len || std::memcmp(back.alpn, p.alpn, p.alpn_len) != 0 ||
+          back.sni_len != p.sni_len || std::memcmp(back.sni, p.sni, p.sni_len) != 0) {
+        die("a sealed state does not open to itself");
+      }
+      ticket[(len * 7u) % n] ^= static_cast<unsigned char>(1u << (opt & 7u));
+      if (gtls_ticket_open(&key, 1, 500, ticket, n, &back) == GTLS_OK) {
+        die("a ticket with a bit changed opened");
+      }
+      /* Freshness never throws or loops, whatever the clocks. */
+      (void)gtls_ticket_fresh(&p, static_cast<int64_t>(len) * 123456789 - 1000, p.age_add + static_cast<uint32_t>(len), 10000);
+      break;
+    }
+    default: {
+      GTLS_Session * s = gtls_session_alloc(gtls_allocator_default(), 1u + (len % 200u));
+      if (s == nullptr) die("alloc");
+      s->suite = suite;
+      s->psk_len = gtls_hash_len(gtls_suite_hash(suite));
+      for (size_t i = 0; i < s->psk_len; i++) s->psk[i] = i < len ? body[i] : static_cast<unsigned char>(i);
+      for (size_t i = 0; i < s->ticket_len; i++) s->ticket[i] = i < len ? body[i] : 0;
+      s->lifetime = static_cast<uint32_t>(len) % (GTLS_TICKET_LIFETIME_MAX + 1u);
+      s->age_add = static_cast<uint32_t>(len) * 2654435761u;
+      s->received = static_cast<int64_t>(len) << 20;
+      s->host_len = 1u + (len % 255u);
+      for (size_t i = 0; i < s->host_len; i++) s->host[i] = static_cast<unsigned char>('a' + i % 26);
+      s->alpn_len = len % 8u;
+      for (size_t i = 0; i < s->alpn_len; i++) s->alpn[i] = static_cast<unsigned char>('h' + i);
+      Bytes blob(1024 + 16384);
+      size_t n = 0;
+      if (gtls_session_serialize(s, blob.data(), blob.size(), &n) != GTLS_OK) die("serialise");
+      GTLS_Limits wide;
+      gtls_limits_default(&wide);
+      GTLS_Session * back = nullptr;
+      if (gtls_session_parse(nullptr, &wide, blob.data(), n, &back) != GTLS_OK) die("a serialised session does not parse");
+      if (back->suite != s->suite || back->psk_len != s->psk_len ||
+          std::memcmp(back->psk, s->psk, s->psk_len) != 0 || back->ticket_len != s->ticket_len ||
+          std::memcmp(back->ticket, s->ticket, s->ticket_len) != 0 || back->host_len != s->host_len ||
+          back->received != s->received || back->age_add != s->age_add) {
+        die("a session does not parse back to itself");
+      }
+      /* One byte changed, anywhere, is refused. */
+      blob[len % n] ^= 0x10;
+      GTLS_Session * bad = nullptr;
+      if (gtls_session_parse(nullptr, &wide, blob.data(), n, &bad) == GTLS_OK) die("a damaged session parsed");
+      gtls_session_free(back);
+      gtls_session_free(s);
+      break;
+    }
+  }
   return 0;
 }
 

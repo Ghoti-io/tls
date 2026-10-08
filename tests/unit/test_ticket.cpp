@@ -694,6 +694,9 @@ TEST(Ticket, TheKeyIsFoundByNameAndMustNotHaveExpired) {
       << "a key that has not begun still opens: it only does not seal";
   const GTLS_TicketKey renamed_key[] = {[]() { GTLS_TicketKey k = key_named(2, 200, 2000); k.key[5] ^= 1; return k; }()};
   EXPECT_EQ(gtls_ticket_open(renamed_key, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH) << "another key, same name";
+  const GTLS_TicketKey other_name[] = {[]() { GTLS_TicketKey k = key_named(2, 200, 2000); k.name[0] ^= 1; return k; }()};
+  EXPECT_EQ(gtls_ticket_open(other_name, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH)
+      << "the same key bytes under another name is not the key that sealed it";
   EXPECT_EQ(gtls_ticket_open(nullptr, 0, 300, ticket, n, &back), GTLS_ERR_MISMATCH);
 
   /* The sealing key: the newest start that is valid now; none when none is. */

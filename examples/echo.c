@@ -31,7 +31,7 @@
  * client that talks to `openssl s_server`, so every handshake is checked by a
  * second implementation in both roles.
  *
- *   echo server [options] PORT           accept one connection, echo it, close
+ *   echo server [options] PORT           accept a connection, echo it, close
  *   echo client [options] HOST PORT      connect, send a line, print the echo
  *
  * Options (repeat --chain, --ca and --alpn for more than one):
@@ -51,14 +51,34 @@
  *   --key-update     the client updates its key and asks the server to
  *   --compat         ask for middlebox compatibility mode (client)
  *   --time SECONDS   the time to check certificates at, default now
+ *   --tickets N      send N session tickets after each handshake, under a key
+ *                    this program draws at random (a caller's job)   (server)
+ *   --ticket-lifetime S  how long a ticket is good for, in seconds   (server)
+ *   --connections N  serve N connections one after another, from one context,
+ *                    so that a ticket from the first can be used by the next
+ *                    (server)
+ *   --rekey          before each connection after the first, draw a new key
+ *                    in a new context: the tickets of the ones before no
+ *                    longer open (server)
+ *   --rename         the same, but the key keeps its bytes and takes a new
+ *                    name (server)
+ *   --advance S      the server's clock runs S seconds ahead from the second
+ *                    connection on (server)
+ *   --resume         connect twice: the second time offering the session the
+ *                    first was sent (client)
+ *   --gate FILE      with --resume, wait for FILE to exist before the second
+ *                    connection (client)
  *
- * On success it prints one line, `ok`, then what was negotiated, and exits 0.
- * On failure it prints `failed`, the reason, and the alerts, and exits 1.
+ * On success it prints one line, `ok`, then what was negotiated, and exits 0
+ * (one line for each connection, when there are several). On failure it
+ * prints `failed`, the reason, and the alerts, and exits 1.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include <ghoti.io/tls/tls.h>
+
+#include <ghoti.io/security/random.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,6 +129,14 @@ typedef struct Options {
   int key_update;
   int compat;
   int64_t now;
+  unsigned tickets;
+  unsigned ticket_lifetime;
+  unsigned connections;
+  int rekey;
+  int rename_key;
+  int64_t advance;
+  int resume;
+  const char * gate;
 } Options;
 
 static int fail(const char * what) {
@@ -190,6 +218,7 @@ static int parse_options(int argc, char ** argv, Options * o) {
   o->id_count = 1;
   o->message = "hello";
   o->now = (int64_t)time(NULL);
+  o->connections = 1;
   if (argc < 2) {
     return -1;
   }
@@ -223,6 +252,18 @@ static int parse_options(int argc, char ** argv, Options * o) {
       o->compat = 1;
       continue;
     }
+    if (strcmp(a, "--rekey") == 0) {
+      o->rekey = 1;
+      continue;
+    }
+    if (strcmp(a, "--rename") == 0) {
+      o->rename_key = 1;
+      continue;
+    }
+    if (strcmp(a, "--resume") == 0) {
+      o->resume = 1;
+      continue;
+    }
     if (strcmp(a, "--next-identity") == 0) {
       if (o->id_count >= MAX_IDS) {
         return -1;
@@ -252,6 +293,16 @@ static int parse_options(int argc, char ** argv, Options * o) {
       o->expect = v;
     } else if (strcmp(a, "--time") == 0) {
       o->now = (int64_t)atoll(v);
+    } else if (strcmp(a, "--tickets") == 0) {
+      o->tickets = (unsigned)atoi(v);
+    } else if (strcmp(a, "--ticket-lifetime") == 0) {
+      o->ticket_lifetime = (unsigned)atoi(v);
+    } else if (strcmp(a, "--connections") == 0) {
+      o->connections = (unsigned)atoi(v);
+    } else if (strcmp(a, "--gate") == 0) {
+      o->gate = v;
+    } else if (strcmp(a, "--advance") == 0) {
+      o->advance = (int64_t)atoll(v);
     } else if (strcmp(a, "--suites") == 0) {
       int tmp[3];
 
@@ -297,39 +348,50 @@ static int parse_options(int argc, char ** argv, Options * o) {
 
 /* ------------------------------------------------------------------ the socket */
 
-static int open_socket(const Options * o) {
+static int fill_addr(const Options * o, struct sockaddr_in * addr) {
+  memset(addr, 0, sizeof *addr);
+  addr->sin_family = AF_INET;
+  addr->sin_port = htons((unsigned short)o->port);
+  addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  return 0;
+}
+
+/** A server's listening socket, made once for all its connections. */
+static int listen_on(const Options * o) {
+  struct sockaddr_in addr;
+  int one = 1;
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+  if (fd < 0) {
+    return -1;
+  }
+  fill_addr(o, &addr);
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 1) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int accept_on(int listener) {
+  struct pollfd p = {listener, POLLIN, 0};
+
+  if (poll(&p, 1, 30000) <= 0) {
+    return -1;
+  }
+  return accept(listener, NULL, NULL);
+}
+
+static int connect_to(const Options * o) {
   struct sockaddr_in addr;
   int fd = socket(AF_INET, SOCK_STREAM, 0);
 
   if (fd < 0) {
     return -1;
   }
-  memset(&addr, 0, sizeof addr);
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons((unsigned short)o->port);
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (o->server) {
-    int one = 1;
-    int conn;
-
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 1) != 0) {
-      close(fd);
-      return -1;
-    }
-    {
-      struct pollfd p = {fd, POLLIN, 0};
-
-      if (poll(&p, 1, 30000) <= 0) {
-        close(fd);
-        return -1;
-      }
-    }
-    conn = accept(fd, NULL, NULL);
-    close(fd);
-    return conn;
-  }
-  for (int attempt = 0; attempt < 50; attempt++) {
+  fill_addr(o, &addr);
+  for (int attempt = 0; attempt < 100; attempt++) {
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0) {
       return fd;
     }
@@ -416,6 +478,7 @@ static int load_material(const Options * o, Material * m) {
           gcert_key_from_pkcs8(NULL, m->id[k].key_der, m->id[k].key_len, &m->id[k].key) != GCERT_OK) {
         return -1;
       }
+      m->id[k].names[0] = o->id[k].name;
     }
   } else {
     if (gcert_trust_new(NULL, NULL, &m->trust) != GCERT_OK) {
@@ -453,81 +516,100 @@ static void free_material(Material * m) {
   gcert_trust_free(m->trust);
 }
 
-int main(int argc, char ** argv) {
-  Options o;
-  Material m;
+/**
+ * A server's ticket key: drawn here, because the library draws none (session.h).
+ * @p key holds the last one; @p fresh asks for new bytes, and without it the
+ * bytes stay and only the name is new.
+ */
+static int draw_ticket_key(const Options * o, GTLS_TicketKey * key, int fresh) {
+  if (gsec_random_bytes(key->name, sizeof key->name, NULL) != GSEC_OK ||
+      (fresh && gsec_random_bytes(key->key, sizeof key->key, NULL) != GSEC_OK)) {
+    return -1;
+  }
+  key->not_before = o->now - 60;
+  key->not_after = o->now + 86400;
+  return 0;
+}
+
+static int build_context(const Options * o, const Material * m, GTLS_TicketKey * ticket_key,
+    int fresh_key, GTLS_Context ** context) {
   GTLS_ContextConfig config;
   GTLS_Identity identity[MAX_IDS];
   size_t chain_lens[MAX_IDS][MAX_FILES];
-  GTLS_Context * context = NULL;
+  size_t i;
+
+  gtls_context_config_default(&config);
+  config.role = o->server ? GTLS_ROLE_SERVER : GTLS_ROLE_CLIENT;
+  config.trust = m->trust;
+  config.alpn = o->alpn_count != 0 ? o->alpn : NULL;
+  config.alpn_count = o->alpn_count;
+  config.suites = o->suite_count != 0 ? o->suites : NULL;
+  config.suite_count = o->suite_count;
+  config.groups = o->group_count != 0 ? o->groups : NULL;
+  config.group_count = o->group_count;
+  config.sig_algs = o->sig_count != 0 ? o->sigs : NULL;
+  config.sig_alg_count = o->sig_count;
+  config.middlebox_compat = o->compat;
+  if (o->server) {
+    size_t k;
+
+    for (k = 0; k < o->id_count; k++) {
+      for (i = 0; i < o->id[k].chain_count; i++) {
+        chain_lens[k][i] = m->id[k].lens[i];
+      }
+      memset(&identity[k], 0, sizeof identity[k]);
+      identity[k].chain = m->id[k].chain;
+      identity[k].chain_lens = chain_lens[k];
+      identity[k].chain_count = o->id[k].chain_count;
+      identity[k].key = m->id[k].key;
+      identity[k].names = o->id[k].name != NULL ? m->id[k].names : NULL;
+      identity[k].name_count = o->id[k].name != NULL ? 1u : 0u;
+    }
+    config.identities = identity;
+    config.identity_count = o->id_count;
+    if (o->tickets != 0) {
+      if (draw_ticket_key(o, ticket_key, fresh_key) != 0) {
+        return -1;
+      }
+      config.ticket_keys = ticket_key;
+      config.ticket_key_count = 1;
+      config.ticket_count = o->tickets;
+      config.ticket_lifetime = o->ticket_lifetime;
+    } else {
+      config.ticket_count = 0;
+    }
+  }
+  return gtls_context_new(NULL, &config, context) == GTLS_OK ? 0 : -1;
+}
+
+/**
+ * One connection, from the handshake to the close. A client sends its line and
+ * waits for the echo; a server echoes until the peer closes. A client that is
+ * asked to keep a session waits for the server's tickets too, and hands the
+ * first back in @p keep. Prints the `ok` line. Returns 0 on success.
+ */
+static int run_connection(const Options * o, GTLS_Context * context, int fd, int64_t now,
+    const GTLS_Session * offer, GTLS_Session ** keep) {
   GTLS_Conn * conn = NULL;
   unsigned char buf[16384];
   unsigned char echo[65536];
   size_t echo_len = 0;
   size_t sent_message = 0;
-  size_t got = 0;
   char received[4096];
   size_t received_len = 0;
-  int fd;
   int status = 1;
   int closed = 0;
-  size_t i;
 
-  if (parse_options(argc, argv, &o) != 0) {
-    fprintf(stderr, "usage: echo server [options] PORT | echo client [options] HOST PORT (see the file comment)\n");
-    return 2;
+  if (o->server ? gtls_conn_new_server(context, &conn) != GTLS_OK
+                : gtls_conn_new(context, o->server_name, strlen(o->server_name), &conn) != GTLS_OK) {
+    fprintf(stderr, "failed\ncould not make the connection\n");
+    return 1;
   }
-  if (load_material(&o, &m) != 0) {
-    free_material(&m);
-    return fail("could not load the certificates or the key");
-  }
-  gtls_context_config_default(&config);
-  config.role = o.server ? GTLS_ROLE_SERVER : GTLS_ROLE_CLIENT;
-  config.trust = m.trust;
-  config.alpn = o.alpn_count != 0 ? o.alpn : NULL;
-  config.alpn_count = o.alpn_count;
-  config.suites = o.suite_count != 0 ? o.suites : NULL;
-  config.suite_count = o.suite_count;
-  config.groups = o.group_count != 0 ? o.groups : NULL;
-  config.group_count = o.group_count;
-  config.sig_algs = o.sig_count != 0 ? o.sigs : NULL;
-  config.sig_alg_count = o.sig_count;
-  config.middlebox_compat = o.compat;
-  if (o.server) {
-    size_t k;
-
-    for (k = 0; k < o.id_count; k++) {
-      for (i = 0; i < o.id[k].chain_count; i++) {
-        chain_lens[k][i] = m.id[k].lens[i];
-      }
-      memset(&identity[k], 0, sizeof identity[k]);
-      identity[k].chain = m.id[k].chain;
-      identity[k].chain_lens = chain_lens[k];
-      identity[k].chain_count = o.id[k].chain_count;
-      identity[k].key = m.id[k].key;
-      m.id[k].names[0] = o.id[k].name;
-      identity[k].names = o.id[k].name != NULL ? m.id[k].names : NULL;
-      identity[k].name_count = o.id[k].name != NULL ? 1u : 0u;
-    }
-    config.identities = identity;
-    config.identity_count = o.id_count;
-  }
-  if (gtls_context_new(NULL, &config, &context) != GTLS_OK) {
-    free_material(&m);
-    return fail("could not make the context");
-  }
-  if (o.server ? gtls_conn_new_server(context, &conn) != GTLS_OK
-               : gtls_conn_new(context, o.server_name, strlen(o.server_name), &conn) != GTLS_OK) {
-    gtls_context_free(context);
-    free_material(&m);
-    return fail("could not make the connection");
-  }
-  if (gtls_conn_start(conn) != GTLS_OK) {
+  if (offer != NULL && gtls_conn_set_session(conn, offer, now) != GTLS_OK) {
+    fprintf(stderr, "failed\nthe session was refused\n");
     goto done;
   }
-  fd = open_socket(&o);
-  if (fd < 0) {
-    fprintf(stderr, "failed\ncould not open the socket\n");
+  if (gtls_conn_start(conn) != GTLS_OK) {
     goto done;
   }
 
@@ -538,55 +620,55 @@ int main(int argc, char ** argv) {
 
     if (flush_out(conn, fd) != 0 && !gtls_conn_is_failed(conn)) {
       fprintf(stderr, "failed\nwrite error\n");
-      goto closed_fd;
+      goto done;
     }
     if (gtls_conn_is_failed(conn)) {
       report_failure(conn);
-      goto closed_fd;
+      goto done;
     }
-    if (!o.server && gtls_conn_is_connected(conn) && sent_message == 0) {
+    if (!o->server && gtls_conn_is_connected(conn) && sent_message == 0) {
       size_t w = 0;
-      size_t len = strlen(o.message);
+      size_t len = strlen(o->message);
 
-      if (gtls_conn_write(conn, o.message, len, &w) != GTLS_OK || w != len ||
+      if (gtls_conn_write(conn, o->message, len, &w) != GTLS_OK || w != len ||
           gtls_conn_write(conn, "\n", 1, &w) != GTLS_OK) {
         fprintf(stderr, "failed\nwrite refused\n");
-        goto closed_fd;
+        goto done;
       }
       sent_message = 1;
-      if (o.key_update && gtls_conn_key_update(conn, 1) != GTLS_OK) {
+      if (o->key_update && gtls_conn_key_update(conn, 1) != GTLS_OK) {
         fprintf(stderr, "failed\nkey update refused\n");
-        goto closed_fd;
+        goto done;
       }
-      if (o.key_update) {
+      if (o->key_update) {
         /* data under the new key, to see the peer took it */
-        if (gtls_conn_write(conn, o.message, len, &w) != GTLS_OK ||
+        if (gtls_conn_write(conn, o->message, len, &w) != GTLS_OK ||
             gtls_conn_write(conn, "\n", 1, &w) != GTLS_OK) {
           fprintf(stderr, "failed\nwrite refused\n");
-          goto closed_fd;
+          goto done;
         }
       }
       continue;
     }
-    if (o.server && echo_len > 0) {
+    if (o->server && echo_len > 0) {
       size_t w = 0;
 
       if (gtls_conn_write(conn, echo, echo_len, &w) != GTLS_OK) {
         fprintf(stderr, "failed\nwrite refused\n");
-        goto closed_fd;
+        goto done;
       }
       memmove(echo, echo + w, echo_len - w);
       echo_len -= w;
       continue;
     }
-    if (o.server && gtls_conn_peer_closed(conn) && !closed && echo_len == 0) {
+    if (o->server && gtls_conn_peer_closed(conn) && !closed && echo_len == 0) {
       (void)gtls_conn_close(conn);
       closed = 1;
       (void)flush_out(conn, fd);
       break;
     }
-    if (!o.server && received_len >= strlen(o.expect) + (sent_message ? 1u : 0u) &&
-        sent_message && !closed) {
+    if (!o->server && received_len >= strlen(o->expect) + (sent_message ? 1u : 0u) &&
+        sent_message && !closed && (keep == NULL || gtls_conn_session_count(conn) > 0)) {
       (void)gtls_conn_close(conn);
       closed = 1;
       (void)flush_out(conn, fd);
@@ -597,7 +679,7 @@ int main(int argc, char ** argv) {
     p.revents = 0;
     if (poll(&p, 1, IO_TIMEOUT_MS) <= 0) {
       fprintf(stderr, "failed\ntimed out\n");
-      goto closed_fd;
+      goto done;
     }
     n = recv(fd, buf, sizeof buf, 0);
     if (n <= 0) {
@@ -607,23 +689,23 @@ int main(int argc, char ** argv) {
         break;
       }
       fprintf(stderr, "failed\n%s\n", gtls_result_string(r));
-      goto closed_fd;
+      goto done;
     }
     off = 0;
     while (off < (size_t)n) {
       size_t used = 0;
-      GTLS_Result r = gtls_conn_stream_feed(conn, buf + off, (size_t)n - off, o.now, &used);
+      GTLS_Result r = gtls_conn_stream_feed(conn, buf + off, (size_t)n - off, now, &used);
 
       off += used;
       for (;;) {
         size_t k = 0;
 
-        if (gtls_conn_read(conn, o.server ? echo + echo_len : (unsigned char *)received + received_len,
-                o.server ? sizeof echo - echo_len : sizeof received - received_len - 1u, &k) != GTLS_OK ||
+        if (gtls_conn_read(conn, o->server ? echo + echo_len : (unsigned char *)received + received_len,
+                o->server ? sizeof echo - echo_len : sizeof received - received_len - 1u, &k) != GTLS_OK ||
             k == 0) {
           break;
         }
-        if (o.server) {
+        if (o->server) {
           echo_len += k;
         } else {
           received_len += k;
@@ -639,35 +721,119 @@ int main(int argc, char ** argv) {
     if (gtls_conn_is_failed(conn)) {
       (void)flush_out(conn, fd);
       report_failure(conn);
-      goto closed_fd;
+      goto done;
     }
   }
   /* The client has what it asked for: check it and say what was negotiated. */
-  if (!o.server) {
-    size_t want = strlen(o.expect);
+  if (!o->server) {
+    size_t want = strlen(o->expect);
 
     received[received_len] = 0;
-    if (received_len < want || memcmp(received, o.expect, want) != 0) {
+    if (received_len < want || memcmp(received, o->expect, want) != 0) {
       fprintf(stderr, "failed\nthe echo was not what was sent: got %zu bytes\n", received_len);
-      goto closed_fd;
+      goto done;
     }
+  }
+  if (keep != NULL && gtls_conn_session_count(conn) > 0 &&
+      gtls_conn_session(conn, 0, keep) != GTLS_OK) {
+    fprintf(stderr, "failed\nthe session could not be kept\n");
+    goto done;
   }
   {
     const unsigned char * alpn = NULL;
     size_t alpn_len = 0;
 
     (void)gtls_conn_alpn(conn, &alpn, &alpn_len);
-    printf("ok suite=%04x group=%04x alpn=%.*s retried=%d\n", (unsigned)gtls_conn_suite(conn),
-        (unsigned)gtls_conn_group(conn), (int)alpn_len, alpn != NULL ? (const char *)alpn : "",
-        gtls_conn_retried(conn));
+    printf("ok suite=%04x group=%04x alpn=%.*s retried=%d resumed=%d sessions=%zu offered=%d\n",
+        (unsigned)gtls_conn_suite(conn), (unsigned)gtls_conn_group(conn), (int)alpn_len,
+        alpn != NULL ? (const char *)alpn : "", gtls_conn_retried(conn), gtls_conn_resumed(conn),
+        gtls_conn_session_count(conn), offer != NULL);
     fflush(stdout);
   }
   status = 0;
-closed_fd:
-  close(fd);
 done:
-  (void)got;
   gtls_conn_free(conn);
+  return status;
+}
+
+int main(int argc, char ** argv) {
+  Options o;
+  Material m;
+  GTLS_Context * context = NULL;
+  GTLS_Session * session = NULL;
+  GTLS_TicketKey ticket_key;
+  int listener = -1;
+  int status = 1;
+  unsigned n;
+
+  if (parse_options(argc, argv, &o) != 0) {
+    fprintf(stderr, "usage: echo server [options] PORT | echo client [options] HOST PORT (see the file comment)\n");
+    return 2;
+  }
+  if (load_material(&o, &m) != 0) {
+    free_material(&m);
+    return fail("could not load the certificates or the key");
+  }
+  memset(&ticket_key, 0, sizeof ticket_key);
+  if (build_context(&o, &m, &ticket_key, 1, &context) != 0) {
+    free_material(&m);
+    return fail("could not make the context");
+  }
+  if (o.server) {
+    listener = listen_on(&o);
+    if (listener < 0) {
+      fprintf(stderr, "failed\ncould not open the socket\n");
+      goto out;
+    }
+  }
+  for (n = 0; n < (o.server ? o.connections : (o.resume ? 2u : 1u)); n++) {
+    int64_t now = o.now + (n > 0 ? o.advance : 0);
+    int fd;
+    int result;
+
+    if (o.server && n > 0 && (o.rekey || o.rename_key)) {
+      /* The next context has a key of its own, or the same bytes under a new name:
+       * what the last one sealed no longer opens. */
+      gtls_context_free(context);
+      context = NULL;
+      if (build_context(&o, &m, &ticket_key, o.rekey, &context) != 0) {
+        fprintf(stderr, "failed\ncould not make the context\n");
+        goto out;
+      }
+    }
+    if (!o.server && n > 0 && o.gate != NULL) {
+      /* Whoever started the next server says when it is listening. */
+      int waited;
+
+      for (waited = 0; waited < 400 && access(o.gate, F_OK) != 0; waited++) {
+        struct timespec ts = {0, 50 * 1000 * 1000};
+
+        nanosleep(&ts, NULL);
+      }
+    }
+    fd = o.server ? accept_on(listener) : connect_to(&o);
+    if (fd < 0) {
+      fprintf(stderr, "failed\ncould not open the socket\n");
+      goto out;
+    }
+    result = run_connection(&o, context, fd, now, n > 0 ? session : NULL,
+        (!o.server && o.resume && n == 0) ? &session : NULL);
+    close(fd);
+    if (result != 0) {
+      goto out;
+    }
+    if (!o.server && o.resume && n == 0 && session == NULL) {
+      fprintf(stderr, "failed\nthe server sent no ticket\n");
+      goto out;
+    }
+  }
+  status = 0;
+out:
+  if (listener >= 0) {
+    close(listener);
+  }
+  memset(&ticket_key, 0, sizeof ticket_key);
+  gtls_session_free(session);
   gtls_context_free(context);
   free_material(&m);
   return status;

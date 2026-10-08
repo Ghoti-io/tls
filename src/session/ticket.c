@@ -182,7 +182,8 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
     return GTLS_ERR_MISMATCH;
   }
   n = len - GTLS_TICKET_KEY_NAME_LEN - GTLS_TICKET_NONCE_LEN - GTLS_TICKET_TAG_LEN;
-  aad_len = build_aad(aad, key->name, ticket + GTLS_TICKET_KEY_NAME_LEN);
+  /* The name the ticket carries is authenticated, whichever key was found by it. */
+  aad_len = build_aad(aad, ticket, ticket + GTLS_TICKET_KEY_NAME_LEN);
   opened = gsec_aes_gcm_decrypt(key->key, GTLS_TICKET_KEY_LEN,
       ticket + GTLS_TICKET_KEY_NAME_LEN, GTLS_TICKET_NONCE_LEN, aad, aad_len,
       ticket + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN, n, plain,

@@ -252,10 +252,60 @@ TEST(Resume, AfterARetryThatNamesAnotherHashTheOfferIsDroppedAndTheHandshakeIsFu
   n.p.scfg.groups = p256;
   n.p.scfg.group_count = 1;
   n.p.offer = h.s;
-  ASSERT_NO_FATAL_FAILURE(run_full(n.p));
+  ASSERT_EQ(n.p.build(), GTLS_OK);
+  n.p.carry(n.p.c, n.p.s, 0);   /* the first hello, with the offer */
+  n.p.carry(n.p.s, n.p.c, 0);   /* the retry */
+  {
+    /* The second hello: no pre_shared_key, though the modes stay. */
+    Bytes wire = stream_out(n.p.c.conn);
+    ASSERT_GT(wire.size(), 9u);
+    GTLS_ClientHello h2;
+    GTLS_Limits lim;
+    gtls_limits_default(&lim);
+    ASSERT_EQ(gtls_msg_parse_client_hello(wire.data() + 9, wire.size() - 9, &lim, &h2), GTLS_OK);
+    EXPECT_EQ(gtls_msg_find_ext(h2.exts, h2.ext_count, GTLS_EXT_PRE_SHARED_KEY), nullptr)
+        << "a PSK for SHA-384 is not offered again under a SHA-256 retry";
+    EXPECT_EQ(n.p.c.conn->offer, nullptr) << "and the session is let go";
+  }
+  n.p.run();
+  ASSERT_TRUE(n.p.connected());
   EXPECT_TRUE(gtls_conn_retried(n.p.c.conn));
   expect_resumed(n.p, false);
   EXPECT_EQ(gtls_conn_suite(n.p.c.conn), GTLS_SUITE_AES_128_GCM_SHA256);
+}
+
+TEST(Resume, ARetryThatNamesAnotherSuiteOfTheSameHashKeepsTheOfferAndTheServerStillDoesNotResume) {
+  Env e;
+  static const GTLS_Suite aes128[] = {GTLS_SUITE_AES_128_GCM_SHA256};
+  e.p.scfg.suites = aes128;
+  e.p.scfg.suite_count = 1;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+
+  /* The server prefers ChaCha20 and wants P-256, and its clock is a minute ahead of
+   * the client's when the first hello arrives, so the ticket is too stale to use.
+   * The retry names ChaCha20 (the same hash as the ticket's suite: the client
+   * offers the PSK again, with a fresh age), and the second hello's ticket is
+   * good. It is for AES-128, and the ServerHello must name the retry's suite. */
+  static const GTLS_Suite order[] = {GTLS_SUITE_CHACHA20_POLY1305_SHA256, GTLS_SUITE_AES_128_GCM_SHA256};
+  static const GTLS_Group p256[] = {GTLS_GROUP_SECP256R1};
+  Next n(e);
+  n.p.scfg.suites = order;
+  n.p.scfg.suite_count = 2;
+  n.p.scfg.groups = p256;
+  n.p.scfg.group_count = 1;
+  n.p.offer = h.s;
+  n.p.offer_time = kNow;
+  n.p.now = kNow + 60;
+  ASSERT_EQ(n.p.build(), GTLS_OK);
+  n.p.run();
+  ASSERT_TRUE(n.p.connected()) << "client: " << result_name(gtls_conn_failure(n.p.c.conn))
+                               << ", server: " << result_name(gtls_conn_failure(n.p.s.conn));
+  EXPECT_TRUE(gtls_conn_retried(n.p.c.conn));
+  EXPECT_EQ(gtls_conn_suite(n.p.s.conn), GTLS_SUITE_CHACHA20_POLY1305_SHA256)
+      << "the retry's suite, not the ticket's";
+  expect_resumed(n.p, false);
 }
 
 TEST(Resume, TheServerResumesUnderTheTicketsSuiteWhateverItPrefers) {
@@ -446,6 +496,110 @@ TEST(Resume, ANoAlpnSessionResumesWhateverIsOfferedNow) {
   EXPECT_EQ(decision(e, h.s, [](Pair & p) { p.calpn = {"h2"}; p.salpn = {"h2"}; }), 1);
 }
 
+namespace {
+
+/**
+ * A ClientHello (as a plaintext record) that offers @p session's ticket,
+ * with the suites it lists, a binder of @p binder_len bytes, and the right
+ * binder at the front of it when @p right_binder.
+ */
+Bytes crafted_hello(const Env & e, const GTLS_Session * session, const GTLS_Suite * suites,
+    size_t suite_count, size_t binder_len, bool right_binder) {
+  static const GTLS_Group groups[] = {GTLS_GROUP_X25519};
+  static const GCERT_SigScheme sigs[] = {GCERT_SIG_ED25519};
+  GTLS_HelloParams hp;
+  std::memset(&hp, 0, sizeof hp);
+  hp.suites = suites;
+  hp.suite_count = suite_count;
+  hp.host = e.cred->name.data();
+  hp.host_len = e.cred->name.size();
+  hp.groups = groups;
+  hp.group_count = 1;
+  hp.sig_algs = sigs;
+  hp.sig_alg_count = 1;
+  hp.share.group = GTLS_GROUP_X25519;
+  hp.share.pub_len = 32;
+  Bytes priv(32, 0x11);
+  EXPECT_EQ(gsec_x25519_public(priv.data(), hp.share.pub), GSEC_OK);
+  GTLS_PskParams psk = {session->ticket, session->ticket_len, session->age_add, binder_len};
+  hp.psk = &psk;
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 1 << 16);
+  EXPECT_EQ(gtls_msg_build_client_hello(&hp, &b), GTLS_OK);
+  Bytes hello{22, 3, 1};
+  hello.push_back(static_cast<unsigned char>(b.len >> 8));
+  hello.push_back(static_cast<unsigned char>(b.len));
+  hello.insert(hello.end(), b.data, b.data + b.len);
+  gtls_buf_free(&b);
+  if (right_binder) {
+    GTLS_Transcript t;
+    unsigned char th[GTLS_HASH_MAX];
+    unsigned char binder[GTLS_HASH_MAX];
+    const GTLS_Hash hash = gtls_suite_hash(session->suite);
+    const size_t cut = hello.size() - GTLS_PSK_BINDERS_TAIL(binder_len);
+
+    EXPECT_EQ(gtls_transcript_init(&t), GTLS_OK);
+    EXPECT_EQ(gtls_transcript_select(&t, hash), GTLS_OK);
+    EXPECT_EQ(gtls_binder_transcript(&t, hello.data() + 5, cut - 5, th), GTLS_OK);
+    EXPECT_EQ(gtls_binder_compute(hash, session->psk, session->psk_len, th, binder), GTLS_OK);
+    gtls_transcript_wipe(&t);
+    std::memcpy(hello.data() + hello.size() - binder_len, binder, session->psk_len);
+  }
+  return hello;
+}
+
+}  // namespace
+
+TEST(Resume, ATicketForASuiteTheClientDidNotOfferIsPassedOver) {
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+  ASSERT_EQ(h.s->suite, GTLS_SUITE_AES_128_GCM_SHA256);
+  static const GTLS_Suite other[] = {GTLS_SUITE_CHACHA20_POLY1305_SHA256};   /* the same hash */
+  static const GTLS_Suite same[] = {GTLS_SUITE_AES_128_GCM_SHA256};
+  size_t used = 0;
+
+  {
+    Next n(e);
+    ASSERT_EQ(n.p.build(), GTLS_OK);
+    Bytes hello = crafted_hello(e, h.s, other, 1, 32, true);
+    ASSERT_EQ(gtls_conn_stream_feed(n.p.s.conn, hello.data(), hello.size(), kNow, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_resumed(n.p.s.conn), 0) << "the suite of the ticket is not among those offered";
+    EXPECT_EQ(gtls_conn_suite(n.p.s.conn), GTLS_SUITE_CHACHA20_POLY1305_SHA256);
+  }
+  {
+    Next n(e);
+    ASSERT_EQ(n.p.build(), GTLS_OK);
+    Bytes hello = crafted_hello(e, h.s, same, 1, 32, true);
+    ASSERT_EQ(gtls_conn_stream_feed(n.p.s.conn, hello.data(), hello.size(), kNow, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_resumed(n.p.s.conn), 1) << "and with the suite offered it is resumed: the hello is good";
+  }
+}
+
+TEST(Resume, ASessionResumesWithNoSignatureSchemeInCommonBecauseNoneIsNeeded) {
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+  static const GCERT_SigScheme pss[] = {GCERT_SIG_RSA_PSS_SHA256};   /* the server's key is Ed25519 */
+
+  Next full(e);
+  full.p.ccfg.sig_algs = pss;
+  full.p.ccfg.sig_alg_count = 1;
+  EXPECT_EQ(full.p.build(), GTLS_OK);
+  full.p.run();
+  EXPECT_FALSE(full.p.connected()) << "without a session there is no scheme to sign with";
+  EXPECT_EQ(gtls_conn_failure(full.p.s.conn), GTLS_ERR_NO_COMMON);
+
+  Next n(e);
+  n.p.ccfg.sig_algs = pss;
+  n.p.ccfg.sig_alg_count = 1;
+  n.p.offer = h.s;
+  ASSERT_NO_FATAL_FAILURE(run_full(n.p));
+  expect_resumed(n.p, true);
+}
+
 TEST(Resume, AnOfferThatCannotUseDheIsAFullHandshake) {
   Env e;
   ASSERT_NO_FATAL_FAILURE(run_full(e.p));
@@ -603,6 +757,47 @@ TEST(Resume, ABinderOfTheWrongLengthForTheTicketIsAlsoABadBinder) {
   size_t used = 0;
   EXPECT_EQ(gtls_conn_stream_feed(n.p.s.conn, hello.data(), hello.size(), kNow, &used), GTLS_ERR_MISMATCH);
   EXPECT_EQ(gtls_conn_alert(n.p.s.conn), GTLS_ALERT_DECRYPT_ERROR);
+
+  /* The same, with the 32 bytes of the right binder at the front of the 48: the
+   * length alone is what is wrong, and it is wrong enough. */
+  {
+    GTLS_Transcript t;
+    unsigned char th[GTLS_HASH_MAX];
+    unsigned char binder[GTLS_HASH_MAX];
+    const size_t cut = hello.size() - GTLS_PSK_BINDERS_TAIL(48);
+
+    ASSERT_EQ(gtls_transcript_init(&t), GTLS_OK);
+    ASSERT_EQ(gtls_transcript_select(&t, GTLS_HASH_SHA256), GTLS_OK);
+    ASSERT_EQ(gtls_binder_transcript(&t, hello.data() + 5, cut - 5, th), GTLS_OK);
+    ASSERT_EQ(gtls_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
+    gtls_transcript_wipe(&t);
+    std::memcpy(hello.data() + hello.size() - 48, binder, 32);
+    Next m(e);
+    ASSERT_EQ(m.p.build(), GTLS_OK);
+    EXPECT_EQ(gtls_conn_stream_feed(m.p.s.conn, hello.data(), hello.size(), kNow, &used), GTLS_ERR_MISMATCH);
+    EXPECT_EQ(gtls_conn_alert(m.p.s.conn), GTLS_ALERT_DECRYPT_ERROR);
+    /* ... and the 32-byte binder itself, written the same way, is accepted: the computation is right. */
+    GTLS_PskParams ok_psk = {h.s->ticket, h.s->ticket_len, h.s->age_add, 32};
+    hp.psk = &ok_psk;
+    GTLS_Buf b2;
+    gtls_buf_init(&b2, nullptr, 1 << 16);
+    ASSERT_EQ(gtls_msg_build_client_hello(&hp, &b2), GTLS_OK);
+    Bytes good{22, 3, 1};
+    good.push_back(static_cast<unsigned char>(b2.len >> 8));
+    good.push_back(static_cast<unsigned char>(b2.len));
+    good.insert(good.end(), b2.data, b2.data + b2.len);
+    gtls_buf_free(&b2);
+    ASSERT_EQ(gtls_transcript_init(&t), GTLS_OK);
+    ASSERT_EQ(gtls_transcript_select(&t, GTLS_HASH_SHA256), GTLS_OK);
+    ASSERT_EQ(gtls_binder_transcript(&t, good.data() + 5, good.size() - 5 - GTLS_PSK_BINDERS_TAIL(32), th), GTLS_OK);
+    ASSERT_EQ(gtls_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
+    gtls_transcript_wipe(&t);
+    std::memcpy(good.data() + good.size() - 32, binder, 32);
+    Next k(e);
+    ASSERT_EQ(k.p.build(), GTLS_OK);
+    EXPECT_EQ(gtls_conn_stream_feed(k.p.s.conn, good.data(), good.size(), kNow, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_resumed(k.p.s.conn), 1);
+  }
 }
 
 /* --------------------------------------------- what the client will not take */
@@ -689,6 +884,32 @@ TEST(Resume, AnIndexOutOfRangeIsIllegalParameterAndIndexZeroIsAccepted) {
     EXPECT_EQ(alert, GTLS_ALERT_ILLEGAL_PARAMETER) << index;
     EXPECT_TRUE(wiped) << index;
   }
+}
+
+TEST(Resume, ASelectedPskUnderASuiteOfAnotherHashIsIllegalParameter) {
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+  ASSERT_EQ(h.s->suite, GTLS_SUITE_AES_128_GCM_SHA256);
+
+  Next n(e);
+  n.p.offer = h.s;
+  ASSERT_EQ(n.p.build(), GTLS_OK);
+  Bytes hello = stream_out(n.p.c.conn);
+  size_t used = 0;
+  ASSERT_EQ(gtls_conn_stream_feed(n.p.s.conn, hello.data(), hello.size(), n.p.now, &used), GTLS_OK);
+  Bytes wire = stream_out(n.p.s.conn);
+  Bytes sh = server_hello_in(wire);
+  ASSERT_FALSE(sh.empty());
+  /* The suite field of the ServerHello: header, version, random, session id. */
+  const size_t at = 5 + 4 + 2 + 32 + 1 + sh[4 + 2 + 32];
+  ASSERT_EQ(wire[at], 0x13);
+  ASSERT_EQ(wire[at + 1], 0x01);
+  wire[at + 1] = 0x02;   /* TLS_AES_256_GCM_SHA384: offered, and the wrong hash for the PSK */
+  EXPECT_EQ(gtls_conn_stream_feed(n.p.c.conn, wire.data(), wire.size(), n.p.now, &used), GTLS_ERR_PROTOCOL);
+  EXPECT_EQ(gtls_conn_alert(n.p.c.conn), GTLS_ALERT_ILLEGAL_PARAMETER);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(n.p.c.conn));
 }
 
 /* ------------------------------------------------------------------ rotation */
@@ -807,6 +1028,21 @@ TEST(Resume, ASessionIsRefusedForAnotherHostAnotherSuiteOrOnceItHasRunOut) {
 
   client("elsewhere.test", &c, &ctx, nullptr, 0);
   EXPECT_EQ(gtls_conn_set_session(c, h.s, kNow), GTLS_ERR_INVALID) << "another host";
+  gtls_conn_free(c);
+  gtls_context_free(ctx);
+
+  client("examplf.test", &c, &ctx, nullptr, 0);
+  EXPECT_EQ(gtls_conn_set_session(c, h.s, kNow), GTLS_ERR_INVALID) << "another host of the same length";
+  gtls_conn_free(c);
+  gtls_context_free(ctx);
+
+  client("example.tes", &c, &ctx, nullptr, 0);
+  EXPECT_EQ(gtls_conn_set_session(c, h.s, kNow), GTLS_ERR_INVALID) << "a prefix of the host";
+  gtls_conn_free(c);
+  gtls_context_free(ctx);
+
+  client("example.testx", &c, &ctx, nullptr, 0);
+  EXPECT_EQ(gtls_conn_set_session(c, h.s, kNow), GTLS_ERR_INVALID) << "the host with more after it";
   gtls_conn_free(c);
   gtls_context_free(ctx);
 

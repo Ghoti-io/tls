@@ -57,6 +57,8 @@ const Harness kHarnesses[] = {
     {"stream", gtlsfuzz::client_stream_one, 20},
     {"record", gtlsfuzz::record_one, 7},
     {"pump", gtlsfuzz::pump_one, 12},
+    {"resume", gtlsfuzz::resume_one, 15},
+    {"session", gtlsfuzz::session_one, 12},
 };
 
 }  // namespace
@@ -163,8 +165,9 @@ TEST(FuzzSeeds, ByteFlipsAndTruncationsAtAStrideOfEveryStreamSeed) {
 }
 
 TEST(FuzzSeeds, ByteFlipsAndTruncationsOfEveryMessageAndRecordSeed) {
-  for (const char * kind : {"msg", "record"}) {
-    int (*run)(const uint8_t *, size_t) = std::string(kind) == "msg" ? gtlsfuzz::msg_one : gtlsfuzz::record_one;
+  for (const char * kind : {"msg", "record", "session"}) {
+    int (*run)(const uint8_t *, size_t) = std::string(kind) == "msg" ? gtlsfuzz::msg_one
+        : std::string(kind) == "record" ? gtlsfuzz::record_one : gtlsfuzz::session_one;
     for (const std::string & p : seeds(kind)) {
       gtlsfuzz::Bytes b = read(p);
       size_t step = b.size() > 2000 ? 7 : 1;
@@ -204,6 +207,27 @@ TEST(FuzzSeeds, PositionsAtAStrideOfBothStreamsOfARealHandshakeChangedInTurn) {
     }
   }
   EXPECT_GT(runs, 400u);
+}
+
+/* The same, with a first handshake behind them: the second one offers its
+ * ticket, and a byte of the hello, the binder, the ServerHello or the abbreviated
+ * flight is changed. */
+TEST(FuzzSeeds, PositionsAtAStrideOfBothStreamsOfAResumedHandshakeChangedInTurn) {
+  size_t runs = 0;
+  for (unsigned option : {0x0fu, 0x1fu}) {
+    for (int direction = 0; direction < 2; direction++) {
+      for (unsigned at = 0; at < 1500; at += 29) {
+        for (unsigned x : {0x01u, 0x80u}) {
+          unsigned v = (static_cast<unsigned>(direction) << 15) | at;
+          gtlsfuzz::Bytes in = {static_cast<unsigned char>(option), static_cast<unsigned char>(v >> 8),
+              static_cast<unsigned char>(v), static_cast<unsigned char>(x)};
+          gtlsfuzz::resume_one(in.data(), in.size());
+          runs++;
+        }
+      }
+    }
+  }
+  EXPECT_GT(runs, 200u);
 }
 
 int main(int argc, char ** argv) {

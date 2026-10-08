@@ -32,7 +32,7 @@ accepts.
 
 | Document | What | Deviation |
 | --- | --- | --- |
-| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | a PSK or early data offered to a server is ignored (the handshake falls back to the full one), none is accepted or sent, no client certificate and no CertificateRequest, no NewSessionTicket sent, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
+| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | resumption with `psk_dhe_ke` from a ticket this server sealed (stateless, no server-side cache), no `psk_ke` alone, no external PSK; early data offered to a server is not accepted (its records are skipped) and none is sent; no client certificate and no CertificateRequest, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
 | RFC 6066 | `server_name`; an IP literal is never sent; a server chooses its identity by it and acknowledges it | no other extension of that RFC |
 | RFC 7301 | ALPN, offered and read back; a server picks the first of its list that the client offered | no overlap with both lists present is fatal (`no_application_protocol`), as the RFC says |
 | RFC 7685 | padding a ClientHello of 256 to 511 bytes to 512 | |
@@ -126,22 +126,20 @@ flight fit the queue a connection holds. What a ClientHello makes it choose:
   present and no overlap is `no_application_protocol`; a client that offered
   none, or a server with none, gets none.
 
-It sends no CertificateRequest and no NewSessionTicket. It refuses, with the
+It sends no CertificateRequest. It refuses, with the
 alert that names the cause: a hello with no `supported_versions` or none that
 offers 1.3 (`protocol_version`); a cookie it never issued; a
 missing `supported_groups`, `signature_algorithms` or `key_share`
 (`missing_extension`); nothing in common (`handshake_failure`).
 
-**A PSK or early-data offer is validated and ignored** (RFC 8446 sections
-4.2.9 to 4.2.11), because the server issues no tickets and so holds no key to
-select and no early-data key. A `pre_shared_key` must be the last extension
+**A `pre_shared_key` offer is judged, and `early_data` is not accepted** (RFC
+8446 sections 4.2.9 to 4.2.11). A `pre_shared_key` must be the last extension
 (`illegal_parameter`), `psk_key_exchange_modes` must be there
 (`missing_extension`), the identities and the binders must parse, be as many
 as each other (`illegal_parameter`), and fit `GTLS_Limits::max_tickets` and
-`max_ticket_bytes` (`GTLS_ERR_LIMIT`, `decode_error`). The binders are not
-checked: they vouch for a PSK that is used, and none is. No `pre_shared_key`
-goes in the ServerHello and the full certificate handshake follows.
-`early_data` must have an empty body (`decode_error`) and is rejected by not
+`max_ticket_bytes` (`GTLS_ERR_LIMIT`, `decode_error`). What follows is
+[Tickets](#tickets-and-resumption). `early_data` must have an empty body
+(`decode_error`) and is rejected by not
 echoing it in EncryptedExtensions. The client then sends records protected by
 a key this server never had, and section 4.2.10 has the server skip them, so
 the skip window opens only when `early_data` comes with a `pre_shared_key`
@@ -164,14 +162,98 @@ open** (RFC 8446 section 4.2.10): a Finished record that fails to open looks
 exactly like an early record, so it is discarded and the handshake stalls
 instead of failing at once. It stays discarded until the cap is reached
 (`GTLS_ERR_LIMIT`) or a record that opens arrives. The cap is what bounds it.
-
-Accepting a PSK,
-issuing tickets and accepting early data are later work (planning step 8).
+Accepting early data, which has a replay problem of its own, is the next step.
 
 The server writes application data only once the client's Finished has
 verified, and reads and writes under the application keys from the moment its
 flight has gone out, as OpenSSL does, so an alert after the flight is sealed
 under the key the client has switched to.
+
+## Tickets and resumption
+
+`session.h` is the interface; RFC 8446 sections 2.2, 4.2.11 and 4.6.1 are the
+rules. The design is stateless: **no server keeps anything per session.**
+
+**The ticket.** The server seals the state a resumption needs under a key the
+caller supplies: the PSK, the suite, `ticket_age_add`, the second it was
+issued, its lifetime, the ALPN protocol and the server name of the connection
+it came from, and nothing else. A ticket is the 16-byte name of the key, a
+random 12-byte nonce, the AES-256-GCM ciphertext and its tag, with a label,
+the name and the nonce as additional data. The library generates, stores and
+persists no key. `GTLS_ContextConfig::ticket_keys` is a list of up to eight
+`GTLS_TicketKey` (name, 32 bytes, a window of Unix seconds): the key that
+began last among those valid at the moment seals; every key that has not
+expired opens. That is rotation: add a key that begins now, and leave the old one
+in the list until the tickets it sealed have run out. Names must differ. A
+random 96-bit nonce under one key is safe for about 2^32 tickets, so a key
+should not live that long. How the keys reach the several processes that serve
+one name, and where they are kept, is the caller's.
+`GTLS_Limits::max_ticket_bytes` must be at least the largest ticket (a
+context with keys and a smaller cap is `GTLS_ERR_LIMIT`).
+
+**Issuing.** After the client's Finished has verified, the server sends
+`ticket_count` NewSessionTicket messages (default 1; 0 sends none; at most
+`max_tickets`) under the application keys, on every connection, resumed or
+not. Each carries its own nonce, so each stands for a PSK of its own:
+`HKDF-Expand-Label(resumption_master_secret, "resumption", nonce, Hash.length)`,
+where the resumption master secret is derived from the transcript through
+the client's Finished. The lifetime is `ticket_lifetime` (default six hours,
+never above seven days). A server with no key valid now sends none.
+
+**Accepting.** For each identity of the offer, in order, the ticket is opened
+and passed over, without an error, if it is not ours or does not decrypt, its key
+has expired, its suite is not one the client offered and the server has, its
+lifetime has run out, its age is outside the window, its server name is not the
+one the ClientHello carries now, or the ALPN protocol it came from is not among
+those offered again. `psk_ke` alone (no `psk_dhe_ke` in the modes) is passed
+over too. The first identity that qualifies has its binder checked in constant
+time, over the transcript so far (empty, or the retry's) and the
+ClientHello cut where the binders list begins; **a binder that is wrong, or the
+wrong length for the PSK, is fatal** (`GTLS_ERR_MISMATCH`, `decrypt_error`) and
+the connection is wiped. A good one gives the abbreviated flight: ServerHello
+with `pre_shared_key` naming the identity, EncryptedExtensions, Finished, and
+no Certificate, no CertificateVerify, so no signature scheme need be in
+common. The suite is the ticket's, not the server's preference (the hash of the
+PSK is the hash of the handshake). The ECDHE exchange still happens.
+The age check is in milliseconds, in 64-bit arithmetic on values that are
+already bounded: the client's age is the obfuscated one minus `age_add`
+modulo 2^32, the server's is its own clock minus the issue time, and they must
+agree within `ticket_age_window` (default 10 s). The clocks are seconds the
+caller passes in; nothing here reads one.
+
+**A HelloRetryRequest.** The first ClientHello's binder is not looked at when
+the answer is a retry (the binder that counts is the one in the second hello,
+over the transcript with the retry in it). The retry's suite is the one the
+ServerHello must name: if the ticket is for another suite by the time the
+second hello arrives (it was not good for the first, say), the ticket is passed
+over and the handshake is a full one under the retry's suite.
+
+**The client.** After the handshake a connection holds a `GTLS_Session` for
+each ticket it was sent (`gtls_conn_session_count`, `gtls_conn_session`): the
+ticket, the PSK it stands for, the suite, `age_add`, the lifetime (cut to seven
+days), the second it arrived, the host name and the ALPN protocol. The
+library keeps nothing across connections: the caller keeps the session
+(`gtls_session_serialize` writes a versioned blob with a SHA-256 digest to catch
+damage; it holds the PSK in the clear, so it is a secret as a key is) and hands it to
+a new connection with `gtls_conn_set_session` before start, with the time. A
+session is refused for another host name, for a suite the connection does not
+offer, before it arrived and after it has run out. The ClientHello then
+carries `psk_key_exchange_modes` (`psk_dhe_ke`), the ticket as the one
+identity, `obfuscated_ticket_age`, and the binder, with `pre_shared_key` last
+(the padding moves in front of it). After a HelloRetryRequest the second
+hello's age is refreshed and its binder computed again over the transcript with
+the retry in it; if the retry names a suite whose hash is not the PSK's the
+offer is dropped, the session let go, and the handshake that follows is a full
+one. A ServerHello that selects a PSK that was not offered, an index out of
+range, or under a suite of another hash is `illegal_parameter`; one that selects
+none means a full handshake and the client goes on to check the certificate as
+it always does. A resumed client expects no Certificate (`unexpected_message` if one
+comes) and `gtls_conn_peer_certificate` is empty for it.
+
+**Wiping.** The PSK and every secret after it live in the connection's secret
+block, wiped on failure and on free; a session is wiped when freed; a failed
+connection frees its sessions and the offer; the ticket's plaintext, the PSK
+on the server's stack and the binder keys are wiped on every path.
 
 ## The record layer
 
@@ -256,6 +338,8 @@ header as additional data, and the outer type says application data
 | (server) no `supported_versions`, or none naming 1.3 | `GTLS_ERR_UNSUPPORTED` | `protocol_version` |
 | (server) `pre_shared_key` not last, or a binder count that differs | `GTLS_ERR_PROTOCOL` | `illegal_parameter` |
 | (server) `pre_shared_key` or `early_data` that does not parse | `GTLS_ERR_CORRUPT` | `decode_error` |
+| (server) a binder that does not verify, or is the wrong length for the PSK | `GTLS_ERR_MISMATCH` | `decrypt_error` |
+| (client) a ServerHello that selects a PSK never offered, an index out of range, or a suite of another hash | `GTLS_ERR_PROTOCOL` | `illegal_parameter` |
 | (server) more identities, or a longer one, than the limits | `GTLS_ERR_LIMIT` | `decode_error` |
 | (server) more early-data bytes skipped than the limit | `GTLS_ERR_LIMIT` | `unexpected_message` |
 | (server) required extension missing | `GTLS_ERR_PROTOCOL` | `missing_extension` |
@@ -367,7 +451,15 @@ plaintext-alert rules, the fragments rule, KeyUpdate's record and its answers,
 the key of a server's alert, the client's dummy record, ALPN names compared by
 their bytes, what a second ClientHello may change, a context's checks on a chain,
 which identity a name picks, the wire's room for a record, and the result of an
-allocation failure.
+allocation failure; and for tickets, the binder (its check, its length, the transcript
+it covers), the key name, expiry and choice of a ticket key, the freshness
+arithmetic (lifetime, window, `age_add`, a ticket from the future), each of the
+checks that passes a ticket over (name, ALPN protocol, suite, `psk_dhe_ke`,
+the retry's suite), the suite the ticket chooses, the abbreviated flight (no
+Certificate; no signature scheme needed), the number and the nonce of the
+tickets, the client's binder (first hello and retry), the age it reports, the hash
+it drops an offer for, what it takes of a ServerHello's PSK, what a session is
+bound to, and every check of a session blob and of a ticket configuration.
 
 `make check-controls` runs all of it (slow: it builds a copy per plant; needs
 `PREFIX`). `make test` runs `check-controls-anchors`, which needs no build and
@@ -392,6 +484,26 @@ four damage what is sent, and five remove a check or a rule (the ALPN failure,
 the `supported_versions` check, the no-common-scheme refusal, the plaintext-alert
 rule, the identity choice).
 
+**Resumption is in the population, in both roles.** This library's server
+issues tickets under a key the example program draws, and a first `s_client`
+saves its session (`-sess_out`) for a second connection to offer (`-sess_in`).
+This library's client keeps what an `s_server` sends and offers it on a second
+connection. Every suite, every group, a HelloRetryRequest (the ticket is looked
+at twice, once in each hello) and ALPN are each a case that must resume, with
+the evidence from the other stack (`Reused, TLSv1.3` and the PSK in its
+ClientHello and ServerHello; or the server's session-cache hits). Six cases
+must not resume and must still complete in full, with the ticket offered
+and refused: a server whose key changed, one whose key kept its bytes and took
+a new name, a server clock a hundred seconds ahead, an ALPN protocol not
+offered again, a connection with no server name, and a client whose second
+server is a different process. A planted binder (computed wrongly by the
+client, or read over the wrong transcript by the server) breaks every
+resumption; a removed age window, name match, ALPN match or key-name check
+breaks the case that depends on it, and so does a client that takes the PSK for
+granted when the server did not select it. (A ticket under a key the server no
+longer has is refused by the lookup and by the AEAD alike, so no one plant
+breaks that case; `tools/controls.sh` plants the unit tests.)
+
 A refusal is judged on **this side's own result**, not on a string: the case
 says which alert the library sent (or was sent), and a different alert, or the
 right alert for the wrong reason, fails. A full run has a floor on the cases that
@@ -404,7 +516,9 @@ with a requested KeyUpdate (OpenSSL reports the update it was answered with).
 
 What this library compares of a secret is the `Finished` (`gsec_equal`, in
 `gtls_finished_check`, for both roles: a server checks the client's with the
-same function) and the AEAD tag, which `security` compares itself. The review:
+same function), a PSK binder (`gtls_binder_check`, the same shape: a MAC under a key
+derived from the PSK, compared with `gsec_equal`; the `check-ct` gate runs it
+beside `Finished`) and the AEAD tag, which `security` compares itself. The review:
 `tools/check-secret.py` forbids `memcmp` and kin under `src/`; the padding scan
 in `gtls_record_open` runs only on a record that has already authenticated, so
 what it learns an attacker chose nothing of; the ALPN and SNI comparisons are of
@@ -418,7 +532,12 @@ covers here. The tag comparison is `security`'s, with its own gate there.
 ## Not here
 
 Client authentication and `CertificateRequest` (the server never sends one);
-TLS 1.2; resumption and tickets (a client parses and discards a
-NewSessionTicket; a server sends none; a server ignores a PSK or early-data offer and does the full handshake); accepting early data; DTLS; revocation in the
-handshake; the `http` adapter. `GTLS_ContextConfig` already has room for TLS
-1.2, a PSK and a client certificate.
+TLS 1.2; early data (an offer is not accepted and its records are skipped; a
+ticket never permits it; `max_early_data` is kept in a session for when it
+does); `psk_ke` without ECDHE; external PSKs; a server-side ticket or session
+cache and revocation of tickets (the way to refuse one is to retire its key);
+replay protection (a ticket may be used again until it expires, as RFC 8446
+section 8 says of a server with no cache, which is why early data is not
+here); DTLS; revocation in the handshake; the `http` adapter.
+`GTLS_ContextConfig` already has room for TLS 1.2, an external PSK and a client
+certificate.

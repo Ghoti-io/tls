@@ -131,6 +131,74 @@ early-skip-only-mismatch	src/client/stream.c	if (result == GTLS_ERR_MISMATCH \&\
 early-skip-header-type	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	!c->early_skip	testPsk
 early-skip-seq-advance	src/client/stream.c	(void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	c->sec.rd.seq++;\n      (void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	testPsk
 early-skip-pending-fragment	src/client/stream.c	and early data is not that. */\n    return gtls_conn_unexpected(c);	and early data is not that. */\n    (void)0;	testPsk
+binder-check	src/server/server.c	result = gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	result = GTLS_OK; (void)gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	testResume
+binder-compare	src/schedule/schedule.c	return same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same);	return GTLS_OK;	testTicket
+binder-length	src/schedule/schedule.c	if (got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	if (0) {\n    return GTLS_ERR_MISMATCH;	testResume
+binder-transcript	src/server/server.c	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc, th);	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc - 1u, th);	testResume
+ticket-aead	src/session/ticket.c	if (opened != GSEC_OK) {	if (0) {	testTicket
+ticket-key-name	src/session/ticket.c	gsec_equal(keys[i].name, ticket, GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {	1) {	testTicket
+ticket-key-expiry	src/session/ticket.c	if (now < keys[i].not_after \&\&	if (1 \&\&	testTicket
+ticket-sealing-newest	src/session/ticket.c	(best == NULL \|\| keys[i].not_before > best->not_before)	(best == NULL)	testTicket
+ticket-sealing-window	src/session/ticket.c	if (keys[i].not_before <= now \&\& now < keys[i].not_after \&\&	if (now < keys[i].not_after \&\&	testTicket
+ticket-state-version	src/session/ticket.c	if (n < 1u + 2u + 1u \|\| plain[at++] != GTLS_TICKET_STATE_VERSION) {	if (n < 1u + 2u + 1u \|\| (at++, 0)) {	testTicket
+ticket-state-lifetime	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at < t.alpn_len + 1u) {	if (n - at < t.alpn_len + 1u) {	testTicket
+ticket-state-exact	src/session/ticket.c	if (n - at != t.sni_len) {	if (n - at < t.sni_len) {	testTicket
+ticket-fresh-lifetime	src/session/ticket.c	if (elapsed_s >= p->lifetime) {	if (0) {	testTicket
+ticket-fresh-window	src/session/ticket.c	return diff <= (int64_t)window_ms;	return 1;	testTicket
+ticket-fresh-age-add	src/session/ticket.c	client_ms = (int64_t)(uint32_t)(obfuscated_age - p->age_add);	client_ms = (int64_t)obfuscated_age;	testTicket
+ticket-fresh-future	src/session/ticket.c	if (elapsed_s > GTLS_TICKET_AGE_WINDOW_MAX) {	if (0) {	testTicket
+ticket-fresh-lifetime-max	src/session/ticket.c	if (p->lifetime > GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	if (0) {\n    return 0;	testTicket
+resume-sni	src/server/server.c	t.sni_len == o->host.len \&\& names_equal(t.sni, o->host.p, t.sni_len) \&\&	1 \&\&	testResume
+resume-alpn	src/server/server.c	(t.alpn_len == 0 \|\| offered_alpn(o, t.alpn, t.alpn_len));	1;	testResume
+resume-suite-context	src/server/server.c	offered_suite(o, t.suite) \&\& context_suite(x, t.suite) \&\&	offered_suite(o, t.suite) \&\& 1 \&\&	testResume
+resume-suite-offered	src/server/server.c	good = offered_suite(o, t.suite) \&\& context_suite(x, t.suite) \&\&	good = 1 \&\& context_suite(x, t.suite) \&\&	testResume
+resume-fresh	src/server/server.c	gtls_ticket_fresh(\&t, now, en->age, x->ticket_age_window * 1000u) \&\&	1 \&\&	testResume
+resume-dhe	src/server/server.c	if (!o->psk \|\| !o->psk_dhe \|\| x->ticket_key_count == 0) {	if (!o->psk \|\| x->ticket_key_count == 0) {	testResume
+resume-retry-suite	src/server/server.c	if (second \&\& r->active \&\& r->plain.suite != (uint32_t)c->suite) {	if (0) {	testResume
+resume-suite-choice	src/server/server.c	} else if (r->active) {\n    c->suite = (GTLS_Suite)r->plain.suite;	} else if (0) {\n    c->suite = (GTLS_Suite)r->plain.suite;	testResume
+resume-needs-no-scheme	src/server/server.c	if (c->scheme == 0 \&\& !r->active) {	if (c->scheme == 0) {	testResume
+resume-no-certificate	src/server/server.c	if (!resumed) {\n    result = send_authentication	if (1) {\n    result = send_authentication	testResume
+resume-selects-psk	src/server/server.c	sp.psk = resumed;	sp.psk = 0;	testResume
+resume-early-secret	src/server/server.c	result = resumed ? gtls_schedule_early_psk(	result = 0 ? gtls_schedule_early_psk(	testResume
+ticket-resumption-secret-server	src/server/server.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
+ticket-nonce	src/server/server.c	unsigned char nonce = (unsigned char)i;	unsigned char nonce = 0;	testResume
+ticket-count	src/server/server.c	for (i = 0; i < x->ticket_count; i++) {	for (i = 0; i < x->ticket_count + 1u; i++) {	testResume
+ticket-lifetime-sent	src/server/server.c	t.lifetime = p.lifetime;	t.lifetime = 0;	testResume
+ticket-age-add-sent	src/server/server.c	t.age_add = p.age_add;	t.age_add = 0;	testResume
+client-binder	src/client/client.c	result = patch_binder(c, \&empty, \&c->hello);	result = GTLS_OK;	testResume
+client-binder-retry	src/client/client.c	result = patch_binder(c, \&c->sec.transcript, \&h2);	result = GTLS_OK;	testResume
+client-retry-hash	src/client/client.c	if (hash == gtls_suite_hash(c->offer->suite)) {	if (1) {	testResume
+client-age	src/client/client.c	return (uint32_t)(elapsed * 1000u) + s->age_add;	return (uint32_t)(elapsed * 1000u);	testResume
+client-psk-index	src/client/client.c	sh.psk_identity != 0 \|\|	0 \|\|	testResume
+client-psk-hash	src/client/client.c	gtls_suite_hash(sh.suite) != offered_hash(c)	0	testResume
+client-skips-certificate	src/client/client.c	c->state = c->resumed ? GTLS_STATE_WAIT_FIN : GTLS_STATE_WAIT_CERT;	c->state = GTLS_STATE_WAIT_CERT;	testResume
+client-lifetime-zero	src/client/client.c	if (t.lifetime == 0) {	if (0) {	testResume
+client-lifetime-cap	src/client/client.c	s->lifetime = t->lifetime < GTLS_TICKET_LIFETIME_MAX ? t->lifetime : GTLS_TICKET_LIFETIME_MAX;	s->lifetime = t->lifetime;	testResume
+ticket-resumption-secret-client	src/client/client.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
+session-host-length	src/session/session.c	session->host_len != c->host_len \|\|	0 \|\|	testResume
+session-host-name	src/session/session.c	!names_match(session->host, c->host, c->host_len)) {	0) {	testResume
+session-suite-offered	src/session/session.c	if (!offered) {	if (0) {	testResume
+session-not-yet	src/session/session.c	if (unix_time < session->received \|\|	if (0 \|\|	testResume
+session-expiry	src/session/session.c	(uint64_t)unix_time - (uint64_t)session->received >= session->lifetime) {	(uint64_t)unix_time - (uint64_t)session->received > session->lifetime) {	testResume
+session-digest	src/session/session.c	if (gsec_equal(digest, p + at + ticket_len, GSEC_SHA256_DIGEST_LEN) != GSEC_OK) {	if (0) {	testTicket
+session-version	src/session/session.c	if (p[0] != SESSION_VERSION) {	if (0) {	testTicket
+session-ticket-limit	src/session/session.c	if (ticket_len > l.max_ticket_bytes) {	if (0) {	testTicket
+session-psk-size	src/session/session.c	psk_len != gtls_hash_len(hash) \|\| host_len == 0 \|\|	host_len == 0 \|\|	testTicket
+session-lifetime	src/session/session.c	r32(p + 3) > GTLS_TICKET_LIFETIME_MAX	0	testTicket
+session-length-exact	src/session/session.c	if (len - at != ticket_len + GSEC_SHA256_DIGEST_LEN) {	if (len - at < ticket_len + GSEC_SHA256_DIGEST_LEN) {	testTicket
+session-blob-bound	src/session/session.c	(size_t)l.max_ticket_bytes + GSEC_SHA256_DIGEST_LEN) {	(size_t)l.max_ticket_bytes + GSEC_SHA256_DIGEST_LEN + 1000000u) {	testTicket
+context-ticket-window	src/client/context.c	config->ticket_keys[i].not_after <= config->ticket_keys[i].not_before	0	testTicket
+context-ticket-duplicate	src/client/context.c	GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {	GTLS_TICKET_KEY_NAME_LEN) != GSEC_OK) {	testTicket
+context-ticket-lifetime	src/client/context.c	config->ticket_lifetime > GTLS_TICKET_LIFETIME_MAX \|\|	0 \|\|	testTicket
+context-ticket-window-max	src/client/context.c	config->ticket_age_window > GTLS_TICKET_AGE_WINDOW_MAX) {	0) {	testTicket
+context-ticket-count	src/client/context.c	if (config->ticket_count > c->limits.max_tickets) {	if (0) {	testTicket
+context-ticket-fit	src/client/context.c	if (config->ticket_key_count != 0 \&\& c->limits.max_ticket_bytes < GTLS_TICKET_MAX) {	if (0) {	testTicket
+context-ticket-keys-max	src/client/context.c	config->ticket_key_count > GTLS_TICKET_KEYS_MAX \|\|	0 \|\|	testTicket
+context-ticket-client	src/client/context.c	if (config->role == GTLS_ROLE_CLIENT \&\&\n      (config->ticket_keys != NULL	if (0 \&\&\n      (config->ticket_keys != NULL	testTicket
+stream-ticket-flush	src/client/stream.c	if (type == GTLS_HS_KEY_UPDATE) {\n      if (c->ku_queued > 0) {	if (1) {\n      if (c->ku_queued > 0) {	testResume
+resumption-label	src/schedule/schedule.c	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumption", nonce,	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumptiox", nonce,	testTicket
+binder-label	src/schedule/schedule.c	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binder", empty,	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binderx", empty,	testTicket
+res-master-label	src/schedule/schedule.c	return gtls_derive_secret(s->hash, s->master, s->hlen, "res master",	return gtls_derive_secret(s->hash, s->master, s->hlen, "res masterx",	testTicket
 PLANTS
 }
 

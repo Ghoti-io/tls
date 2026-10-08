@@ -25,7 +25,18 @@ A population, not a sample: one case per suite, group, signature scheme,
 ALPN selection, HelloRetryRequest, key update and compatibility setting, in
 each direction, and a set of cases that must be refused (an old version, no
 common scheme, a name that does not match, no ALPN overlap). A refusal is
-counted in the denominator with the reason it was given. Differences
+counted in the denominator with the reason it was given.
+
+Resumption is in the population in both roles. This library's server issues
+tickets and a first `s_client` saves its session (-sess_out); a second connection
+offers it (-sess_in) and must reuse it. This library's client keeps the tickets
+an `s_server` sends and offers one on a second connection, which the server
+must reuse. Each suite, each group and a HelloRetryRequest, and ALPN; and the
+cases in which the second connection must NOT be resumed and must still
+complete (a server whose key changed, a clock too far from the client's, an
+ALPN protocol not offered again, a server that is a different process) count
+in the denominator as full handshakes, with the evidence that the ticket was
+offered and not taken. Differences
 between the two stacks that are not defects are declared in DIFFERENCES: a
 disagreement that is not declared fails the run, and a declared one that no
 longer happens fails it too.
@@ -57,8 +68,8 @@ IMAGE = os.environ.get("GHOTI_TLS_ORACLE_IMAGE",
                        "localhost/ghoti-certificate-oracle-openssl:3.5.7")
 PIN = "OpenSSL 3.5.7"
 CASE_TIMEOUT = 40
-POPULATION_FLOOR = 69   # cases a full run must have run
-PASS_FLOOR = 60          # and how many of them must have interoperated
+POPULATION_FLOOR = 93   # cases a full run must have run
+PASS_FLOOR = 84          # and how many of them must have interoperated
 
 KINDS = {
     "ed": "ed.example.com",
@@ -93,7 +104,9 @@ class Case:
                  server_name=None, expect="ok", refusal=None, declared=None,
                  no_anchor=False, theirs_sigalgs=None, ours_sigalgs=None,
                  our_alert=None, peer_alert=None, theirs_extra=(), ours_extra=(),
-                 theirs_has=(), identities=None, resume=None, theirs_lacks=(), psk_count=1):
+                 theirs_has=(), identities=None, resume=None, theirs_lacks=(), psk_count=1,
+                 resumption=None, expect_resumed=True, advance=0, second_alpn=None, second_name=None,
+                 rekey=False, new_server=False, rename=False, unplanted=None):
         self.role = role              # "client": our client, their s_server; "server": the reverse
         self.name = "%s/%s" % (role, name)
         self.kind = kind
@@ -133,6 +146,22 @@ class Case:
         # ClientHello, and the second one after a HelloRetryRequest when OpenSSL
         # keeps the PSK in it. A ServerHello that selected one would add a message.
         self.psk_count = psk_count
+        # A real resumption (see the docstring): "yes" when the second
+        # connection must reuse the first's ticket, "no" when it must be a full
+        # handshake that still completes, with how the ticket is made not to
+        # qualify: a key that changed (rekey), a server clock `advance` seconds
+        # ahead, a server that is another process (new-server, client role),
+        # an ALPN list for the second connection (second_alpn), a name for it
+        # (second_name).
+        self.resumption = resumption
+        self.expect_resumed = expect_resumed
+        self.advance = advance
+        self.second_alpn = second_alpn
+        self.second_name = second_name
+        self.rekey = rekey
+        self.new_server = new_server
+        self.rename = rename            # the server's key keeps its bytes and takes a new name
+        self.unplanted = unplanted      # why no interop plant can break this case, if none can
 
 
 def population():
@@ -221,6 +250,31 @@ def population():
                       theirs_has=["extension_type=psk(41)", "extension_type=early_data",
                                   "Early data was rejected"] + full,
                       theirs_lacks=["Reused, TLSv1.3"]))
+    # Resumption, in both roles: the second connection reuses the first's ticket.
+    for role in ("client", "server"):
+        for s in SUITES:
+            cases.append(Case(role, "resume-suite-%s" % s, suite=s, resumption="yes"))
+        for g in GROUPS:
+            cases.append(Case(role, "resume-group-%s" % g, group=g, resumption="yes"))
+        cases.append(Case(role, "resume-retry-p256", group="p256", groups=["x25519", "p256"], retried=1,
+                          resumption="yes"))
+        cases.append(Case(role, "resume-retry-p384-aes256", group="p384", groups=["x25519", "p384"], suite="aes256",
+                          retried=1, resumption="yes"))
+        cases.append(Case(role, "resume-alpn", alpn_ours=["h2", "http/1.1"], alpn_theirs=["h2", "http/1.1"],
+                          expect_alpn="h2", resumption="yes"))
+    # ... and where it must not, and the handshake must still complete in full.
+    cases.append(Case("server", "resume-refused-rekey", resumption="no", expect_resumed=False, rekey=True,
+                      unplanted="a ticket under a key the server no longer has is refused by the key lookup and "
+                                "by the AEAD alike, so removing either leaves the other; tools/controls.sh plants "
+                                "the unit tests"))
+    cases.append(Case("server", "resume-refused-key-name", resumption="no", expect_resumed=False, rename=True))
+    cases.append(Case("server", "resume-refused-clock", resumption="no", expect_resumed=False, advance=100))
+    cases.append(Case("server", "resume-refused-alpn", resumption="no", expect_resumed=False,
+                      alpn_ours=["h2", "http/1.1"], alpn_theirs=["h2", "http/1.1"], second_alpn=["http/1.1"],
+                      expect_alpn="http/1.1"))
+    cases.append(Case("server", "resume-refused-name", resumption="no", expect_resumed=False, second_name=""))
+    cases.append(Case("client", "resume-refused-new-server", resumption="no", expect_resumed=False,
+                      new_server=True))
     return cases
 
 
@@ -318,11 +372,17 @@ class Outcome:
         self.ours_text = ours_text   # what this library's side printed
 
 
-def parse_ours(text):
-    m = re.search(r"ok suite=([0-9a-f]{4}) group=([0-9a-f]{4}) alpn=(\S*) retried=(\d)", text)
-    if not m:
+def parse_ours(text, which=0):
+    """The result line of the connection `which` (0 the first, -1 the last)."""
+    found = re.findall(r"ok suite=([0-9a-f]{4}) group=([0-9a-f]{4}) alpn=(\S*) retried=(\d)"
+                       r"(?: resumed=(\d) sessions=(\d+) offered=(\d))?", text)
+    if not found:
         return None
-    return {"suite": m.group(1), "group": m.group(2), "alpn": m.group(3), "retried": int(m.group(4))}
+    m = found[which]
+    out = {"suite": m[0], "group": m[1], "alpn": m[2], "retried": int(m[3])}
+    if m[4] != "":
+        out.update({"resumed": int(m[4]), "sessions": int(m[5]), "offered": int(m[6])})
+    return out
 
 
 def group_matches(theirs_text, group):
@@ -373,7 +433,46 @@ def check_negotiated(case, ours, theirs_text, errors):
             errors.append("OpenSSL did not report a %s signature" % want)
 
 
+def check_resumption(case, outcome, errors):
+    """The second connection was resumed, or was a full handshake, as the case says; both stacks agree."""
+    want = 1 if case.expect_resumed else 0
+    first, second = getattr(outcome, "first", None), outcome.ours
+    if first is None or second is None or "resumed" not in second or "resumed" not in first:
+        errors.append("our side printed no resumption result")
+        return
+    if first["resumed"] != 0:
+        errors.append("the first connection says it was resumed")
+    if second["resumed"] != want:
+        errors.append("the second connection resumed=%d, wanted %d" % (second["resumed"], want))
+    if case.role == "client":
+        if second["offered"] != 1:
+            errors.append("our client did not offer the session")
+        hits = [int(x) for x in re.findall(r"^\s*(\d+) session cache hits", outcome.theirs, re.M)]
+        # A HelloRetryRequest makes the server look at the ticket twice, once in each ClientHello.
+        wanted = want * (1 + case.retried)
+        if sum(hits) != wanted:
+            errors.append("OpenSSL's s_server counts %d session cache hits, wanted %d" % (sum(hits), wanted))
+        if first["sessions"] < 1:
+            errors.append("our client was sent no ticket")
+    else:
+        if first["sessions"] != 0:
+            errors.append("a server holds no sessions")
+        psks = outcome.theirs.count("extension_type=psk(41)")
+        word = "Reused, TLSv1.3" if want else "New, TLSv1.3"
+        other = "New, TLSv1.3" if want else "Reused, TLSv1.3"
+        if word not in outcome.theirs or other in outcome.theirs:
+            errors.append("s_client did not say %r on the second connection" % word)
+        if "New, TLSv1.3" not in getattr(outcome, "theirs_first", ""):
+            errors.append("s_client did not say New on the first connection")
+        if want and psks < 2:
+            errors.append("the PSK was in %d messages of s_client's trace, wanted the ClientHello and the ServerHello" % psks)
+        if not want and psks != 1:
+            errors.append("the PSK was in %d messages of s_client's trace, wanted the ClientHello alone (offered, not taken)" % psks)
+
+
 def run_case(case, echo, pems, tmp):
+    if case.resumption:
+        return run_resume_case(case, echo, pems, tmp)
     port = free_port()
     name = container_name()
     mount = "%s:/pki:ro,z" % pems
@@ -499,6 +598,155 @@ def run_case(case, echo, pems, tmp):
                    None, theirs, out + err)
 
 
+def theirs_flags(case, alpn):
+    """The options both OpenSSL programs take for the suite, group and ALPN of a case."""
+    f = []
+    if case.suite:
+        f += ["-ciphersuites", SUITES[case.suite][0]]
+    return f, (["-alpn", ",".join(alpn)] if alpn else [])
+
+
+def run_resume_case(case, echo, pems, tmp):
+    """Two connections, the second offering the first's ticket (see the docstring)."""
+    port = free_port()
+    mount = "%s:/pki:ro,z" % pems
+    suite_flags, _ = theirs_flags(case, None)
+    now = str(int(time.time()))
+    if case.role == "client":
+        def server(naccept, out):
+            name = container_name()
+            srv = ["openssl", "s_server", "-accept", "127.0.0.1:%d" % port, "-cert", "/pki/%s-leaf.pem" % case.kind,
+                   "-key", "/pki/%s-key.pem" % case.kind, "-naccept", str(naccept), "-rev"] + suite_flags
+            if case.group:
+                srv += ["-groups", GROUPS[case.group][0]]
+            if case.alpn_theirs:
+                srv += ["-alpn", ",".join(case.alpn_theirs)]
+            cmd = [ENGINE, "run", "--rm", "--name", name, "--network", "host", "-v", mount, IMAGE] + srv
+            with open(out, "w") as to:
+                return subprocess.Popen(cmd, stdout=to, stderr=subprocess.STDOUT), name
+        outs = [os.path.join(tmp, "theirs1.out"), os.path.join(tmp, "theirs2.out")]
+        names = []
+        procs = []
+        ours = None
+        try:
+            proc, name = server(1 if case.new_server else 2, outs[0])
+            procs.append(proc)
+            names.append(name)
+            if not wait_listening(port, proc):
+                return Outcome(False, "OpenSSL s_server did not start listening")
+            gate = os.path.join(tmp, "gate")
+            ours_cmd = [echo, "client", "--message", "hello", "--expect", "olleh", "--server-name", case.server_name,
+                        "--time", now, "--ca", os.path.join(PKI, case.kind + "-ca.der"), "--resume"]
+            if case.new_server:
+                ours_cmd += ["--gate", gate]
+            ours_cmd += echo_args(case, "client", port) + ["127.0.0.1", str(port)]
+            ours_proc = subprocess.Popen(ours_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if case.new_server:
+                # The first server has had its one connection; another process, with ticket keys of its own, takes the next.
+                try:
+                    proc.wait(timeout=CASE_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    pass
+                proc2, name2 = server(1, outs[1])
+                procs.append(proc2)
+                names.append(name2)
+                if not wait_listening(port, proc2):
+                    return Outcome(False, "the second OpenSSL s_server did not start listening")
+                open(gate, "w").close()
+            try:
+                out, err = ours_proc.communicate(timeout=CASE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                ours_proc.kill()
+                out, err = ours_proc.communicate()
+                err += "\n(our client was still waiting)"
+            for pr in procs:
+                try:
+                    pr.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            for n in names:
+                subprocess.run([ENGINE, "rm", "-f", n], capture_output=True)
+            for pr in procs:
+                try:
+                    pr.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pr.kill()
+        theirs = "".join(open(o).read() for o in outs if os.path.exists(o))
+        ours_text = out + err
+        if ours_proc.returncode != 0:
+            return Outcome(False, ours_text.replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300],
+                           None, theirs, ours_text)
+        o = Outcome(True, "", parse_ours(out, -1), theirs, ours_text)
+        o.first = parse_ours(out, 0)
+        return o
+
+    # OpenSSL dials twice; this library serves both.
+    with open(os.path.join(tmp, "early.txt"), "w") as f:
+        f.write("")
+    ours_cmd = [echo, "server", "--time", now, "--tickets", "1", "--connections", "2"]
+    if case.rekey:
+        ours_cmd += ["--rekey"]
+    if case.rename:
+        ours_cmd += ["--rename"]
+    if case.advance:
+        ours_cmd += ["--advance", str(case.advance)]
+    ours_cmd += ["--chain", os.path.join(PKI, case.kind + "-leaf.der"),
+                 "--key", os.path.join(PKI, case.kind + "-leaf.pkcs8"), "--name", KINDS[case.kind]]
+    ours_cmd += echo_args(case, "server", port) + [str(port)]
+    ours_proc = subprocess.Popen(ours_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    names = []
+    results = []
+    try:
+        if not wait_listening(port, ours_proc):
+            out, err = ours_proc.communicate(timeout=5) if ours_proc.poll() is not None else ("", "")
+            return Outcome(False, "our server did not start listening: " + (out + err).replace("\n", " "))
+        for n in (1, 2):
+            name = container_name()
+            names.append(name)
+            alpn = case.alpn_theirs if n == 1 or case.second_alpn is None else case.second_alpn
+            cli = ["openssl", "s_client", "-connect", "127.0.0.1:%d" % port, "-CAfile", "/pki/%s-ca.pem" % case.kind,
+                   "-verify_return_error", "-no_ign_eof", "-tls1_3"] + suite_flags
+            if n == 2 and case.second_name == "":
+                cli += ["-noservername"]
+            else:
+                cli += ["-servername", case.second_name if (n == 2 and case.second_name) else case.server_name]
+            if case.group and not case.groups:
+                cli += ["-groups", GROUPS[case.group][0]]
+            elif case.groups:
+                cli += ["-groups", ":".join(GROUPS[g][0] for g in case.groups)]
+            if alpn:
+                cli += ["-alpn", ",".join(alpn)]
+            cli += ["-sess_out", "/work/sess.pem"] if n == 1 else ["-sess_in", "/work/sess.pem", "-trace"]
+            sh = "(printf 'hello\\n'; sleep 0.4; sleep 1.4) | %s 2>&1" % " ".join(shell_quote(x) for x in
+                 [ENGINE, "run", "-i", "--rm", "--name", name, "--network", "host", "-v", mount,
+                  "-v", "%s:/work:z" % tmp, IMAGE] + cli)
+            r = subprocess.run(["sh", "-c", sh], capture_output=True, text=True, timeout=CASE_TIMEOUT)
+            results.append(r.stdout)
+        try:
+            out, err = ours_proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            ours_proc.kill()
+            out, err = ours_proc.communicate()
+            err += "\n(our server was still waiting)"
+    finally:
+        for n in names:
+            subprocess.run([ENGINE, "rm", "-f", n], capture_output=True)
+        if ours_proc.poll() is None:
+            ours_proc.kill()
+    theirs = results[1] if len(results) == 2 else ""
+    if ours_proc.returncode != 0 or len(results) != 2:
+        return Outcome(False, (out + err).replace("\n", " ").strip() + " | openssl: " + theirs.replace("\n", " ")[:300],
+                       None, theirs, out + err)
+    if "hello" not in results[0] or "hello" not in theirs:
+        return Outcome(False, "the echo did not come back to s_client: " + theirs.replace("\n", " ")[:300],
+                       parse_ours(out, -1), theirs, out + err)
+    o = Outcome(True, "", parse_ours(out, -1), theirs, out + err)
+    o.first = parse_ours(out, 0)
+    o.theirs_first = results[0]
+    return o
+
+
 def get_session(case, pems, tmp):
     """A session ticket for s_client to offer: one connection to an OpenSSL
     s_server that issues tickets (and takes early data), saved with -sess_out.
@@ -564,6 +812,8 @@ def judge(case, outcome):
         return "fail", outcome.detail[:400]
     errors = []
     check_negotiated(case, outcome.ours, outcome.theirs, errors)
+    if case.resumption:
+        check_resumption(case, outcome, errors)
     for text in case.theirs_has:
         if text not in outcome.theirs:
             errors.append("OpenSSL's output does not contain %r" % text)
@@ -636,14 +886,50 @@ PLANTS = {
                        ["server/early-data-fallback", "server/early-data-fallback-retry",
                        "server/early-data-fallback-refresh"]),
     "psk-refused": ("src/server/server.c",
-                    "result = gtls_msg_parse_ch_psk_offer(e, &c->limits, &identities);",
-                    "result = GTLS_ERR_UNSUPPORTED; (void)identities;",
+                    "result = gtls_msg_parse_ch_psk_offer(e, &c->limits, &o->psk_offer);",
+                    "result = GTLS_ERR_UNSUPPORTED; (void)o->psk_offer;",
                     ["server/psk-ticket-fallback", "server/early-data-fallback",
                      "server/early-data-fallback-refresh"]),
     "retry-skip-ends": ("src/client/stream.c",
                         "if (c->early_skip && epoch == GTLS_EPOCH_INITIAL && type == GTLS_CT_APPLICATION_DATA) {",
                         "if (0) {",
                         ["server/early-data-fallback-retry"]),
+    # Resumption. A binder that is wrong breaks every resumption the other
+    # stack makes or takes. The checks that make a ticket pass over are
+    # shown by the refusals: a ticket the clock has aged, the name or the ALPN
+    # protocol changed, or the key renamed (the same bytes under a new name).
+    # A client that took the PSK for granted breaks on a server that did not.
+    "resume-binder-transcript": ("src/server/server.c",
+                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc, th);",
+                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc - 1u, th);",
+                                 ["server/resume-suite-aes128", "server/resume-suite-aes256", "server/resume-suite-chacha",
+                                  "server/resume-group-x25519", "server/resume-group-p256", "server/resume-group-p384",
+                                  "server/resume-retry-p256", "server/resume-retry-p384-aes256", "server/resume-alpn"]),
+    "resume-client-binder": ("src/client/client.c",
+                             "result = patch_binder(c, &empty, &c->hello);", "result = GTLS_OK;",
+                             ["client/resume-suite-aes128", "client/resume-suite-aes256", "client/resume-suite-chacha",
+                              "client/resume-group-x25519", "client/resume-group-p256", "client/resume-group-p384",
+                              "client/resume-alpn"]),
+    "resume-client-binder-retry": ("src/client/client.c",
+                                   "result = patch_binder(c, &c->sec.transcript, &h2);", "result = GTLS_OK;",
+                                   ["client/resume-retry-p256", "client/resume-retry-p384-aes256"]),
+    "resume-age-window": ("src/server/server.c",
+                          "gtls_ticket_fresh(&t, now, en->age, x->ticket_age_window * 1000u) &&", "1 &&",
+                          ["server/resume-refused-clock"]),
+    "resume-sni": ("src/server/server.c",
+                   "t.sni_len == o->host.len && names_equal(t.sni, o->host.p, t.sni_len) &&", "1 &&",
+                   ["server/resume-refused-name"]),
+    "resume-key-name": ("src/session/ticket.c",
+                        "gsec_equal(keys[i].name, ticket, GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {", "1) {",
+                        ["server/resume-refused-key-name"]),
+    "resume-client-assumes": ("src/client/client.c",
+                              "if ((sh.flags & GTLS_SH_FLAG_PSK) != 0) {", "if (c->offer != NULL) {",
+                              ["client/resume-refused-new-server"]),
+    "resume-alpn": ("src/server/server.c",
+                    "(t.alpn_len == 0 || offered_alpn(o, t.alpn, t.alpn_len));", "1;",
+                    ["server/resume-refused-alpn"]),
+    "resume-selected": ("src/server/server.c", "sp.psk = resumed;", "sp.psk = 0;",
+                        ["server/resume-suite-aes128", "server/resume-group-p256", "server/resume-retry-p256"]),
     "sni-selection": ("src/server/server.c",
                       "if (name_rank(&x->identities[i], o->host.p, o->host.len) != rank) {",
                       "if (0) {",
@@ -661,7 +947,10 @@ def plant_coverage_problems(cases):
     for c in cases:
         if c.resume and c.name not in broken:
             problems.append("%s offers a ticket but no plant is required to break it" % c.name)
-    for need in ("psk-refused", "early-skip-off"):
+        if c.resumption and c.name not in broken and not c.unplanted:
+            problems.append("%s resumes (or must refuse to) but no plant is required to break it" % c.name)
+    for need in ("psk-refused", "early-skip-off", "resume-binder-transcript", "resume-client-binder",
+                 "resume-age-window", "resume-sni", "resume-alpn", "resume-key-name", "resume-client-assumes"):
         if need not in PLANTS:
             problems.append("the plant %s, which cuts this library's PSK path, is gone" % need)
     try:

@@ -309,11 +309,13 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
       gcu_allocator_free(allocator, c);
       return GTLS_ERR_LIMIT; /* a ticket it seals could be refused by the very caps it was given */
     }
-    if (config->ticket_key_count != 0) {
+    /* The count was checked above; the copy does not rely on it. */
+    c->ticket_key_count = config->ticket_key_count < GTLS_TICKET_KEYS_MAX
+        ? config->ticket_key_count : GTLS_TICKET_KEYS_MAX;
+    if (c->ticket_key_count != 0) {
       memcpy(c->ticket_keys, config->ticket_keys,
-          config->ticket_key_count * sizeof config->ticket_keys[0]);
+          c->ticket_key_count * sizeof config->ticket_keys[0]);
     }
-    c->ticket_key_count = config->ticket_key_count;
     c->ticket_count = config->ticket_count;
     c->ticket_lifetime = config->ticket_lifetime != 0 ? config->ticket_lifetime
                                                       : GTLS_TICKET_LIFETIME_DEFAULT;
