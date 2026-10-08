@@ -164,7 +164,7 @@ sanitizer matrix.
 adapter; mutual authentication and revocation in the handshake; TLS 1.2;
 session tickets and resumption, then early data; QUIC hardening and DTLS.
 Nothing here has run on macOS, and Windows only under wine
-(`tools/xwin/tls.sh`; `TODO(windows)` in the Makefile). A server never asks for
+(`suite/tools/xwin/tls.sh`; `TODO(windows)` in the Makefile). A server never asks for
 a client certificate, and a client that is asked (`CertificateRequest`) is
 refused with `GTLS_ERR_UNSUPPORTED`.
 
