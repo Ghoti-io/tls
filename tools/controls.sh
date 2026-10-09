@@ -33,10 +33,10 @@
 # The result of each plant is one of: caught (the test fails with the check
 # removed), SURVIVED (it passes), or ERROR (the baseline fails, the text does
 # not apply exactly once, the planted copy does not build, the test runs for
-# more than $CONTROLS_TIMEOUT seconds (600 by default), it dies of a signal, or
+# more than $CONTROLS_TIMEOUT seconds (600 by default), it dies of a signal outside a matching test, or
 # it exits non-zero without any gtest test reporting FAILED, or only one outside
 # the plant's filter does: a broken scratch tree must not be credited with a
-# catch, so a hang or a crash is an ERROR, never a failed test). A caught plant
+# catch, so a hang is an ERROR, never a failed test; a crash is a catch only when the last test gtest announced with [ RUN ] never reported and it matches the plant's filter or expect, and is printed as caught by crash in that test). A caught plant
 # prints the test that caught it. The exit status is non-zero for
 # any SURVIVED or ERROR, and the last line says how many of each and how long
 # it took. CONTROLS_VERBOSE=N prints the first N failure lines of each caught plant.
@@ -463,7 +463,7 @@ run_test() {
     return $?
   fi
   (cd "$scratch/tree" && LD_LIBRARY_PATH="$bindir:$PREFIX/lib/ghoti.io" \
-      timeout "$limit" "$bindir/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
+      timeout "$limit" "$bindir/$1" ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
 }
 
 # Apply a plant to the scratch copy: exactly one match, or an error.
@@ -499,7 +499,24 @@ text = open(path, errors="replace").read()
 if rc == 124:
     print("error timed out (a hang is not a failed test)")
 elif rc >= 128:
-    print("error killed by signal %d (a crash is not a failed test)" % (rc - 128))
+    # A crash is a catch only when it is attributable: the last test gtest
+    # announced ([ RUN ]) never reported OK or FAILED, so the binary died in
+    # it, and it matches the plant's filter (or expect). Unplanted, the whole
+    # run passed, so that test passes without the plant.
+    running = None
+    for line in text.splitlines():
+        m = re.match(r"\[ RUN      \] (\S+)", line)
+        if m:
+            running = m.group(1)
+        elif running and re.match(r"\[       OK \] %s[ $]|\[  FAILED  \] %s[ $,]" % (re.escape(running), re.escape(running)), line + " "):
+            running = None
+    want = [f for f in flt.split("-")[0].split(":") if f] if flt else []
+    if running is None:
+        print("error killed by signal %d with no test running (a crash is not a failed test)" % (rc - 128))
+    elif want and not any(fnmatch.fnmatchcase(running, w) for w in want):
+        print("error killed by signal %d in %s, outside the filter '%s'" % (rc - 128, running, flt))
+    else:
+        print("caught by crash in %s (signal %d)" % (running, rc - 128))
 elif mode == "valgrind":
     m = re.findall(r"ERROR SUMMARY: (\d+) errors", text)
     if m and int(m[-1]) > 0:
@@ -540,8 +557,18 @@ classify_selftest() {
   check "caught Records.OpenWipes" 1 "Records.Open*" "" "$f"
   check "caught Records.OpenWipes" 1 "Other.*:Records.Open*" "" "$f"
   check "error only tests outside" 1 "Other.*" "" "$f"
-  check "error killed by signal 11" 139 "" "" "$f"
-  check "error killed by signal 9" 137 "" "" "$f"
+  check "error killed by signal 11 with no test running" 139 "" "" "$f"
+  check "error killed by signal 9 with no test running" 137 "" "" "$f"
+  c='[ RUN      ] Records.A
+[       OK ] Records.A (1 ms)
+[ RUN      ] Records.OpenWipes'
+  check "caught by crash in Records.OpenWipes" 139 "" "" "$c"
+  check "caught by crash in Records.OpenWipes" 134 "Records.Open*" "" "$c"
+  check "error killed by signal 11 in Records.OpenWipes, outside" 139 "Other.*" "" "$c"
+  check "error killed by signal 11 with no test running" 139 "" "" "[ RUN      ] Records.A
+[       OK ] Records.A (1 ms)"
+  check "error killed by signal 11 with no test running" 139 "" "" "[ RUN      ] Records.A
+[  FAILED  ] Records.A (1 ms)"
   check "error timed out" 124 "" "" "$f"
   check "error exit 1 with no gtest" 1 "" "" "error while loading shared libraries"
   check "error exit 1 with no gtest" 1 "" "" "[  PASSED  ] 4 tests."
