@@ -636,6 +636,28 @@ granted when the server did not select it. (A ticket under a key the server no
 longer has is refused by the lookup and by the AEAD alike, so no one plant
 breaks that case; `tools/controls.sh` plants the unit tests.)
 
+**Early data is in the population, in both roles** (25 cases; the population is
+118, of which 109 interoperate and 9 are refused for their declared reasons).
+The second connection of a resumption sends bytes ahead of the server's answer:
+accepted for every suite and group, with ALPN and in compatibility mode; refused
+by a HelloRetryRequest, by a replay (the third connection offers the first's
+ticket again; this library's server refuses it through its in-memory store, and
+OpenSSL's cache has already had the ticket so its server does not even resume),
+by a callback that says no, by another ALPN protocol than the ticket's, and by a
+clock or a key that took the ticket out. The evidence is OpenSSL's own (`Early
+data was accepted` / `rejected` from `s_client`; the early data an `s_server`
+received, and the client's next line arriving under the application keys, which
+only happens if it verified a Finished that covers `EndOfEarlyData`) beside
+what each end reports (the status, the bytes delivered or handed back and sent
+again, how often the replay decision was asked). `s_server` will not take early
+data with `-rev`, so these cases print what arrives and the example client does
+not wait for an echo. OpenSSL's server does not insist that `EndOfEarlyData` be
+sent, so the interop plants break it by leaving the message out of the
+transcript the Finished covers; six plants in all (a server that never accepts,
+never asks the callback, does not tie the ALPN protocol, does not wait for the
+message; a client that leaves it out of the transcript or keeps `early_data` in
+the retry's second hello).
+
 A refusal is judged on **this side's own result**, not on a string: the case
 says which alert the library sent (or was sent), and a different alert, or the
 right alert for the wrong reason, fails. A full run has a floor on the cases that

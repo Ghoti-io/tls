@@ -578,7 +578,7 @@ check-interop: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Run the OpenSSL inter
 	@LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION)
 
 interop-plants: $(APP_DIR)/examples/echo$(EXE_EXTENSION) ## Plant a defect, one at a time, and require the interop cases to fail
-	@status=0; for p in record-nonce key-update-label server-cv-label client-finished alpn-failure supported-versions no-common-scheme plaintext-alert-rule sni-selection early-skip-off psk-refused retry-skip-ends resume-binder-transcript resume-client-binder resume-client-binder-retry resume-age-window resume-sni resume-alpn resume-key-name resume-client-assumes resume-selected early-server-never-accepts early-server-ignores-callback early-server-alpn-tie early-server-eoed-not-awaited early-client-eoed-not-sent early-client-retry-keeps-early; do \
+	@status=0; for p in record-nonce key-update-label server-cv-label client-finished alpn-failure supported-versions no-common-scheme plaintext-alert-rule sni-selection early-skip-off psk-refused retry-skip-ends resume-binder-transcript resume-client-binder resume-client-binder-retry resume-age-window resume-sni resume-alpn resume-key-name resume-client-assumes resume-selected early-server-never-accepts early-server-ignores-callback early-server-alpn-tie early-server-eoed-not-awaited early-client-eoed-not-in-transcript early-client-retry-keeps-early; do \
 		LD_LIBRARY_PATH="$(TEST_LD_PATH)" PREFIX="$(PREFIX)" python3 tools/oracle/interop.py --echo $(APP_DIR)/examples/echo$(EXE_EXTENSION) --plant $$p || status=1; \
 	done; exit $$status
 

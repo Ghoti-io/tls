@@ -584,6 +584,12 @@ def check_early(case, outcome, errors):
                           % (theirs.count("Early data was rejected"), rejected))
         if text.strip() not in theirs:
             errors.append("OpenSSL's s_server never printed the text that was sent")
+        # The line the client sends after the handshake arrives under the application keys, so it is
+        # printed only if OpenSSL verified the client's Finished (it covers EndOfEarlyData).
+        said = theirs.splitlines().count("hello")
+        if said != len(every):
+            errors.append("OpenSSL's s_server received the client's line %d times, wanted %d (a Finished it "
+                          "did not accept ends the connection before it)" % (said, len(every)))
     else:
         for k, got in enumerate(every):
             if k == 0:
@@ -1090,8 +1096,9 @@ PLANTS = {
                         ["server/resume-suite-aes128", "server/resume-group-p256", "server/resume-retry-p256"]),
     # Early data. A server that never accepts, or never asks the caller, or
     # does not tie the ALPN protocol to the ticket's, or does not wait for
-    # EndOfEarlyData; a client that does not send it, or that keeps early_data
-    # in the second hello of a retry. (OpenSSL's server never resumes a ticket
+    # EndOfEarlyData; a client that leaves it out of the transcript (OpenSSL's
+    # server does not insist that it be sent, so a plant that only drops it breaks
+    # no case), or that keeps early_data in the second hello of a retry. (OpenSSL's server never resumes a ticket
     # it has already seen early data offered with, so a client's "resumed, and
     # early data refused" has no case here; the unit tests have it.)
     "early-server-never-accepts": ("src/server/server.c", "  return verdict == 1;\n}",
@@ -1111,9 +1118,9 @@ PLANTS = {
                                       "  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;",
                                       ["server/early-suite-aes128", "server/early-group-p256", "server/early-alpn",
                                        "server/early-compat"]),
-    "early-client-eoed-not-sent": ("src/client/client.c",
-                                   "  if (result == GTLS_OK && c->early_status == GTLS_EARLY_ACCEPTED) {\n    GTLS_Buf eoed;",
-                                   "  if (0) {\n    GTLS_Buf eoed;",
+    "early-client-eoed-not-in-transcript": ("src/client/client.c",
+                                   "      result = gtls_transcript_update(&c->sec.transcript, eoed.data, eoed.len);",
+                                   "      result = GTLS_OK;",
                                    ["client/early-suite-aes128", "client/early-suite-aes256", "client/early-suite-chacha",
                                     "client/early-group-x25519", "client/early-group-p256", "client/early-group-p384",
                                     "client/early-alpn", "client/early-compat", "client/early-replay"]),
@@ -1141,7 +1148,7 @@ def plant_coverage_problems(cases):
         if c.resumption and c.name not in broken and not c.unplanted:
             problems.append("%s resumes (or must refuse to) but no plant is required to break it" % c.name)
     for need in ("early-server-never-accepts", "early-server-ignores-callback", "early-server-alpn-tie",
-                 "early-server-eoed-not-awaited", "early-client-eoed-not-sent", "early-client-retry-keeps-early",
+                 "early-server-eoed-not-awaited", "early-client-eoed-not-in-transcript", "early-client-retry-keeps-early",
                  "psk-refused", "early-skip-off", "resume-binder-transcript", "resume-client-binder",
                  "resume-age-window", "resume-sni", "resume-alpn", "resume-key-name", "resume-client-assumes"):
         if need not in PLANTS:
