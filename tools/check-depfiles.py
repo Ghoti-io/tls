@@ -73,10 +73,25 @@ for target, recipe in rules:
             "%s/%%.o writes depfiles and no -include reads them (looked for "
             "%s)" % (target, want[0]))
 
+# The fuzz harnesses are C++ files compiled and linked in one step by a rule
+# the Makefile expands once per harness. They include fuzz_common.h and the
+# headers in tests/, which no prerequisite names, so without -MMD a changed
+# header leaves a stale fuzzer behind (found 2026-10-09: fuzz_common.h was
+# edited and the binaries were removed by hand).
+harness = re.search(r"^\$\$\(FUZZ_APP_DIR\)/\$1:[^\n]*\n((?:\t[^\n]*\n)+)", text, re.M)
+if not harness:
+    problems.append("no fuzz harness rule found, so nothing tracks fuzz_common.h")
+else:
+    if "-MMD" not in harness.group(1) or "-MF" not in harness.group(1):
+        problems.append("the fuzz harness rule does not pass -MMD with -MF, so a "
+                        "changed header does not rebuild a fuzzer")
+    if not re.search(r"^-include \$\(FUZZ_HARNESS_DEPFILES\)", text, re.M):
+        problems.append("the fuzz harness depfiles are never included")
+
 if problems:
     for problem in problems:
         print("check-depfiles: %s" % problem, file=sys.stderr)
     sys.exit(1)
 
-print("check-depfiles: %d object trees pass -MMD, and every one has its "
-      "depfiles included" % len(rules))
+print("check-depfiles: %d object trees and the fuzz harnesses pass -MMD, and every "
+      "one has its depfiles included" % len(rules))

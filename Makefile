@@ -881,8 +881,12 @@ FUZZ_OBJECTS := $(patsubst src/%.c,$(FUZZ_OBJ_DIR)/%.o,$(SOURCES))
 FUZZ_CORPUS := tests/fuzz/corpus
 FUZZ_TIME ?= 60
 
+# The harnesses include tests/fuzz/fuzz_common.h and tests/*.h, which no rule
+# below names; their depfiles are what make a changed header rebuild them.
 FUZZ_DEPFILES := $(patsubst src/%.c,$(FUZZ_OBJ_DIR)/%.d,$(SOURCES))
 -include $(FUZZ_DEPFILES)
+FUZZ_HARNESS_DEPFILES := $(patsubst tests/fuzz/%.cpp,$(FUZZ_APP_DIR)/%.d,$(wildcard tests/fuzz/fuzz_*.cpp))
+-include $(FUZZ_HARNESS_DEPFILES)
 
 $(FUZZ_OBJ_DIR)/%.o: src/%.c $(FUZZ_FLAGS_STAMP) | $(LIBVER_GEN)
 	@mkdir -p $(@D)
@@ -899,6 +903,7 @@ $$(FUZZ_APP_DIR)/$1: tests/fuzz/$1.cpp $$(FUZZ_OBJECTS) $$(FUZZ_FLAGS_STAMP) | $
 	fi
 	@mkdir -p $$(@D) $$(FUZZ_CORPUS)/$2
 	$$(FUZZ_CXX) $$(FUZZ_BIN_FLAGS) -std=c++20 -w $$(INCLUDE) -DGTLS_TEST_DATA=\"$$(TEST_DATA)\" \
+		-MMD -MP -MT $$@ -MF $$(FUZZ_APP_DIR)/$1.d \
 		-o $$@ $$< $$(FUZZ_OBJECTS) $(DEP_LIBS)
 
 fuzz-run-$2: $$(FUZZ_APP_DIR)/$1 ## Run the $2 fuzzer for $$(FUZZ_TIME) seconds
@@ -1052,5 +1057,5 @@ $(CT_FLAGS_STAMP): force-flags
 
 $(FUZZ_FLAGS_STAMP): force-flags
 	@mkdir -p $(@D)
-	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(INCLUDE) $(TEST_DATA) $(DEP_LIBS)' > $@.new
+	@printf '%s\n' '$(FUZZ_CC) $(FUZZ_CXX) $(FUZZ_SAN) $(FUZZ_LIB_FLAGS) $(FUZZ_BIN_FLAGS) $(FUZZ_APP_DIR) $(INCLUDE) $(TEST_DATA) $(DEP_LIBS)' > $@.new
 	@cmp -s $@.new $@ 2>/dev/null && rm -f $@.new || mv -f $@.new $@
