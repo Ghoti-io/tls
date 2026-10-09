@@ -151,7 +151,7 @@ typedef struct GTLS_ContextConfig {
    * @{ */
   const GTLS_TicketKey * ticket_keys; ///< The keyring, copied. The newest key valid at the time seals; every unexpired one opens. NULL with a count of 0: no tickets.
   size_t ticket_key_count;        ///< Length of @p ticket_keys: at most ::GTLS_TICKET_KEYS_MAX, names distinct.
-  unsigned ticket_count;          ///< NewSessionTicket messages sent after each handshake (the default of 1 is set by ::gtls_context_config_default; 0 disables them). At most ::GTLS_Limits::max_tickets.
+  unsigned ticket_count;          ///< NewSessionTicket messages sent after each handshake (the default of 1 is set by ::gtls_context_config_default; 0 disables them). At most ::GTLS_Limits::max_tickets and ::GTLS_TICKET_COUNT_MAX.
   uint32_t ticket_lifetime;       ///< Seconds a ticket is good for, sent to the client. 0: ::GTLS_TICKET_LIFETIME_DEFAULT. At most ::GTLS_TICKET_LIFETIME_MAX.
   uint32_t ticket_age_window;     ///< Seconds the age a client reports may differ from the server's own. 0: ::GTLS_TICKET_AGE_WINDOW_DEFAULT. At most ::GTLS_TICKET_AGE_WINDOW_MAX.
   /** @} */
@@ -191,7 +191,8 @@ GTLS_API void gtls_context_config_default(GTLS_ContextConfig * config);
  *   than TLS 1.3; ::GTLS_ERR_LIMIT for an ALPN list that does not fit in the
  *   extension, a chain too large to send within ::GTLS_Limits::max_output_bytes,
  *   or a ticket key list with ::GTLS_Limits::max_ticket_bytes too small for
- *   the largest ticket this library seals;
+ *   the largest ticket this library seals, or a ticket count above
+ *   ::GTLS_TICKET_COUNT_MAX (the ticket nonce is one byte);
  *   ::GTLS_ERR_OOM.
  */
 GTLS_API GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,

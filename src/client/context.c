@@ -301,6 +301,10 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   c->middlebox_compat = config->middlebox_compat != 0;
   gtls_limits_resolve(config->limits, &c->limits);
   if (config->role == GTLS_ROLE_SERVER) {
+    if (config->ticket_count > GTLS_TICKET_COUNT_MAX) {
+      gcu_allocator_free(allocator, c);
+      return GTLS_ERR_LIMIT; /* the nonce that tells the tickets apart is one byte */
+    }
     if (config->ticket_count > c->limits.max_tickets) {
       gcu_allocator_free(allocator, c);
       return GTLS_ERR_INVALID;

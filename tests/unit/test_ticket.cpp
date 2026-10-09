@@ -412,7 +412,9 @@ TEST(PskOfferParser, EveryIdentityAndBinderIsReturnedAndTheCountsAreChecked) {
   }
   l = limits();
   l.max_ticket_bytes = 3;
-  EXPECT_EQ(gtls_msg_parse_ch_psk_offer(&e, &l, &o), GTLS_ERR_LIMIT);
+  ASSERT_EQ(gtls_msg_parse_ch_psk_offer(&e, &l, &o), GTLS_OK)
+      << "an identity longer than the ticket limit is returned: the server passes it over";
+  EXPECT_EQ(o.count, 3u);
 }
 
 TEST(PskOfferParser, MoreIdentitiesThanAreKeptAreCountedAndNotLookedAt) {
@@ -812,6 +814,268 @@ TEST(Ticket, AStateTheSealerWouldNotHaveWrittenIsNotOpened) {
   }
 }
 
+namespace {
+
+/** The state the sealer writes for @p suite with a PSK of the hash's length, @p alpn and @p sni. */
+Bytes state_of(uint32_t suite, const std::string & alpn, const std::string & sni,
+    uint32_t lifetime = 3600) {
+  const size_t hlen = gtls_hash_len(gtls_suite_hash(suite));
+  Bytes b = {1, static_cast<unsigned char>(suite >> 8), static_cast<unsigned char>(suite),
+      static_cast<unsigned char>(hlen)};
+  for (size_t i = 0; i < hlen; i++) {
+    b.push_back(static_cast<unsigned char>(0x40 + i));
+  }
+  for (int i = 0; i < 4; i++) b.push_back(static_cast<unsigned char>(0x10 + i));      /* age_add */
+  for (int i = 0; i < 8; i++) b.push_back(i < 4 ? 0 : static_cast<unsigned char>(0x20 + i)); /* issued */
+  b.push_back(static_cast<unsigned char>(lifetime >> 24));
+  b.push_back(static_cast<unsigned char>(lifetime >> 16));
+  b.push_back(static_cast<unsigned char>(lifetime >> 8));
+  b.push_back(static_cast<unsigned char>(lifetime));
+  b.push_back(static_cast<unsigned char>(alpn.size()));
+  b.insert(b.end(), alpn.begin(), alpn.end());
+  b.push_back(static_cast<unsigned char>(sni.size()));
+  b.insert(b.end(), sni.begin(), sni.end());
+  return b;
+}
+
+/** A ticket as a program with the key would write it: any state at all, sealed with the real key. */
+Bytes forge(const GTLS_TicketKey & key, const Bytes & state, unsigned nonce_seed = 3) {
+  static const char label[] = "ghoti.io tls ticket v1";
+  Bytes ticket(key.name, key.name + 16);
+  const Bytes nonce = nonce12(nonce_seed);
+  ticket.insert(ticket.end(), nonce.begin(), nonce.end());
+  Bytes aad(label, label + sizeof label - 1);
+  aad.insert(aad.end(), key.name, key.name + 16);
+  aad.insert(aad.end(), nonce.begin(), nonce.end());
+  Bytes ct(state.size() == 0 ? 1 : state.size());
+  Bytes tag(16);
+  EXPECT_EQ(gsec_aes_gcm_encrypt(key.key, 32, nonce.data(), 12, aad.data(), aad.size(),
+                state.data(), state.size(), ct.data(), tag.data(), 16), GSEC_OK);
+  ticket.insert(ticket.end(), ct.begin(), ct.begin() + static_cast<long>(state.size()));
+  ticket.insert(ticket.end(), tag.begin(), tag.end());
+  return ticket;
+}
+
+GTLS_Result open_bytes(const GTLS_TicketKey & key, const Bytes & ticket, int64_t now = 500) {
+  GTLS_TicketPlain back;
+  /* An exact-size heap copy, so that a read past the end is something a memory checker sees. */
+  std::unique_ptr<unsigned char[]> copy(new unsigned char[ticket.size() == 0 ? 1 : ticket.size()]);
+  std::memcpy(copy.get(), ticket.data(), ticket.size());
+  return gtls_ticket_open(&key, 1, now, copy.get(), ticket.size(), &back);
+}
+
+}  // namespace
+
+TEST(Ticket, TheAeadsReturnAnErrorAndZeroTheirOutputOnABadTag) {
+  /* The ticket's own tag check has no plant that can be seen to fail: with the check
+   * removed, the plaintext that security wipes on a failed tag decodes as version 0
+   * and is refused anyway. So the check rests on that behaviour of security, and this
+   * test pins it, for each of the three AEADs the library uses (the ticket is
+   * AES-256-GCM; the records are these three). If security stops wiping, this fails
+   * before a forged ticket's plaintext can be read. */
+  const Bytes key(32, 0x42);
+  const Bytes nonce(12, 0x24);
+  const Bytes aad = {1, 2, 3, 4};
+  const Bytes pt(100, 0x5a);
+
+  for (int which = 0; which < 3; which++) {
+    const size_t key_len = which == 0 ? 16 : 32;   /* AES-128, AES-256, ChaCha20 */
+    Bytes ct(pt.size());
+    Bytes tag(16);
+    if (which < 2) {
+      ASSERT_EQ(gsec_aes_gcm_encrypt(key.data(), key_len, nonce.data(), 12, aad.data(), aad.size(),
+                    pt.data(), pt.size(), ct.data(), tag.data(), 16), GSEC_OK);
+    } else {
+      ASSERT_EQ(gsec_chacha20_poly1305_encrypt(key.data(), nonce.data(), aad.data(), aad.size(),
+                    pt.data(), pt.size(), ct.data(), tag.data()), GSEC_OK);
+    }
+    auto open = [&](const Bytes & c, const Bytes & t, Bytes & out) {
+      out.assign(pt.size(), 0xaa);
+      return which < 2
+          ? gsec_aes_gcm_decrypt(key.data(), key_len, nonce.data(), 12, aad.data(), aad.size(),
+                c.data(), c.size(), out.data(), t.data(), 16)
+          : gsec_chacha20_poly1305_decrypt(key.data(), nonce.data(), aad.data(), aad.size(),
+                c.data(), c.size(), out.data(), t.data());
+    };
+    Bytes out;
+    ASSERT_EQ(open(ct, tag, out), GSEC_OK) << which;
+    EXPECT_EQ(out, pt);
+    for (size_t i = 0; i < tag.size(); i++) {
+      Bytes bad = tag;
+      bad[i] ^= 0x01;
+      EXPECT_EQ(open(ct, bad, out), GSEC_ERR_MISMATCH) << which << ":" << i;
+      EXPECT_EQ(out, Bytes(pt.size(), 0)) << "the plaintext of a failed tag is wiped: " << which << ":" << i;
+    }
+    Bytes bad_ct = ct;
+    bad_ct[0] ^= 0x80;
+    EXPECT_EQ(open(bad_ct, tag, out), GSEC_ERR_MISMATCH) << which;
+    EXPECT_EQ(out, Bytes(pt.size(), 0)) << which;
+  }
+}
+
+TEST(Ticket, TheLengthBoundsAreExactAndALongTicketIsRefusedBeforeItIsRead) {
+  const GTLS_TicketKey key = key_named(1, 100, 1000);
+
+  /* The shortest ticket the sealer writes (SHA-256, no ALPN, no name) opens... */
+  {
+    GTLS_TicketPlain p = plain_for(0x1301);
+    p.alpn_len = 0;
+    p.sni_len = 0;
+    unsigned char ticket[GTLS_TICKET_MAX];
+    size_t n = 0;
+    GTLS_TicketPlain back;
+    ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+    ASSERT_EQ(n, GTLS_TICKET_MIN);
+    EXPECT_EQ(gtls_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the minimum";
+  }
+  /* ... and the longest (SHA-384, both strings at 255) does too, and is exactly the maximum. */
+  {
+    GTLS_TicketPlain p = plain_for(0x1302);
+    p.alpn_len = 255;
+    p.sni_len = 255;
+    unsigned char ticket[GTLS_TICKET_MAX];
+    size_t n = 0;
+    GTLS_TicketPlain back;
+    ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+    ASSERT_EQ(n, GTLS_TICKET_MAX);
+    EXPECT_EQ(gtls_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the maximum";
+  }
+  /* One byte either side, authentic and sealed with the real key, and the same at every length from nothing. */
+  const Bytes shortest = state_of(0x1301, "", "");
+  ASSERT_EQ(shortest.size() + 44, GTLS_TICKET_MIN);
+  EXPECT_EQ(open_bytes(key, forge(key, shortest)), GTLS_OK);
+  EXPECT_EQ(open_bytes(key, forge(key, Bytes(shortest.begin(), shortest.end() - 1))), GTLS_ERR_MISMATCH)
+      << "one below the minimum";
+  Bytes longest = state_of(0x1302, std::string(255, 'a'), std::string(255, 'b'));
+  ASSERT_EQ(longest.size() + 44, GTLS_TICKET_MAX);
+  EXPECT_EQ(open_bytes(key, forge(key, longest)), GTLS_OK);
+  longest.push_back(0);
+  EXPECT_EQ(open_bytes(key, forge(key, longest)), GTLS_ERR_MISMATCH) << "one above the maximum";
+  Bytes ticket = forge(key, Bytes(2000, 0x41));
+  for (size_t n = 0; n < GTLS_TICKET_MIN; n++) {
+    ASSERT_EQ(open_bytes(key, Bytes(ticket.begin(), ticket.begin() + static_cast<long>(n))), GTLS_ERR_MISMATCH)
+        << "a ticket of " << n << " bytes";
+  }
+  /* A ticket far past the maximum, led by a real key name, would be decrypted into a buffer
+   * the size of the largest state if the length were not looked at first. */
+  for (size_t extra : {static_cast<size_t>(1), static_cast<size_t>(100), static_cast<size_t>(5000),
+           static_cast<size_t>(65000)}) {
+    Bytes big = forge(key, Bytes(extra + GTLS_TICKET_MAX, 0x41));
+    EXPECT_EQ(open_bytes(key, big), GTLS_ERR_MISMATCH) << extra;
+  }
+}
+
+TEST(Ticket, AnAuthenticStateThatEndsTooSoonOrClaimsTooMuchIsRefusedAtEveryLength) {
+  /* Sealed by the real key, so only the decode stands between these and the caller. Every
+   * prefix of a good state, and every value of the PSK, ALPN and name lengths. A check
+   * that stops a read past the end of the state changes no result (a later check catches
+   * it), so tools/controls.sh plants these three under Valgrind. */
+  const GTLS_TicketKey key = key_named(1, 100, 1000);
+
+  for (uint32_t suite : {0x1301u, 0x1302u}) {
+    const Bytes good = state_of(suite, "h2", "example.test");
+    ASSERT_EQ(open_bytes(key, forge(key, good)), GTLS_OK);
+    for (size_t n = 0; n < good.size(); n++) {
+      ASSERT_EQ(open_bytes(key, forge(key, Bytes(good.begin(), good.begin() + static_cast<long>(n)))),
+          GTLS_ERR_MISMATCH) << "the first " << n << " bytes, suite " << suite;
+    }
+    const size_t hlen = gtls_hash_len(gtls_suite_hash(suite));
+    for (unsigned v = 0; v < 256; v++) {
+      Bytes b = good;
+      b[3] = static_cast<unsigned char>(v);   /* psk_len */
+      ASSERT_EQ(open_bytes(key, forge(key, b)), v == hlen ? GTLS_OK : GTLS_ERR_MISMATCH)
+          << "psk_len " << v << " suite " << suite;
+    }
+    /* A PSK of the other hash's length, with the bytes to match, so only its length is wrong. */
+    {
+      const size_t other = hlen == 32 ? 48 : 32;
+      Bytes b = good;
+      b[3] = static_cast<unsigned char>(other);
+      b.erase(b.begin() + 4, b.begin() + 4 + static_cast<long>(hlen));
+      b.insert(b.begin() + 4, other, 0x77);
+      EXPECT_EQ(open_bytes(key, forge(key, b)), GTLS_ERR_MISMATCH) << "a PSK that is the other hash's size";
+    }
+    const size_t alpn_at = 4 + hlen + 4 + 8 + 4;
+    for (unsigned v = 0; v < 256; v++) {
+      Bytes b = good;
+      b[alpn_at] = static_cast<unsigned char>(v);
+      ASSERT_EQ(open_bytes(key, forge(key, b)), v == 2 ? GTLS_OK : GTLS_ERR_MISMATCH)
+          << "alpn_len " << v << " suite " << suite;
+    }
+    const size_t sni_at = alpn_at + 1 + 2;
+    for (unsigned v = 0; v < 256; v++) {
+      Bytes b = good;
+      b[sni_at] = static_cast<unsigned char>(v);
+      ASSERT_EQ(open_bytes(key, forge(key, b)), v == 12 ? GTLS_OK : GTLS_ERR_MISMATCH)
+          << "sni_len " << v << " suite " << suite;
+    }
+  }
+  /* A state of the longest kind whose ALPN length overruns by exactly the one byte its own length needs. */
+  {
+    Bytes b = state_of(0x1301, "", "");
+    b[4 + 32 + 4 + 8 + 4] = 1;   /* one ALPN byte claimed; only the name's length byte follows */
+    EXPECT_EQ(open_bytes(key, forge(key, b)), GTLS_ERR_MISMATCH);
+  }
+}
+
+TEST(Ticket, TheLifetimeCapIsExactInTheStateAndInTheFreshnessCheck) {
+  const GTLS_TicketKey key = key_named(1, 100, 1000);
+  EXPECT_EQ(open_bytes(key, forge(key, state_of(0x1301, "h2", "example.test", GTLS_TICKET_LIFETIME_MAX))), GTLS_OK)
+      << "exactly seven days";
+  EXPECT_EQ(open_bytes(key, forge(key, state_of(0x1301, "h2", "example.test", GTLS_TICKET_LIFETIME_MAX + 1))),
+      GTLS_ERR_MISMATCH);
+
+  GTLS_TicketPlain p = plain_for(0x1301);
+  p.issued = 1000;
+  p.age_add = 77;
+  p.lifetime = GTLS_TICKET_LIFETIME_MAX;
+  EXPECT_TRUE(gtls_ticket_fresh(&p, 1000, p.age_add, 10000)) << "a lifetime of exactly seven days is good";
+  EXPECT_TRUE(gtls_ticket_fresh(&p, 1000 + GTLS_TICKET_LIFETIME_MAX - 1,
+      p.age_add + (GTLS_TICKET_LIFETIME_MAX - 1) * 1000u, 10000)) << "to the last second";
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 1000 + GTLS_TICKET_LIFETIME_MAX,
+      p.age_add + GTLS_TICKET_LIFETIME_MAX * 1000u, 10000));
+  p.lifetime = GTLS_TICKET_LIFETIME_MAX + 1;
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 1000, p.age_add, 10000));
+}
+
+TEST(Ticket, ATicketFromTheFutureIsForgivenExactlyTheWindowsWorthAndItsSignMatters) {
+  GTLS_TicketPlain p = plain_for(0x1301);
+  p.age_add = 5000;
+  p.lifetime = 3600;
+  const uint32_t most_ms = GTLS_TICKET_AGE_WINDOW_MAX * 1000u;
+
+  /* Issued exactly the largest forgiven distance ahead, the client saying 0 ms. */
+  p.issued = 100000 + GTLS_TICKET_AGE_WINDOW_MAX;
+  EXPECT_TRUE(gtls_ticket_fresh(&p, 100000, p.age_add, most_ms)) << "exactly 86400 s ahead";
+  p.issued = 100000 + GTLS_TICKET_AGE_WINDOW_MAX + 1;
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 100000, p.age_add, most_ms)) << "one second more";
+
+  /* A client age that is not zero: the server's age is minus five seconds, the client's is two. */
+  p.issued = 100005;
+  const uint32_t obf = p.age_add + 2000u;
+  EXPECT_TRUE(gtls_ticket_fresh(&p, 100000, obf, 7000)) << "|2000 - (-5000)| = 7000";
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 100000, obf, 6999));
+  /* Twelve seconds old to the client, five ahead to the server: seventeen apart. Were the
+   * server's age taken as plus five, they would be seven apart and this would be good. */
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 100000, p.age_add + 12000u, 7000));
+  EXPECT_TRUE(gtls_ticket_fresh(&p, 100000, p.age_add + 12000u, 17000));
+  EXPECT_FALSE(gtls_ticket_fresh(&p, 100000, p.age_add + 12000u, 16999));
+}
+
+TEST(Ticket, TheSealingKeyBeginsExactlyAtItsNotBefore) {
+  const GTLS_TicketKey a = key_named(1, 100, 1000);
+  const GTLS_TicketKey b = key_named(2, 200, 2000);
+  const GTLS_TicketKey both[] = {a, b};
+  const GTLS_TicketKey only_b[] = {b};
+
+  EXPECT_EQ(gtls_ticket_sealing_key(both, 2, 199), &both[0]);
+  EXPECT_EQ(gtls_ticket_sealing_key(both, 2, 200), &both[1]) << "the second it begins";
+  EXPECT_EQ(gtls_ticket_sealing_key(only_b, 1, 199), nullptr);
+  EXPECT_EQ(gtls_ticket_sealing_key(only_b, 1, 200), &only_b[0]);
+  EXPECT_EQ(gtls_ticket_sealing_key(only_b, 1, 1999), &only_b[0]);
+  EXPECT_EQ(gtls_ticket_sealing_key(only_b, 1, 2000), nullptr);
+}
+
 TEST(Ticket, TheAdditionalDataBindsTheLabelTheNameAndTheNonce) {
   /* The same state sealed with no additional data does not open. */
   const GTLS_TicketKey keys[] = {key_named(1, 100, 1000)};
@@ -987,6 +1251,192 @@ TEST(SessionBlob, AValidDigestOverAnImpossibleSessionIsStillRefused) {
   gtls_session_free(s);
 }
 
+namespace {
+
+/** @p body with its SHA-256 appended, in a buffer of exactly that size (for a memory checker). */
+Bytes signed_blob(const Bytes & body) {
+  Bytes b = body;
+  b.resize(body.size() + 32);
+  EXPECT_EQ(gsec_sha256(body.data(), body.size(), b.data() + body.size()), GSEC_OK);
+  return b;
+}
+
+GTLS_Result parse_exact(const Bytes & blob, const GTLS_Limits * l = nullptr, GTLS_Session ** keep = nullptr) {
+  std::unique_ptr<unsigned char[]> copy(new unsigned char[blob.size() == 0 ? 1 : blob.size()]);
+  std::memcpy(copy.get(), blob.data(), blob.size());
+  GTLS_Session * out = nullptr;
+  GTLS_Result r = gtls_session_parse(nullptr, l, copy.get(), blob.size(), &out);
+  if (r == GTLS_OK) {
+    EXPECT_NE(out, nullptr);
+    if (keep != nullptr) {
+      *keep = out;
+    } else {
+      gtls_session_free(out);
+    }
+  } else {
+    EXPECT_EQ(out, nullptr) << "nothing is returned on a refusal";
+  }
+  return r;
+}
+
+}  // namespace
+
+TEST(SessionBlob, EveryPrefixOfAGoodBlobWithAValidDigestIsRefused) {
+  /* The digest is whatever the writer says it is; the structure has to stand on its own. */
+  GTLS_Session * s = make_session(130, 0x1302);
+  const Bytes good = blob_of(s);
+  const Bytes body(good.begin(), good.end() - 32);
+
+  ASSERT_EQ(parse_exact(good), GTLS_OK);
+  for (size_t n = 0; n < body.size(); n++) {
+    const GTLS_Result r = parse_exact(signed_blob(Bytes(body.begin(), body.begin() + static_cast<long>(n))));
+    ASSERT_NE(r, GTLS_OK) << "the first " << n << " bytes";
+  }
+  /* And the blob itself cut at every length, in a buffer of exactly that length. */
+  for (size_t n = 0; n < good.size(); n++) {
+    ASSERT_NE(parse_exact(Bytes(good.begin(), good.begin() + static_cast<long>(n))), GTLS_OK) << n;
+  }
+  gtls_session_free(s);
+}
+
+TEST(SessionBlob, EachLengthAndEachFieldIsCheckedOnItsOwnUnderAValidDigest) {
+  GTLS_Session * s = make_session(130, 0x1302);   /* host 16, ALPN 2, PSK 48 */
+  const Bytes good = blob_of(s);
+  const Bytes body(good.begin(), good.end() - 32);
+  const size_t host_at = 23;   // the fixed prefix: version, suite, three u32, received
+  const size_t alpn_at = host_at + 1 + 16;
+  const size_t psk_at = alpn_at + 1 + 2;
+  const size_t ticket_at = psk_at + 1 + 48;
+
+  /* The three one-byte lengths, over their whole range. */
+  for (unsigned v = 0; v < 256; v++) {
+    for (size_t at : {host_at, alpn_at, psk_at}) {
+      Bytes b = body;
+      b[at] = static_cast<unsigned char>(v);
+      const bool same = (at == host_at && v == 16) || (at == alpn_at && v == 2) || (at == psk_at && v == 48);
+      EXPECT_EQ(parse_exact(signed_blob(b)) == GTLS_OK, same) << "length byte at " << at << " = " << v;
+    }
+  }
+  /* The ticket's length, by the whole 16 bits it has: only the true one parses. */
+  for (unsigned v : {0u, 1u, 129u, 131u, 255u, 256u, 65535u}) {
+    Bytes b = body;
+    b[ticket_at] = static_cast<unsigned char>(v >> 8);
+    b[ticket_at + 1] = static_cast<unsigned char>(v);
+    EXPECT_NE(parse_exact(signed_blob(b)), GTLS_OK) << v;
+  }
+  /* No ticket at all: a blob that would otherwise be good. */
+  {
+    GTLS_Session * none = make_session(0, 0x1302);
+    EXPECT_EQ(parse_exact(blob_of(none)), GTLS_ERR_CORRUPT) << "a session with no ticket offers nothing";
+    gtls_session_free(none);
+  }
+  /* No host: the session is for nobody. */
+  {
+    GTLS_Session * nobody = make_session(130, 0x1302);
+    nobody->host_len = 0;
+    EXPECT_EQ(parse_exact(blob_of(nobody)), GTLS_ERR_CORRUPT);
+    gtls_session_free(nobody);
+  }
+  /* A suite that is none, with the PSK length that "none" has: only the suite is wrong. */
+  {
+    GTLS_Session * odd = make_session(130, 0x1302);
+    odd->suite = 0x1234;
+    odd->psk_len = 0;
+    EXPECT_EQ(parse_exact(blob_of(odd)), GTLS_ERR_CORRUPT) << "an unknown suite with an empty PSK";
+    odd->psk_len = 32;
+    EXPECT_EQ(parse_exact(blob_of(odd)), GTLS_ERR_CORRUPT);
+    gtls_session_free(odd);
+  }
+  /* The suite and the PSK each of the right size for the other's hash. */
+  {
+    GTLS_Session * mixed = make_session(130, 0x1301);
+    mixed->psk_len = 48;
+    EXPECT_EQ(parse_exact(blob_of(mixed)), GTLS_ERR_CORRUPT);
+    gtls_session_free(mixed);
+  }
+  /* The lifetime: the seven days exactly, and one second more. */
+  {
+    GTLS_Session * edge = make_session();
+    edge->lifetime = GTLS_TICKET_LIFETIME_MAX;
+    EXPECT_EQ(parse_exact(blob_of(edge)), GTLS_OK);
+    edge->lifetime = GTLS_TICKET_LIFETIME_MAX + 1;
+    EXPECT_EQ(parse_exact(blob_of(edge)), GTLS_ERR_CORRUPT);
+    gtls_session_free(edge);
+  }
+  gtls_session_free(s);
+}
+
+TEST(SessionBlob, TheLargestBlobALimitAllowsParsesAndOneByteMoreIsALimit) {
+  GTLS_Limits l;
+  gtls_limits_default(&l);
+  l.max_ticket_bytes = 300;
+
+  GTLS_Session * s = make_session(300, 0x1302);
+  s->host_len = 255;
+  std::memset(s->host, 'h', 255);
+  s->alpn_len = 255;
+  std::memset(s->alpn, 'a', 255);
+  const Bytes biggest = blob_of(s);
+  EXPECT_EQ(parse_exact(biggest, &l), GTLS_OK) << "exactly the largest";
+  Bytes more = biggest;
+  more.push_back(0);
+  EXPECT_EQ(parse_exact(more, &l), GTLS_ERR_LIMIT) << "one byte over";
+  Bytes much = biggest;
+  much.insert(much.end(), 100, 0);
+  EXPECT_EQ(parse_exact(much, &l), GTLS_ERR_LIMIT);
+  gtls_session_free(s);
+
+  /* A shorter blob, just under: not a limit. */
+  GTLS_Session * t = make_session(299, 0x1302);
+  t->host_len = 255;
+  std::memset(t->host, 'h', 255);
+  t->alpn_len = 255;
+  std::memset(t->alpn, 'a', 255);
+  EXPECT_EQ(parse_exact(blob_of(t), &l), GTLS_OK);
+  gtls_session_free(t);
+  GTLS_Session * u = make_session(301, 0x1302);
+  EXPECT_EQ(parse_exact(blob_of(u), &l), GTLS_ERR_LIMIT) << "a ticket one byte over its limit";
+  gtls_session_free(u);
+}
+
+TEST(SessionBlob, ATimeThatCannotHaveALifetimeAddedIsRefusedAndExpiresSaturates) {
+  GTLS_Session * s = make_session();
+  s->lifetime = 7200;
+
+  s->received = INT64_MAX - 7200;
+  GTLS_Session * back = nullptr;
+  ASSERT_EQ(parse_exact(blob_of(s), nullptr, &back), GTLS_OK) << "the last received time that fits";
+  GTLS_SessionInfo info;
+  ASSERT_EQ(gtls_session_info(back, &info), GTLS_OK);
+  EXPECT_EQ(info.expires, INT64_MAX);
+  gtls_session_free(back);
+  s->received = INT64_MAX - 7199;
+  EXPECT_EQ(parse_exact(blob_of(s)), GTLS_ERR_CORRUPT) << "one second later, the sum would overflow";
+  s->received = INT64_MAX;
+  EXPECT_EQ(parse_exact(blob_of(s)), GTLS_ERR_CORRUPT);
+  s->lifetime = 0;
+  EXPECT_EQ(parse_exact(blob_of(s)), GTLS_OK) << "a lifetime of nothing adds nothing";
+  s->received = INT64_MIN;
+  s->lifetime = GTLS_TICKET_LIFETIME_MAX;
+  ASSERT_EQ(parse_exact(blob_of(s), nullptr, &back), GTLS_OK) << "a time before the epoch is a time";
+  ASSERT_EQ(gtls_session_info(back, &info), GTLS_OK);
+  EXPECT_EQ(info.expires, INT64_MIN + static_cast<int64_t>(GTLS_TICKET_LIFETIME_MAX));
+  gtls_session_free(back);
+
+  /* A session built by hand can hold what a parse would refuse; asking about it must not overflow. */
+  s->received = INT64_MAX;
+  s->lifetime = 7200;
+  ASSERT_EQ(gtls_session_info(s, &info), GTLS_OK);
+  EXPECT_EQ(info.expires, INT64_MAX) << "saturated, not wrapped";
+  s->received = INT64_MAX - 7200;
+  ASSERT_EQ(gtls_session_info(s, &info), GTLS_OK);
+  EXPECT_EQ(info.expires, INT64_MAX);
+  s->received = INT64_MAX - 7201;
+  ASSERT_EQ(gtls_session_info(s, &info), GTLS_OK);
+  EXPECT_EQ(info.expires, INT64_MAX - 1);
+  gtls_session_free(s);
+}
+
 TEST(SessionBlob, TheLimitOnATicketIsHonouredBeforeAnythingIsAllocated) {
   GTLS_Session * s = make_session(200);
   const Bytes b = blob_of(s);
@@ -1107,6 +1557,25 @@ TEST(TicketConfig, TheKeyringIsCheckedWhenTheContextIsMade) {
   cfg.ticket_count = 16;
   EXPECT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_OK);
   gtls_context_free(ctx);
+
+  /* The ticket nonce is one byte: 255 tickets can be told apart, 256 cannot. */
+  {
+    GTLS_Limits roomy;
+    gtls_limits_default(&roomy);
+    roomy.max_tickets = 1000;
+    fresh();
+    cfg.limits = &roomy;
+    cfg.ticket_count = GTLS_TICKET_COUNT_MAX;
+    EXPECT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_OK) << "255";
+    gtls_context_free(ctx);
+    cfg.ticket_count = GTLS_TICKET_COUNT_MAX + 1;
+    EXPECT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_ERR_LIMIT) << "256";
+    cfg.ticket_count = 100000;
+    EXPECT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_ERR_LIMIT);
+    cfg.limits = nullptr;
+    cfg.ticket_count = GTLS_TICKET_COUNT_MAX + 1;
+    EXPECT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_ERR_LIMIT) << "and under the default limits too";
+  }
 
   /* A ticket must fit the caps the context was given. */
   GTLS_Limits l;

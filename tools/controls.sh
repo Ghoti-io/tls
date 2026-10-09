@@ -26,7 +26,11 @@ set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 
 # name, file, text removed, text put in its place, test binary; tab-separated
-# (a bar is part of the text a plant removes)
+# (a bar is part of the text a plant removes). Two optional fields follow: a
+# gtest filter, and "valgrind" to run the filtered test under Valgrind. The
+# second is for a check whose removal changes no result but lets the code read
+# past the end of its input (a later check refuses what was read), which only a
+# memory checker sees.
 plants() {
   cat <<'PLANTS'
 finished	src/schedule/schedule.c	return same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same);	return GTLS_OK;	testNegative
@@ -101,7 +105,6 @@ psk-last	src/server/server.c	if (ch->exts[ch->ext_count - 1u].type != GTLS_EXT_P
 psk-modes-present	src/server/server.c	if (modes == NULL) {\n      return missing(c);	if (modes == NULL) {\n      return gtls_conn_illegal(c);	testPsk
 psk-offer-parsed	src/server/server.c	result = gtls_msg_parse_ch_psk_offer(e, \&c->limits, \&o->psk_offer);	result = GTLS_OK; (void)o->psk_offer;	testPsk
 psk-count-equal	src/msg/msg.c	if (n_ids != n_binders) {	if (0) {	testPsk
-psk-identity-cap	src/msg/msg.c	identity.len > limits->max_ticket_bytes \|\|	0 \|\|	testPsk
 psk-count-cap	src/msg/msg.c	++n_ids > limits->max_tickets	(++n_ids > limits->max_tickets \&\& 0)	testTicket
 psk-binder-length	src/msg/msg.c	result = gtls_reader_vector(\&binders, 1, 32, 0, \&binder);	result = gtls_reader_vector(\&binders, 1, 0, 0, \&binder);	testPsk
 early-data-empty	src/msg/msg.c	return e->len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;	(void)e->len; return GTLS_OK;	testPsk
@@ -118,7 +121,6 @@ retry-may-refresh-psk	src/server/server.c	a->type == GTLS_EXT_PRE_SHARED_KEY) {	
 psk-count-cap-edge	src/msg/msg.c	++n_ids > limits->max_tickets	++n_ids >= limits->max_tickets	testPsk
 psk-binder-cap	src/msg/msg.c	++n_binders > limits->max_tickets	(++n_binders > limits->max_tickets \&\& 0)	testPsk
 psk-binder-cap-edge	src/msg/msg.c	++n_binders > limits->max_tickets	++n_binders >= limits->max_tickets	testPsk
-psk-identity-cap-edge	src/msg/msg.c	identity.len > limits->max_ticket_bytes \|\|	identity.len >= limits->max_ticket_bytes \|\|	testPsk
 psk-empty-identity	src/msg/msg.c	gtls_reader_vector(\&ids, 2, 1, 0, \&identity)	gtls_reader_vector(\&ids, 2, 0, 0, \&identity)	testPsk
 psk-ids-min-high	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 8, 0, \&ids)	testPsk
 psk-ids-min-zero	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_reader_vector(\&r, 2, 0, 0, \&ids)	testPsk
@@ -197,6 +199,43 @@ stream-ticket-flush	src/client/stream.c	if (type == GTLS_HS_KEY_UPDATE) {\n     
 resumption-label	src/schedule/schedule.c	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumption", nonce,	return gtls_hkdf_expand_label(hash, res_master, hlen, "resumptiox", nonce,	testTicket
 binder-label	src/schedule/schedule.c	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binder", empty,	result = gtls_derive_secret(s->hash, s->early, s->hlen, "res binderx", empty,	testTicket
 res-master-label	src/schedule/schedule.c	return gtls_derive_secret(s->hash, s->master, s->hlen, "res master",	return gtls_derive_secret(s->hash, s->master, s->hlen, "res masterx",	testTicket
+psk-identity-oversize-fallback	src/msg/msg.c	if (++n_ids > limits->max_tickets) {	if (identity.len > limits->max_ticket_bytes \|\| ++n_ids > limits->max_tickets) {	testPsk
+ticket-count-max	src/client/context.c	if (config->ticket_count > GTLS_TICKET_COUNT_MAX) {	if (0) {	testTicket
+ticket-nonce-byte	src/server/server.c	unsigned char nonce = (unsigned char)i;	unsigned char nonce = (unsigned char)(i \& 0x7f);	testResume
+session-expires-saturate	src/session/session.c	info->expires = s->received > INT64_MAX - (int64_t)s->lifetime\n      ? INT64_MAX : s->received + (int64_t)s->lifetime;	info->expires = s->received + (int64_t)s->lifetime;	testTicket
+session-parse-overflow	src/session/session.c	r32(p + 3) > GTLS_TICKET_LIFETIME_MAX \|\|\n      (int64_t)r > INT64_MAX - (int64_t)r32(p + 3)) {	r32(p + 3) > GTLS_TICKET_LIFETIME_MAX \|\|\n      0) {	testTicket
+client-ticket-oversize-discard	src/client/client.c	if (t.ticket_len > c->limits.max_ticket_bytes) {	if (0) {	testNegative
+client-ticket-cap-edge	src/client/client.c	if (t.ticket_len > c->limits.max_ticket_bytes) {	if (t.ticket_len >= c->limits.max_ticket_bytes) {	testNegative
+client-keep-needs-res	src/client/client.c	if (!c->sec.schedule.has_res) {	if (0) {	testResume
+server-issue-needs-res	src/server/server.c	if (!c->sec.schedule.has_res) {	if (0) {	testResume
+server-issue-size	src/server/server.c	if (result == GTLS_OK \&\& ticket_len > c->limits.max_ticket_bytes) {	if (0) {	testResume
+server-issue-size-edge	src/server/server.c	if (result == GTLS_OK \&\& ticket_len > c->limits.max_ticket_bytes) {	if (result == GTLS_OK \&\& ticket_len >= c->limits.max_ticket_bytes) {	testResume
+server-binder-second-hello	src/server/server.c	if (r->active) {\n    result = verify_binder(c, \&o, r, msg);	if (r->active \&\& !second) {\n    result = verify_binder(c, \&o, r, msg);	testResume
+ticket-open-len-min-edge	src/session/ticket.c	len < GTLS_TICKET_MIN \|\|	len <= GTLS_TICKET_MIN \|\|	testTicket
+ticket-open-len-max	src/session/ticket.c	len < GTLS_TICKET_MIN \|\| len > GTLS_TICKET_MAX) {	len < GTLS_TICKET_MIN) {	testTicket
+ticket-open-len-max-edge	src/session/ticket.c	len > GTLS_TICKET_MAX) {	len >= GTLS_TICKET_MAX) {	testTicket
+ticket-state-psk-room	src/session/ticket.c	n - at < t.psk_len + 4u + 8u + 4u + 1u	0	testTicket	Ticket.AnAuthenticStateThatEndsTooSoonOrClaimsTooMuchIsRefusedAtEveryLength	valgrind
+ticket-state-psk-len	src/session/ticket.c	t.psk_len != gtls_hash_len(gtls_suite_hash(t.suite)) \|\|	0 \|\|	testTicket
+ticket-state-lifetime-edge	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at	if (t.lifetime >= GTLS_TICKET_LIFETIME_MAX \|\| n - at	testTicket
+ticket-fresh-lifetime-edge	src/session/ticket.c	if (p->lifetime > GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	if (p->lifetime >= GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	testTicket
+ticket-fresh-future-edge	src/session/ticket.c	if (elapsed_s > GTLS_TICKET_AGE_WINDOW_MAX) {	if (elapsed_s >= GTLS_TICKET_AGE_WINDOW_MAX) {	testTicket
+ticket-fresh-future-sign	src/session/ticket.c	server_ms = -(int64_t)(elapsed_s * 1000u);	server_ms = (int64_t)(elapsed_s * 1000u);	testTicket
+ticket-sealing-not-before-edge	src/session/ticket.c	if (keys[i].not_before <= now \&\& now < keys[i].not_after \&\&	if (keys[i].not_before < now \&\& now < keys[i].not_after \&\&	testTicket
+session-min-length	src/session/session.c	if (len < FIXED_PREFIX + 1u + 1u + 1u + 2u + GSEC_SHA256_DIGEST_LEN) {	if (0) {	testTicket	SessionBlob.EveryPrefixOfAGoodBlobWithAValidDigestIsRefused:SessionBlob.EachLengthAndEachFieldIsCheckedOnItsOwnUnderAValidDigest	valgrind
+session-host-room	src/session/session.c	if (len - at < host_len + 1u) {	if (0) {	testTicket	SessionBlob.EveryPrefixOfAGoodBlobWithAValidDigestIsRefused:SessionBlob.EachLengthAndEachFieldIsCheckedOnItsOwnUnderAValidDigest	valgrind
+session-alpn-room	src/session/session.c	if (len - at < alpn_len + 1u) {	if (0) {	testTicket	SessionBlob.EveryPrefixOfAGoodBlobWithAValidDigestIsRefused:SessionBlob.EachLengthAndEachFieldIsCheckedOnItsOwnUnderAValidDigest	valgrind
+session-psk-room	src/session/session.c	if (len - at < psk_len + 2u) {	if (0) {	testTicket	SessionBlob.EveryPrefixOfAGoodBlobWithAValidDigestIsRefused:SessionBlob.EachLengthAndEachFieldIsCheckedOnItsOwnUnderAValidDigest	valgrind
+session-ticket-empty	src/session/session.c	ticket_len == 0 \|\| r32(p + 3)	r32(p + 3)	testTicket
+session-host-empty	src/session/session.c	host_len == 0 \|\|\n      ticket_len == 0	ticket_len == 0	testTicket
+session-suite-none	src/session/session.c	hash == GTLS_HASH_NONE \|\| psk_len	psk_len	testTicket
+session-lifetime-edge	src/session/session.c	r32(p + 3) > GTLS_TICKET_LIFETIME_MAX \|\|	r32(p + 3) >= GTLS_TICKET_LIFETIME_MAX \|\|	testTicket
+session-blob-bound-edge	src/session/session.c	if (len > FIXED_PREFIX + 1u + 255u	if (len >= FIXED_PREFIX + 1u + 255u	testTicket
+session-name-fold-a	src/session/session.c	if (x >= 'A' \&\& x <= 'Z') {	if (0) {	testResume
+session-name-fold-b	src/session/session.c	if (y >= 'A' \&\& y <= 'Z') {	if (0) {	testResume
+session-name-fold-a-low	src/session/session.c	if (x >= 'A' \&\& x <= 'Z') {	if (x >= '@' \&\& x <= 'Z') {	testResume
+session-name-fold-a-high	src/session/session.c	if (x >= 'A' \&\& x <= 'Z') {	if (x >= 'A' \&\& x <= '[') {	testResume
+session-name-fold-b-low	src/session/session.c	if (y >= 'A' \&\& y <= 'Z') {	if (y >= '@' \&\& y <= 'Z') {	testResume
+session-name-fold-b-high	src/session/session.c	if (y >= 'A' \&\& y <= 'Z') {	if (y >= 'A' \&\& y <= '[') {	testResume
 PLANTS
 }
 
@@ -211,8 +250,14 @@ copy_tree() {
 # stopped using into one), and must not be counted as a test that failed.
 run_test() {
   (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j2 >"$scratch/build.txt" 2>&1) || return 2
+  if [ "${3:-}" = valgrind ]; then
+    (cd "$scratch/tree" && LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
+        valgrind --error-exitcode=1 --track-origins=yes --suppressions=tests/valgrind.supp \
+        "build/linux/release/apps/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
+    return $?
+  fi
   (cd "$scratch/tree" && LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
-      "build/linux/release/apps/$1" --gtest_brief=1 >"$scratch/out.txt" 2>&1)
+      "build/linux/release/apps/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
 }
 
 status=0
@@ -249,12 +294,12 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/gtls-controls.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 want="$*"
 tab=$(printf '\t')
-plants | while IFS="$tab" read -r name file from to test; do
+plants | while IFS="$tab" read -r name file from to test filter mode; do
   if [ -n "$want" ] && ! echo " $want " | grep -q " $name "; then
     continue
   fi
   copy_tree
-  if ! run_test "$test"; then
+  if ! run_test "$test" "$filter" "$mode"; then
     echo "controls: $name: $test fails (or does not build) BEFORE the plant, so nothing was measured" >&2
     tail -5 "$scratch/out.txt" >&2
     echo FAIL >"$scratch/status"
@@ -270,7 +315,7 @@ if s.count(old) != 1:
     sys.exit("expected exactly one match, found %d" % s.count(old))
 open(path, "w").write(s.replace(old, new))
 PY
-  run_test "$test"
+  run_test "$test" "$filter" "$mode"
   case $? in
     0)
       echo "controls: $name: $test still PASSES with the check removed" >&2

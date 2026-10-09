@@ -879,9 +879,9 @@ GTLS_Result gtls_msg_parse_new_session_ticket(const void * body, size_t len,
   if (result != GTLS_OK) {
     return result;
   }
-  if (t.ticket_len > limits->max_ticket_bytes) {
-    return GTLS_ERR_LIMIT;
-  }
+  /* A ticket longer than max_ticket_bytes is not an error here: the message
+   * is well formed, and the client discards the ticket (it points into the
+   * message, so carrying it costs nothing). */
   result = gtls_msg_extensions(&r, limits->max_extensions, exts, &count);
   if (result == GTLS_OK) {
     result = gtls_reader_end(&r);
@@ -1173,7 +1173,12 @@ GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
     if (result != GTLS_OK) {
       return result;
     }
-    if (identity.len > limits->max_ticket_bytes || ++n_ids > limits->max_tickets) {
+    /* An identity longer than max_ticket_bytes is not a ticket this server
+     * sealed (it never seals one that long), so it is not an error: it is
+     * only not ours, and the server falls back to a full handshake. It points
+     * into the message, so it costs nothing to carry. The count of identities
+     * is the cap. */
+    if (++n_ids > limits->max_tickets) {
       return GTLS_ERR_LIMIT;
     }
     if (n_ids <= GTLS_PSK_MAX) {

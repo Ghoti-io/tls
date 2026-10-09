@@ -446,8 +446,9 @@ typedef struct GTLS_PskOffer {
  *
  * @return ::GTLS_ERR_CORRUPT for a list that does not parse or has bytes
  *   left over; ::GTLS_ERR_PROTOCOL when the two lists differ in length;
- *   ::GTLS_ERR_LIMIT for more identities than ::GTLS_Limits::max_tickets or
- *   one longer than ::GTLS_Limits::max_ticket_bytes.
+ *   ::GTLS_ERR_LIMIT for more identities than ::GTLS_Limits::max_tickets.
+ *   An identity longer than ::GTLS_Limits::max_ticket_bytes is returned like
+ *   any other: the server passes it over as not its own.
  */
 GTLS_Result gtls_msg_parse_ch_psk_offer(const GTLS_Ext * e,
     const GTLS_Limits * limits, GTLS_PskOffer * out);

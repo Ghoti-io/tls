@@ -774,12 +774,14 @@ TEST(NewSessionTicket, EarlyDataExtensionCarriesTheMaximum) {
   EXPECT_EQ(gtls_msg_parse_new_session_ticket(bad.data(), bad.size(), &l, &t), GTLS_ERR_CORRUPT);
 }
 
-TEST(NewSessionTicket, TicketCapIsALimitAndAnEmptyTicketIsRefused) {
+TEST(NewSessionTicket, TheParserLeavesTheTicketCapToTheClientAndAnEmptyTicketIsRefused) {
   GTLS_Limits l = limits();
   GTLS_NewSessionTicket t;
   l.max_ticket_bytes = 20;
   Bytes over = ticket_body(0, 21);
-  EXPECT_EQ(gtls_msg_parse_new_session_ticket(over.data(), over.size(), &l, &t), GTLS_ERR_LIMIT);
+  ASSERT_EQ(gtls_msg_parse_new_session_ticket(over.data(), over.size(), &l, &t), GTLS_OK)
+      << "a well formed message; the client decides not to keep it";
+  EXPECT_EQ(t.ticket_len, 21u);
   Bytes at = ticket_body(0, 20);
   EXPECT_EQ(gtls_msg_parse_new_session_ticket(at.data(), at.size(), &l, &t), GTLS_OK);
   Bytes empty = ticket_body(0, 0);

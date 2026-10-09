@@ -300,8 +300,8 @@ inline int msg_one(const uint8_t * data, size_t size) {
     case 4: {
       GTLS_NewSessionTicket t;
       if (gtls_msg_parse_new_session_ticket(body, len, &lim, &t) == GTLS_OK) {
-        if (!inside(t.ticket, t.ticket_len) || !inside(t.nonce, t.nonce_len) ||
-            t.ticket_len > lim.max_ticket_bytes || t.ticket_len == 0) {
+        /* The cap on a ticket is the client's to apply, not the parser's. */
+        if (!inside(t.ticket, t.ticket_len) || !inside(t.nonce, t.nonce_len) || t.ticket_len == 0) {
           die("a ticket view");
         }
       }
@@ -451,7 +451,7 @@ inline int msg_one(const uint8_t * data, size_t size) {
               for (size_t k = 0; k < o.stored; k++) {
                 const GTLS_PskEntry & en = o.entries[k];
                 if (!inside(en.identity, en.identity_len) || en.identity_len == 0 ||
-                    en.identity_len > lim.max_ticket_bytes || !inside(en.binder, en.binder_len) ||
+                    !inside(en.binder, en.binder_len) ||
                     en.binder_len < 32) {
                   die("a PSK entry view");
                 }
@@ -713,7 +713,8 @@ inline void check_end_state(GTLS_Conn * conn) {
 /**
  * The server, fed a stream of records. Input: an options byte, then the raw
  * bytes of the stream. Options: bit 0 picks the HelloRetryRequest trace's
- * ClientHellos and keys, bits 1-3 the feed size, bit 4 a server that wants
+ * ClientHellos and keys, bits 1-2 the feed size, bit 3 a server with two
+ * suites whose connection cannot issue a ticket, bit 4 a server that wants
  * only P-256 (so the RFC's X25519 share is answered with a retry), bit 5
  * has the server act on what it can (write, key update, close) when the
  * handshake completes, bit 6 small limits.
@@ -727,8 +728,13 @@ inline int server_one(const uint8_t * data, size_t size) {
   if (!tr.ok || tr.cert_der.empty()) {
     die("the RFC 8448 vectors could not be read");
   }
-  static const size_t chunks[8] = {0, 1, 2, 3, 5, 16, 100, 0};
-  const size_t chunk = chunks[(opt >> 1) & 7u];
+  static const size_t chunks[4] = {0, 1, 2, 3};
+  const size_t chunk = chunks[(opt >> 1) & 3u];
+  /* Bit 3: a server that offers two of the three suites (no AES-256) and whose
+   * connection will not carry a ticket as large as the smallest it seals, so a
+   * ticket for the missing suite meets the context's list and a handshake that
+   * finishes meets the cap on issuing. */
+  const bool restricted = (opt & 0x08u) != 0;
 
   /* An identity is needed to make the context; the trace's chain replaces it. */
   static const Bytes cert = read_data("ed-leaf.der");
@@ -753,6 +759,12 @@ inline int server_one(const uint8_t * data, size_t size) {
     cfg.groups = p256only;
     cfg.group_count = 1;
   }
+  static const GTLS_Suite two_suites[2] = {GTLS_SUITE_AES_128_GCM_SHA256,
+      GTLS_SUITE_CHACHA20_POLY1305_SHA256};
+  if (restricted) {
+    cfg.suites = two_suites;
+    cfg.suite_count = 2;
+  }
   static const char * const alpn[] = {"h2", "http/1.1"};
   cfg.alpn = alpn;
   cfg.alpn_count = 2;
@@ -769,8 +781,10 @@ inline int server_one(const uint8_t * data, size_t size) {
     lim.max_ticket_bytes = 12;
   }
   cfg.limits = &lim;
-  /* A keyring, so that a ticket in an offer is opened (and refused: no input can
-   * seal one). The small-limits server has a ticket cap too small for one. */
+  /* A keyring, so that a ticket in an offer is opened. No mutation can seal one;
+   * the seeds carry tickets sealed under this key (name and key all 0x6b) by
+   * tools/make-fuzz-seeds.py. The small-limits server has a ticket cap too
+   * small for one. */
   GTLS_TicketKey ticket_key;
   std::memset(&ticket_key, 0x6b, sizeof ticket_key);
   ticket_key.not_before = 1699990000;
@@ -794,6 +808,11 @@ inline int server_one(const uint8_t * data, size_t size) {
   gtls_conn_set_hooks(conn, ServerRandom::fn, &rnd, nullptr, nullptr);
   gtls_conn_set_server_hooks(conn, FuzzSign::fn, &sign, seam_chain, seam_len, 1, 0x0804,
       tr.ee_prefix.data(), tr.ee_prefix.size());
+  if (restricted && (opt & 0x40u) == 0) {
+    /* The context refuses a cap below the largest ticket, so the connection's copy is lowered: no
+     * ticket (98 bytes at least) fits it. */
+    conn->limits.max_ticket_bytes = 90;
+  }
   note(conn);
   if (gtls_conn_start(conn) != GTLS_OK) {
     die("start");
@@ -1202,7 +1221,10 @@ inline int resume_one(const uint8_t * data, size_t size) {
  * The session blob and the ticket. Input: an options byte (bits 0-1 which:
  * 0 a blob to parse, 1 bytes to open as a ticket, 2 a state to seal and open,
  * 3 a session to serialise and parse; bits 2-3 the suite; bits 4-6 the cap on
- * a ticket), then bytes.
+ * a ticket; bit 7, with 2, the clocks of a freshness check taken from the
+ * input), then bytes. The tickets of 1 are opened under a key whose name is
+ * 0x42 and whose bytes are 0x24; the seeds hold tickets sealed under it with
+ * states the sealer would not write.
  */
 inline int session_one(const uint8_t * data, size_t size) {
   if (size < 1) {
@@ -1237,6 +1259,12 @@ inline int session_one(const uint8_t * data, size_t size) {
         if (gtls_session_info(s, &info) != GTLS_OK || info.host_len == 0 ||
             info.lifetime > GTLS_TICKET_LIFETIME_MAX || info.expires < info.received) {
           die("a parsed session's description");
+        }
+        /* A buffer one byte short, and none at all, are limits that say how much is needed. */
+        size_t need = 0;
+        if (gtls_session_serialize(s, out.data(), n - 1, &need) != GTLS_ERR_LIMIT || need != n ||
+            gtls_session_serialize(s, nullptr, 0, &need) != GTLS_ERR_LIMIT || need != n) {
+          die("a short buffer for a session was not a limit");
         }
         gtls_session_free(s);
       } else if (s != nullptr) {
@@ -1294,6 +1322,23 @@ inline int session_one(const uint8_t * data, size_t size) {
       }
       /* Freshness never throws or loops, whatever the clocks. */
       (void)gtls_ticket_fresh(&p, static_cast<int64_t>(len) * 123456789 - 1000, p.age_add + static_cast<uint32_t>(len), 10000);
+      if ((opt & 0x80u) != 0) {
+        /* With bit 7 the lifetime, the issue time, the clock, the age and the window all come from
+         * the input: four 8-byte big-endian words, the first holding the lifetime and age_add. */
+        auto word = [&](size_t at) {
+          uint64_t v = 0;
+          for (size_t i = 0; i < 8; i++) v = (v << 8) | (at + i < len ? body[at + i] : 0u);
+          return v;
+        };
+        GTLS_TicketPlain q = p;
+        q.lifetime = static_cast<uint32_t>(word(0) >> 32);
+        q.age_add = static_cast<uint32_t>(word(0));
+        q.issued = static_cast<int64_t>(word(8));
+        const int64_t now = static_cast<int64_t>(word(16));
+        const int fresh = gtls_ticket_fresh(&q, now, static_cast<uint32_t>(word(24) >> 32),
+            static_cast<uint32_t>(word(24)));
+        if (fresh && q.lifetime > GTLS_TICKET_LIFETIME_MAX) die("a ticket lived past seven days");
+      }
       break;
     }
     default: {

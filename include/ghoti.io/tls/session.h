@@ -45,8 +45,27 @@
  * ::gtls_session_free wipes.
  *
  * A session is for the host name and the hash of the cipher suite it was
- * issued for, and a connection refuses it for any other. A server that does
- * not accept a ticket (expired, a key it no longer has, another name, another
+ * issued for, and a connection refuses it for any other. **It is bound to
+ * nothing else.** In particular it is not bound to the trust store or the
+ * verification hook that authenticated the connection it came from: a resumed
+ * connection sends no certificate and runs no chain check, so a session
+ * carried to a connection with a different (or looser) trust configuration
+ * resumes on the authority of the first. A caller must not share sessions,
+ * or their serialised blobs, across contexts whose trust differs, and should
+ * key its session store by host and by the trust configuration alike.
+ *
+ * **Rotate ticket keys long before they wear out.** A ticket's AES-256-GCM
+ * nonce is drawn at random (96 bits), so the chance that two tickets under one
+ * key repeat a nonce grows with the square of the number issued; NIST SP
+ * 800-38D bounds random-nonce GCM at 2^32 invocations per key. The
+ * recommended maximum is far inside that: replace the sealing key (a new
+ * ::GTLS_TicketKey with a later ::GTLS_TicketKey::not_before) before it has
+ * sealed 2^28 tickets, and in practice daily, keeping the old key in the list
+ * until the tickets it sealed have run out. A server that issues
+ * ::GTLS_ContextConfig::ticket_count tickets per connection reaches the figure
+ * that many times sooner.
+ *
+ * A server that does not accept a ticket (expired, a key it no longer has, another name, another
  * suite, an ALPN protocol the client no longer offers, an age outside its
  * window) is not an error: the handshake continues as a full one, and
  * ::gtls_conn_resumed says which happened. A ticket whose *binder* is wrong is
@@ -79,6 +98,13 @@ extern "C" {
 
 /** Most ticket keys a context holds. */
 #define GTLS_TICKET_KEYS_MAX 8u
+
+/**
+ * Most tickets one connection may be sent (::GTLS_ContextConfig::ticket_count).
+ * Each stands for a PSK derived from a one-byte ticket nonce, so a 256th would
+ * repeat the first's.
+ */
+#define GTLS_TICKET_COUNT_MAX 255u
 
 /** RFC 8446 section 4.6.1: no ticket may live longer than seven days. */
 #define GTLS_TICKET_LIFETIME_MAX 604800u
@@ -118,7 +144,7 @@ typedef struct GTLS_SessionInfo {
   size_t alpn_len;                ///< Its length; 0 when there was none.
   int64_t received;               ///< The Unix second the ticket arrived.
   uint32_t lifetime;              ///< Seconds the server said it is good for, at most seven days.
-  int64_t expires;                ///< ::received plus ::lifetime.
+  int64_t expires;                ///< ::received plus ::lifetime, saturating at INT64_MAX (a parsed session never needs it to).
   uint32_t max_early_data;        ///< What the server would accept as early data; this library does not send any.
 } GTLS_SessionInfo;
 
@@ -165,7 +191,7 @@ GTLS_API GTLS_Result gtls_session_serialize(const GTLS_Session * session,
  * @param out Receives the session. Not NULL; written only on success.
  * @return ::GTLS_OK; ::GTLS_ERR_CORRUPT (truncated, extended, a length that
  *   does not fit, a digest that differs, a PSK of the wrong size for the
- *   suite); ::GTLS_ERR_UNSUPPORTED (another version); ::GTLS_ERR_LIMIT;
+ *   suite, a received time so late that adding the lifetime would overflow); ::GTLS_ERR_UNSUPPORTED (another version); ::GTLS_ERR_LIMIT;
  *   ::GTLS_ERR_INVALID; ::GTLS_ERR_OOM.
  */
 GTLS_API GTLS_Result gtls_session_parse(const GTLS_Allocator * allocator,

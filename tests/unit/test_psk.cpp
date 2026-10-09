@@ -245,13 +245,6 @@ TEST(PskOffer, EveryMalformedOfferHasItsResultAndAlert) {
             h.psk_identities = h.psk_binders = 3;
           },
           GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR},
-      {"an identity longer than the limit",
-          [](HelloSpec & h, GTLS_Limits & l) {
-            l.max_ticket_bytes = 20;
-            h.psk_identities = h.psk_binders = 1;
-            h.psk_identity_len = 21;
-          },
-          GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR},
   };
   for (const Case & k : cases) {
     One t;
@@ -571,10 +564,10 @@ TEST(PskLists, TheCapsPassExactlyAtTheLimitAndFailOneOver) {
           [](HelloSpec & h, GTLS_Limits & l) {
             l.max_ticket_bytes = 20; h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 20; },
           GTLS_OK},
-      {"an identity one byte over the limit",
+      {"an identity one byte over the ticket limit (not ours, and not an error)",
           [](HelloSpec & h, GTLS_Limits & l) {
             l.max_ticket_bytes = 20; h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 21; },
-          GTLS_ERR_LIMIT},
+          GTLS_OK},
       {"the shortest identity there is (the identities list is exactly its minimum)",
           [](HelloSpec & h, GTLS_Limits &) { h.psk_identities = h.psk_binders = 1; h.psk_identity_len = 1; },
           GTLS_OK},
@@ -601,6 +594,56 @@ TEST(PskLists, TheCapsPassExactlyAtTheLimitAndFailOneOver) {
     ASSERT_EQ(t.srv.build(), GTLS_OK) << k.what;
     EXPECT_EQ(t.srv.hello(h.build()), k.result) << k.what;
   }
+}
+
+TEST(PskOffer, AServerWithKeysPassesOverAnIdentityTooLongToBeItsAndStillRefusesTooManyOfThem) {
+  GTLS_TicketKey key;
+  std::memset(&key, 0, sizeof key);
+  std::memset(key.name, 7, sizeof key.name);
+  std::memset(key.key, 9, sizeof key.key);
+  key.not_before = kNow - 100;
+  key.not_after = kNow + 100000;
+
+  auto serve = [&](const HelloSpec & h, uint32_t max_tickets, bool * resumed, unsigned * alert) {
+    One t;
+    t.srv.cfg.ticket_keys = &key;
+    t.srv.cfg.ticket_key_count = 1;
+    t.srv.limits.max_client_hello = 65536;
+    t.srv.limits.max_tickets = max_tickets;
+    EXPECT_EQ(t.srv.build(), GTLS_OK);
+    GTLS_Result r = t.srv.hello(h.build());
+    *resumed = gtls_conn_resumed(t.srv.conn) != 0;
+    *alert = t.srv.alert();
+    if (r == GTLS_OK) {
+      EXPECT_EQ(t.srv.state(), GTLS_STATE_S_WAIT_FIN) << "the full flight is out";
+      EXPECT_GT(t.srv.out(GTLS_EPOCH_HANDSHAKE).size(), 100u);
+    }
+    return r;
+  };
+  bool resumed = true;
+  unsigned alert = 0;
+  HelloSpec h;
+
+  /* One identity, any length up to what a hello can hold: not a ticket this server sealed. */
+  for (size_t len : {static_cast<size_t>(1), static_cast<size_t>(624), static_cast<size_t>(625),
+           static_cast<size_t>(16384), static_cast<size_t>(16385), static_cast<size_t>(30000)}) {
+    h.psk_identities = h.psk_binders = 1;
+    h.psk_identity_len = len;
+    EXPECT_EQ(serve(h, 16, &resumed, &alert), GTLS_OK) << len;
+    EXPECT_FALSE(resumed) << len;
+  }
+  /* The identities are counted all the same: more than the limit is the error. */
+  h.psk_identity_len = 16385;
+  h.psk_identities = h.psk_binders = 2;
+  EXPECT_EQ(serve(h, 2, &resumed, &alert), GTLS_OK) << "two within a limit of two";
+  EXPECT_EQ(serve(h, 1, &resumed, &alert), GTLS_ERR_LIMIT) << "two over a limit of one";
+  EXPECT_EQ(alert, GTLS_ALERT_DECODE_ERROR);
+  h.psk_identity_len = 16;
+  h.psk_identities = h.psk_binders = 17;
+  EXPECT_EQ(serve(h, 16, &resumed, &alert), GTLS_ERR_LIMIT) << "seventeen over the default sixteen";
+  EXPECT_EQ(alert, GTLS_ALERT_DECODE_ERROR);
+  h.psk_identities = h.psk_binders = 16;
+  EXPECT_EQ(serve(h, 16, &resumed, &alert), GTLS_OK);
 }
 
 TEST(PskOffer, AMalformedKeyExchangeModesBesideAPskIsADecodeError) {

@@ -1020,16 +1020,23 @@ TEST(Limits, UnconsumedOutputCountsAgainstTheCapAndConsumingFreesIt) {
   EXPECT_FALSE(gtls_conn_is_failed(w.conn));
 }
 
-TEST(Limits, ATicketLargerThanTheLimitIsALimit) {
-  World w;
-  w.limits.max_ticket_bytes = 10;
-  w.build();
-  SimServer s(w.server_options());
-  ASSERT_EQ(w.run(s), GTLS_OK);
-  Vec v("simple-1rtt");
-  const Bytes nst = v["server.construct-a-newsessionticket-handshake-message.newsessionticket"];
-  EXPECT_EQ(w.feed(GTLS_EPOCH_APPLICATION, nst), GTLS_ERR_LIMIT);
-  expect_failed_and_wiped(w, GTLS_ERR_LIMIT, GTLS_ALERT_DECODE_ERROR);
+TEST(Limits, ATicketLargerThanTheLimitIsDiscardedAndDoesNotFailTheConnection) {
+  /* The server is authenticated and the message is well formed: a ticket the
+   * client will not keep is counted and dropped, not a reason to end the
+   * connection. RFC 8448's ticket is 178 bytes. */
+  for (uint32_t cap : {10u, 177u, 178u}) {
+    World w;
+    w.limits.max_ticket_bytes = cap;
+    w.build();
+    SimServer s(w.server_options());
+    ASSERT_EQ(w.run(s), GTLS_OK);
+    Vec v("simple-1rtt");
+    const Bytes nst = v["server.construct-a-newsessionticket-handshake-message.newsessionticket"];
+    EXPECT_EQ(w.feed(GTLS_EPOCH_APPLICATION, nst), GTLS_OK) << cap;
+    EXPECT_FALSE(gtls_conn_is_failed(w.conn)) << cap;
+    EXPECT_EQ(w.conn->tickets, 1u) << "it counts against max_tickets either way";
+    EXPECT_EQ(gtls_conn_session_count(w.conn), cap == 178u ? 1u : 0u) << cap;
+  }
 }
 
 /* ---------------------------------------------- failure is terminal and wipes */

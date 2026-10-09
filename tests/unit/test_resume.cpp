@@ -15,6 +15,7 @@
 #include "rfc_run.h"
 
 #include <functional>
+#include <set>
 
 using namespace gtlstest;
 
@@ -1169,6 +1170,225 @@ TEST(Resume, ATicketWithALifetimeOfZeroIsNotKeptAndAMuchLongerOneIsCut) {
   ASSERT_EQ(gtls_conn_session(r.conn, 0, &s), GTLS_OK);
   EXPECT_EQ(s->lifetime, GTLS_TICKET_LIFETIME_MAX);
   gtls_session_free(s);
+}
+
+/* ------------------------------------------------------- from the review */
+
+namespace {
+
+/** A copy of @p from whose ticket is @p len bytes: the first bytes of the real one, then filler. */
+GTLS_Session * with_ticket_len(const GTLS_Session * from, size_t len) {
+  GTLS_Session * s = gtls_session_alloc(gtls_allocator_default(), len);
+  s->suite = from->suite;
+  s->lifetime = from->lifetime;
+  s->age_add = from->age_add;
+  s->max_early_data = from->max_early_data;
+  s->received = from->received;
+  std::memcpy(s->host, from->host, from->host_len);
+  s->host_len = from->host_len;
+  std::memcpy(s->alpn, from->alpn, from->alpn_len);
+  s->alpn_len = from->alpn_len;
+  std::memcpy(s->psk, from->psk, from->psk_len);
+  s->psk_len = from->psk_len;
+  for (size_t i = 0; i < len; i++) {
+    s->ticket[i] = i < from->ticket_len ? from->ticket[i] : static_cast<unsigned char>(0x99);
+  }
+  return s;
+}
+
+}  // namespace
+
+TEST(Resume, AnIdentityLongerThanTheTicketLimitIsNotOursAndTheHandshakeIsFull) {
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+  auto roomy = [](Pair & p) { p.slimits.max_client_hello = 65536; };
+
+  EXPECT_EQ(decision(e, h.s, roomy), 1) << "the control: the real ticket resumes";
+  for (size_t len : {static_cast<size_t>(16384), static_cast<size_t>(16385), static_cast<size_t>(20000),
+           static_cast<size_t>(60000)}) {
+    GTLS_Session * big = with_ticket_len(h.s, len);
+    EXPECT_EQ(decision(e, big, roomy), 0) << "an identity of " << len << " bytes is passed over, not fatal";
+    gtls_session_free(big);
+  }
+  /* And the whole handshake completes in full, not just the server's first flight. */
+  GTLS_Session * big = with_ticket_len(h.s, 16385);
+  Next n(e);
+  n.p.slimits.max_client_hello = 65536;
+  n.p.offer = big;
+  ASSERT_NO_FATAL_FAILURE(run_full(n.p));
+  expect_resumed(n.p, false);
+  gtls_session_free(big);
+}
+
+TEST(Resume, TheBinderOfTheSecondHelloAfterARetryIsRequired) {
+  Env e;
+  static const GTLS_Group server_groups[] = {GTLS_GROUP_SECP256R1};
+  e.p.scfg.groups = server_groups;
+  e.p.scfg.group_count = 1;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+
+  for (int variant = 0; variant < 3; variant++) {
+    Next n(e);
+    n.p.scfg.groups = server_groups;
+    n.p.scfg.group_count = 1;
+    n.p.offer = h.s;
+    ASSERT_EQ(n.p.build(), GTLS_OK);
+    n.p.carry(n.p.c, n.p.s, 0);   /* the first hello: a retry is the answer */
+    ASSERT_FALSE(gtls_conn_is_failed(n.p.s.conn)) << "the first binder is not looked at";
+    n.p.carry(n.p.s, n.p.c, 0);   /* the retry, and the client's second hello is made */
+    Bytes second = stream_out(n.p.c.conn);
+    ASSERT_GT(second.size(), 40u);
+    size_t used = 0;
+    if (variant == 0) {
+      /* The control: the second hello as the client wrote it is good. */
+      EXPECT_EQ(gtls_conn_stream_feed(n.p.s.conn, second.data(), second.size(), n.p.now, &used), GTLS_OK);
+      EXPECT_EQ(gtls_conn_resumed(n.p.s.conn), 1);
+    } else {
+      second[second.size() - (variant == 1 ? 1 : 32)] ^= 0x01;
+      EXPECT_EQ(gtls_conn_stream_feed(n.p.s.conn, second.data(), second.size(), n.p.now, &used),
+          GTLS_ERR_MISMATCH) << variant;
+      EXPECT_TRUE(gtls_conn_is_failed(n.p.s.conn));
+      EXPECT_EQ(gtls_conn_alert(n.p.s.conn), GTLS_ALERT_DECRYPT_ERROR);
+      EXPECT_TRUE(gtls_conn_secrets_are_wiped(n.p.s.conn));
+      EXPECT_EQ(gtls_conn_resumed(n.p.s.conn), 0);
+    }
+  }
+}
+
+TEST(Resume, TheTicketThatIsIssuedMustFitTheCapAndTheCapIsExact) {
+  /* The context refuses a cap below the largest ticket, so the cap on the connection is met through its copy. */
+  Env probe;
+  ASSERT_NO_FATAL_FAILURE(run_full(probe.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(probe.p));
+  const uint32_t exact = static_cast<uint32_t>(h.s->ticket_len);
+
+  for (uint32_t cap : {exact, exact - 1}) {
+    Env e;
+    ASSERT_EQ(e.p.build(), GTLS_OK);
+    e.p.s.conn->limits.max_ticket_bytes = cap;
+    e.p.run();
+    if (cap == exact) {
+      EXPECT_TRUE(e.p.connected()) << "a ticket as long as the cap is allowed";
+      EXPECT_EQ(gtls_conn_session_count(e.p.c.conn), 1u);
+    } else {
+      EXPECT_EQ(e.p.s.feed_result, GTLS_ERR_LIMIT);
+      EXPECT_TRUE(gtls_conn_is_failed(e.p.s.conn));
+      EXPECT_EQ(gtls_conn_alert(e.p.s.conn), GTLS_ALERT_INTERNAL_ERROR);
+      EXPECT_TRUE(gtls_conn_secrets_are_wiped(e.p.s.conn));
+      EXPECT_EQ(gtls_conn_session_count(e.p.c.conn), 0u) << "nothing was sent";
+    }
+  }
+}
+
+TEST(Resume, TheResumptionSecretMustHaveBeenKeptBeforeATicketIsMadeFromIt) {
+  /* Server: issuing is the end of the handshake; a connection whose secret was not kept refuses. */
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  GTLS_Conn * s = e.p.s.conn;
+  ASSERT_EQ(s->sec.schedule.has_res, 1);
+  EXPECT_EQ(gtls_server_issue_tickets(s, kNow), GTLS_OK) << "the control: with the secret, more tickets";
+  EXPECT_FALSE(gtls_conn_is_failed(s));
+  s->sec.schedule.has_res = 0;
+  EXPECT_EQ(gtls_server_issue_tickets(s, kNow), GTLS_ERR_INTERNAL);
+  EXPECT_TRUE(gtls_conn_is_failed(s));
+  EXPECT_EQ(gtls_conn_alert(s), GTLS_ALERT_INTERNAL_ERROR);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(s));
+
+  /* A server that sends none has no use for it, and so does not mind. */
+  Env none;
+  none.p.scfg.ticket_count = 0;
+  ASSERT_NO_FATAL_FAILURE(run_full(none.p));
+  none.p.s.conn->sec.schedule.has_res = 0;
+  EXPECT_EQ(gtls_server_issue_tickets(none.p.s.conn, kNow), GTLS_OK);
+
+  /* Client: the same, when a ticket arrives. */
+  Flow r(simple_trace());
+  r.start();
+  r.take(GTLS_EPOCH_INITIAL);
+  ASSERT_EQ(r.through_server_hello(), GTLS_OK);
+  ASSERT_EQ(r.feed(GTLS_EPOCH_HANDSHAKE, r.v[simple_trace().flight()]), GTLS_OK);
+  const Bytes nst = r.v["server.construct-a-newsessionticket-handshake-message.newsessionticket"];
+  ASSERT_EQ(r.conn->sec.schedule.has_res, 1);
+  r.conn->sec.schedule.has_res = 0;
+  EXPECT_EQ(r.feed(GTLS_EPOCH_APPLICATION, nst), GTLS_ERR_INTERNAL);
+  EXPECT_TRUE(gtls_conn_is_failed(r.conn));
+  EXPECT_EQ(gtls_conn_alert(r.conn), GTLS_ALERT_INTERNAL_ERROR);
+  EXPECT_EQ(gtls_conn_session_count(r.conn), 0u);
+}
+
+TEST(Resume, TwoHundredFiftyFiveTicketsInOneConnectionEachHaveAPskOfTheirOwn) {
+  Env e;
+  e.p.scfg.ticket_count = GTLS_TICKET_COUNT_MAX;
+  e.p.slimits.max_tickets = 300;
+  e.p.climits.max_tickets = 300;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  ASSERT_EQ(gtls_conn_session_count(e.p.c.conn), static_cast<size_t>(GTLS_TICKET_COUNT_MAX));
+
+  std::set<Bytes> psks;
+  Held last, before_last;
+  for (size_t i = 0; i < GTLS_TICKET_COUNT_MAX; i++) {
+    Held h;
+    ASSERT_NO_FATAL_FAILURE(h.take(e.p, i));
+    psks.insert(Bytes(h.s->psk, h.s->psk + h.s->psk_len));
+    if (i == GTLS_TICKET_COUNT_MAX - 2) {
+      ASSERT_NO_FATAL_FAILURE(before_last.take(e.p, i));
+    }
+    if (i == GTLS_TICKET_COUNT_MAX - 1) {
+      ASSERT_NO_FATAL_FAILURE(last.take(e.p, i));
+    }
+  }
+  EXPECT_EQ(psks.size(), static_cast<size_t>(GTLS_TICKET_COUNT_MAX)) << "no two tickets share a PSK";
+  EXPECT_NE(Bytes(last.s->psk, last.s->psk + last.s->psk_len),
+      Bytes(before_last.s->psk, before_last.s->psk + before_last.s->psk_len));
+  /* The last ticket, the one a one-byte nonce would first repeat, resumes. */
+  ASSERT_EQ(e.p.again(last.s), GTLS_OK);
+  e.p.run();
+  ASSERT_TRUE(e.p.connected());
+  expect_resumed(e.p, true);
+}
+
+TEST(Resume, AHostNameIsComparedWithoutCaseInBothDirectionsAndOnlyForLetters) {
+  Env e;
+  ASSERT_NO_FATAL_FAILURE(run_full(e.p));
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(h.take(e.p));
+
+  struct Case {
+    std::string session;
+    std::string conn;
+    bool same;
+  };
+  const Case cases[] = {
+      {"abcxyz", "ABCXYZ", true},   {"ABCXYZ", "abcxyz", true},   {"aBcXyZ", "AbCxYz", true},
+      {"a", "A", true},             {"A", "a", true},             {"z", "Z", true},
+      {"Z", "z", true},             {"a", "b", false},            {"A", "b", false},
+      {"@", "`", false},            {"`", "@", false},            {"[", "{", false},
+      {"{", "[", false},            {"@", "@", true},             {"[", "[", true},
+      {"0", "0", true},             {"a", "`", false},            {"z", "{", false},
+      {"A", "@", false},            {"Z", "[", false},            {"a-1.b", "A-1.B", true},
+  };
+  for (const Case & c : cases) {
+    GTLS_Session * s = gtls_session_copy(gtls_allocator_default(), h.s);
+    std::memcpy(s->host, c.session.data(), c.session.size());
+    s->host_len = c.session.size();
+    GTLS_ContextConfig cfg;
+    gtls_context_config_default(&cfg);
+    cfg.trust = e.p.trust->store;
+    GTLS_Context * ctx = nullptr;
+    GTLS_Conn * conn = nullptr;
+    ASSERT_EQ(gtls_context_new(nullptr, &cfg, &ctx), GTLS_OK);
+    ASSERT_EQ(gtls_conn_new(ctx, c.conn.data(), c.conn.size(), &conn), GTLS_OK) << c.conn;
+    EXPECT_EQ(gtls_conn_set_session(conn, s, kNow), c.same ? GTLS_OK : GTLS_ERR_INVALID)
+        << "session '" << c.session << "' on a connection to '" << c.conn << "'";
+    gtls_conn_free(conn);
+    gtls_context_free(ctx);
+    gtls_session_free(s);
+  }
 }
 
 int main(int argc, char ** argv) {

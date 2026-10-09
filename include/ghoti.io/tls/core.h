@@ -149,16 +149,21 @@ typedef struct GTLS_Limits {
   /** Largest CertificateVerify signature, in bytes. Default 1024. */
   uint32_t max_signature_bytes;
   /**
-   * Largest NewSessionTicket ticket, in bytes, and largest identity in a
-   * ClientHello's `pre_shared_key`. Default 16384.
+   * Largest NewSessionTicket ticket a client keeps, in bytes, and largest
+   * identity in a ClientHello's `pre_shared_key` a server will try to open.
+   * Neither is an error when exceeded: a client counts a larger ticket
+   * and discards it, and a server passes over a larger identity as not its
+   * own (the handshake is a full one). Default 16384. A server with ticket
+   * keys needs at least the largest ticket it seals (::GTLS_ERR_LIMIT at
+   * context creation otherwise).
    */
   uint32_t max_ticket_bytes;
   /** Largest cookie a HelloRetryRequest may ask to be echoed. Default 1024. */
   uint32_t max_cookie_bytes;
   /**
-   * Most post-handshake NewSessionTicket messages one connection accepts
-   * (each is parsed and discarded), and most identities a ClientHello's
-   * `pre_shared_key` may offer to a server. Default 16.
+   * Most post-handshake NewSessionTicket messages one connection accepts,
+   * and most identities a ClientHello's `pre_shared_key` may offer to a
+   * server (more is fatal on either side). Default 16.
    */
   uint32_t max_tickets;
   /** Most bytes of output a connection holds unconsumed, per epoch. Default 65536. */

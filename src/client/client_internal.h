@@ -299,6 +299,13 @@ void gtls_conn_drop_sessions(GTLS_Conn * c);
 GTLS_Result gtls_verify_chain(void * user, const GTLS_Conn * conn,
     const GTLS_CertificateMsg * certificate, int64_t unix_time);
 
+/**
+ * Queue the server's NewSessionTickets for a connected connection (the end of
+ * the handshake does it; a test calls it to meet the check that the resumption
+ * secret was kept). ::GTLS_ERR_INTERNAL, failing the connection, without it.
+ */
+GTLS_Result gtls_server_issue_tickets(GTLS_Conn * c, int64_t now);
+
 /** Test seams. See the file comment. */
 void gtls_conn_set_hooks(GTLS_Conn * conn, GTLS_RandomFn random_fn,
     void * random_user, GTLS_ChainFn chain_fn, void * chain_user);

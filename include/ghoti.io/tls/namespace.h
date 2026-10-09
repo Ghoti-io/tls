@@ -227,6 +227,7 @@
 #define gtls_schedule_resumption GHOTIIO_TLS(gtls_schedule_resumption)
 #define gtls_schedule_wipe GHOTIIO_TLS(gtls_schedule_wipe)
 #define gtls_selftest GHOTIIO_TLS(gtls_selftest)
+#define gtls_server_issue_tickets GHOTIIO_TLS(gtls_server_issue_tickets)
 #define gtls_server_on_message GHOTIIO_TLS(gtls_server_on_message)
 #define gtls_server_start GHOTIIO_TLS(gtls_server_start)
 #define gtls_session_alloc GHOTIIO_TLS(gtls_session_alloc)

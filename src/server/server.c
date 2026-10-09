@@ -1053,7 +1053,7 @@ static GTLS_Result on_client_hello(GTLS_Conn * c, const unsigned char * msg,
  * a resumption needs. They go out under the application keys, queued at that
  * epoch. A server with no key valid now sends none.
  */
-static GTLS_Result issue_tickets(GTLS_Conn * c, int64_t now) {
+GTLS_Result gtls_server_issue_tickets(GTLS_Conn * c, int64_t now) {
   const GTLS_Context * x = c->context;
   GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
   size_t hlen = gtls_hash_len(hash);
@@ -1062,6 +1062,10 @@ static GTLS_Result issue_tickets(GTLS_Conn * c, int64_t now) {
   if (x->ticket_count == 0 ||
       gtls_ticket_sealing_key(x->ticket_keys, x->ticket_key_count, now) == NULL) {
     return GTLS_OK;
+  }
+  if (!c->sec.schedule.has_res) {
+    /* Reached only after the client's Finished, which kept the secret. */
+    return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
   }
   for (i = 0; i < x->ticket_count; i++) {
     GTLS_TicketPlain p;
@@ -1162,7 +1166,7 @@ static GTLS_Result on_client_finished(GTLS_Conn * c, const unsigned char * msg,
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_CONNECTED;
-  return issue_tickets(c, now);
+  return gtls_server_issue_tickets(c, now);
 }
 
 GTLS_Result gtls_server_on_message(GTLS_Conn * c, const unsigned char * msg,

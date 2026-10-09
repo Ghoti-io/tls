@@ -1084,6 +1084,10 @@ static GTLS_Result keep_ticket(GTLS_Conn * c, const GTLS_NewSessionTicket * t, i
   GTLS_Session * s;
   GTLS_Result result;
 
+  if (!c->sec.schedule.has_res) {
+    /* Only a finished handshake gets here, and it kept the secret. */
+    return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+  }
   s = gtls_session_alloc(c->allocator, t->ticket_len);
   if (s == NULL) {
     return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
@@ -1151,6 +1155,9 @@ static GTLS_Result on_post_handshake(GTLS_Conn * c, unsigned type,
   c->tickets++;
   if (t.lifetime == 0) {
     return GTLS_OK; /* the server asks that it be discarded (section 4.6.1) */
+  }
+  if (t.ticket_len > c->limits.max_ticket_bytes) {
+    return GTLS_OK; /* more than this connection keeps: counted, and not kept */
   }
   return keep_ticket(c, &t, now);
 }

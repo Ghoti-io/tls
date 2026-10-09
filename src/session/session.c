@@ -107,7 +107,9 @@ GTLS_Result gtls_session_info(const GTLS_Session * s, GTLS_SessionInfo * info) {
   info->alpn_len = s->alpn_len;
   info->received = s->received;
   info->lifetime = s->lifetime;
-  info->expires = s->received + (int64_t)s->lifetime;
+  /* Saturating: a session built by hand can hold any received time. */
+  info->expires = s->received > INT64_MAX - (int64_t)s->lifetime
+      ? INT64_MAX : s->received + (int64_t)s->lifetime;
   info->max_early_data = s->max_early_data;
   return GTLS_OK;
 }
@@ -246,9 +248,14 @@ GTLS_Result gtls_session_parse(const GTLS_Allocator * allocator,
   if (gsec_equal(digest, p + at + ticket_len, GSEC_SHA256_DIGEST_LEN) != GSEC_OK) {
     return GTLS_ERR_CORRUPT;
   }
+  for (i = 0; i < 8u; i++) {
+    r = (r << 8) | p[15u + i];
+  }
   hash = gtls_suite_hash(((uint32_t)p[1] << 8) | p[2]);
   if (hash == GTLS_HASH_NONE || psk_len != gtls_hash_len(hash) || host_len == 0 ||
-      ticket_len == 0 || r32(p + 3) > GTLS_TICKET_LIFETIME_MAX) {
+      ticket_len == 0 || r32(p + 3) > GTLS_TICKET_LIFETIME_MAX ||
+      (int64_t)r > INT64_MAX - (int64_t)r32(p + 3)) {
+    /* The last test: received plus lifetime must be a time (it is signed). */
     return GTLS_ERR_CORRUPT;
   }
   s = gtls_session_alloc(allocator, ticket_len);
@@ -259,9 +266,6 @@ GTLS_Result gtls_session_parse(const GTLS_Allocator * allocator,
   s->lifetime = r32(p + 3);
   s->age_add = r32(p + 7);
   s->max_early_data = r32(p + 11);
-  for (i = 0; i < 8u; i++) {
-    r = (r << 8) | p[15u + i];
-  }
   s->received = (int64_t)r;
   at = FIXED_PREFIX + 1u;
   memcpy(s->host, p + at, host_len);

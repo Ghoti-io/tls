@@ -184,16 +184,23 @@ persists no key. `GTLS_ContextConfig::ticket_keys` is a list of up to eight
 `GTLS_TicketKey` (name, 32 bytes, a window of Unix seconds): the key that
 began last among those valid at the moment seals; every key that has not
 expired opens. That is rotation: add a key that begins now, and leave the old one
-in the list until the tickets it sealed have run out. Names must differ. A
-random 96-bit nonce under one key is safe for about 2^32 tickets, so a key
-should not live that long. How the keys reach the several processes that serve
+in the list until the tickets it sealed have run out. Names must differ.
+**Rotate well before a key wears out.** The AEAD nonce is drawn at random
+(96 bits), so a repeat under one key becomes likely as the square of the
+tickets sealed, and NIST SP 800-38D caps random-nonce GCM at 2^32 invocations
+per key. The recommended maximum is 2^28 tickets per key (a margin of 16
+inside the cap; a repeat has then a chance near 2^-41), and in practice a new
+key daily. A server that sends `ticket_count` tickets on every connection, resumed
+or not, reaches the figure that many times sooner. How the keys reach the several processes that serve
 one name, and where they are kept, is the caller's.
 `GTLS_Limits::max_ticket_bytes` must be at least the largest ticket (a
 context with keys and a smaller cap is `GTLS_ERR_LIMIT`).
 
 **Issuing.** After the client's Finished has verified, the server sends
 `ticket_count` NewSessionTicket messages (default 1; 0 sends none; at most
-`max_tickets`) under the application keys, on every connection, resumed or
+`max_tickets`, and never above 255, `GTLS_TICKET_COUNT_MAX`: the nonce that
+tells the tickets apart is one byte, and a 256th would repeat the first's PSK;
+more is `GTLS_ERR_LIMIT` when the context is made) under the application keys, on every connection, resumed or
 not. Each carries its own nonce, so each stands for a PSK of its own:
 `HKDF-Expand-Label(resumption_master_secret, "resumption", nonce, Hash.length)`,
 where the resumption master secret is derived from the transcript through
@@ -205,7 +212,9 @@ and passed over, without an error, if it is not ours or does not decrypt, its ke
 has expired, its suite is not one the client offered and the server has, its
 lifetime has run out, its age is outside the window, its server name is not the
 one the ClientHello carries now, or the ALPN protocol it came from is not among
-those offered again. `psk_ke` alone (no `psk_dhe_ke` in the modes) is passed
+those offered again. An identity longer than `max_ticket_bytes` is not one this
+server sealed, so it is passed over like the rest; only the number of identities
+(more than `max_tickets`) is an error. `psk_ke` alone (no `psk_dhe_ke` in the modes) is passed
 over too. The first identity that qualifies has its binder checked in constant
 time, over the transcript so far (empty, or the retry's) and the
 ClientHello cut where the binders list begins; **a binder that is wrong, or the
@@ -237,7 +246,17 @@ library keeps nothing across connections: the caller keeps the session
 damage; it holds the PSK in the clear, so it is a secret as a key is) and hands it to
 a new connection with `gtls_conn_set_session` before start, with the time. A
 session is refused for another host name, for a suite the connection does not
-offer, before it arrived and after it has run out. The ClientHello then
+offer, before it arrived and after it has run out. **A session is bound to a
+host and a suite and to nothing else, not to the trust store or the
+verification hook that authenticated the connection it came from**: a resumed
+connection sends no certificate and runs no chain check, so a session carried
+into a context with a different (or looser) trust configuration resumes on the
+authority of the first. The caller must not share sessions, or their blobs,
+across trust configurations. A NewSessionTicket longer than `max_ticket_bytes`
+is counted against `max_tickets` and not kept; it does not fail the connection
+the server has authenticated. A parsed session whose received time plus its
+lifetime would overflow a signed 64-bit is refused, and `gtls_session_info`
+saturates `expires`. The ClientHello then
 carries `psk_key_exchange_modes` (`psk_dhe_ke`), the ticket as the one
 identity, `obfuscated_ticket_age`, and the binder, with `pre_shared_key` last
 (the padding moves in front of it). After a HelloRetryRequest the second
@@ -463,8 +482,13 @@ bound to, and every check of a session blob and of a ticket configuration.
 A planted copy that does not compile has caught nothing, and `controls.sh` says
 so rather than counting it. The one check on a ticket with no plant is the AEAD
 tag: `security` wipes the plaintext of a ciphertext whose tag fails, so the
-strict decode of the state refuses it with the check removed or not, and the
-tests that change every bit of a ticket are what cover it.
+strict decode of the state refuses it with the check removed or not. A test
+pins that dependency (each of the three AEADs this library uses returns an
+error and zeroes its output on a bad tag) and the tests that change every bit
+of a ticket exercise the check, but no plant can be seen to fail. The decode's
+bounds checks on a short authentic state are the same kind: removed, the state
+is still refused (the later checks catch an over-read), and only a memory
+checker sees the read; their plants run the test under Valgrind.
 
 `make check-controls` runs all of it (slow: it builds a copy per plant; needs
 `PREFIX`). `make test` runs `check-controls-anchors`, which needs no build and
