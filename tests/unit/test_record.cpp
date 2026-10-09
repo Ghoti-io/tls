@@ -368,6 +368,115 @@ TEST(Records, EveryBitOfARecordAndItsHeaderFlippedFailsToOpen) {
   }
 }
 
+namespace {
+
+constexpr unsigned char kSentinel = 0xA5;
+
+/**
+ * Open @p rec into a buffer that held a sentinel, and say whether every byte
+ * of the part the library decrypted into (the first ct_len - 16 bytes) from
+ * @p from on is zero, and every byte past it still the sentinel. The caller's
+ * buffer is where the plaintext of a record lived, and gtls_record_open
+ * promises that nothing but the returned content is left there.
+ */
+GTLS_Result open_into_sentinel(GTLS_RecordKeys * k, const Bytes & rec, size_t max_padding,
+    Bytes * buf, size_t * n, unsigned * type) {
+  buf->assign(GTLS_RECORD_CIPHER_MAX, kSentinel);
+  *n = 12345;
+  return gtls_record_open(k, rec.data(), rec.data() + 5, rec.size() - 5, max_padding,
+      buf->data(), n, type);
+}
+
+/** Bytes [from, to) of @p buf are all @p want. */
+::testing::AssertionResult all_equal(const Bytes & buf, size_t from, size_t to, unsigned char want) {
+  for (size_t i = from; i < to; i++) {
+    if (buf[i] != want) {
+      return ::testing::AssertionFailure() << "byte " << i << " is 0x" << std::hex << unsigned(buf[i])
+                                           << ", not 0x" << unsigned(want);
+    }
+  }
+  return ::testing::AssertionSuccess();
+}
+
+}  // namespace
+
+TEST(Records, AnOpenLeavesNothingButTheContentInTheCallersBuffer) {
+  Bytes secret(32, 7);
+  for (size_t pad : {size_t(0), size_t(1), size_t(40)}) {
+    GTLS_RecordKeys w, r;
+    ASSERT_EQ(gtls_record_keys_from_secret(&w, GTLS_SUITE_AES_128_GCM_SHA256, secret.data(), 0), GTLS_OK);
+    ASSERT_EQ(gtls_record_keys_from_secret(&r, GTLS_SUITE_AES_128_GCM_SHA256, secret.data(), 0), GTLS_OK);
+    Bytes pt(50, 0x42);
+    Bytes rec = seal_one(&w, GTLS_CT_APPLICATION_DATA, pt, pad);
+    Bytes buf;
+    size_t n = 0;
+    unsigned type = 0;
+    ASSERT_EQ(open_into_sentinel(&r, rec, 100, &buf, &n, &type), GTLS_OK) << pad;
+    ASSERT_EQ(n, pt.size());
+    EXPECT_EQ(Bytes(buf.begin(), buf.begin() + n), pt);
+    size_t body = rec.size() - 5 - 16;
+    EXPECT_TRUE(all_equal(buf, n, body, 0)) << "the content type byte and the padding stay in the buffer, pad " << pad;
+    EXPECT_TRUE(all_equal(buf, body, buf.size(), kSentinel)) << "past what was decrypted is not touched";
+  }
+}
+
+TEST(Records, AnOpenThatFailsLeavesNothingOfTheDecryptedRecordInTheCallersBuffer) {
+  Bytes secret(32, 7);
+  GTLS_RecordKeys w, r;
+  ASSERT_EQ(gtls_record_keys_from_secret(&w, GTLS_SUITE_AES_128_GCM_SHA256, secret.data(), 0), GTLS_OK);
+  ASSERT_EQ(gtls_record_keys_from_secret(&r, GTLS_SUITE_AES_128_GCM_SHA256, secret.data(), 0), GTLS_OK);
+  Bytes buf;
+  size_t n = 0;
+  unsigned type = 0;
+
+  /* The tag does not verify. The primitive leaves the output zero itself, so
+   * the wipe in gtls_record_open is a second line here that no plant can show
+   * (controls.sh tried it: the test passes with it removed); the contract is
+   * asserted all the same. */
+  Bytes pt(60, 0x42);
+  Bytes rec = seal_one(&w, GTLS_CT_APPLICATION_DATA, pt, 5);
+  size_t body = rec.size() - 5 - 16;
+  Bytes bad = rec;
+  bad.back() ^= 1;
+  EXPECT_EQ(open_into_sentinel(&r, bad, 100, &buf, &n, &type), GTLS_ERR_MISMATCH);
+  EXPECT_TRUE(all_equal(buf, 0, body, 0)) << "authentication failure";
+  EXPECT_TRUE(all_equal(buf, body, buf.size(), kSentinel));
+  EXPECT_EQ(r.seq, 0u);
+
+  /* Padding past what the caller allows, on a record that does authenticate. */
+  EXPECT_EQ(open_into_sentinel(&r, rec, 4, &buf, &n, &type), GTLS_ERR_LIMIT);
+  EXPECT_TRUE(all_equal(buf, 0, body, 0)) << "padding past the cap";
+  EXPECT_TRUE(all_equal(buf, body, buf.size(), kSentinel));
+  EXPECT_EQ(r.seq, 0u);
+
+  /* Nothing but zeros inside: authentic, and no content type. Built with
+   * AES-GCM directly, because the library will not seal a type of 0. */
+  Bytes key(16, 0x33), iv(12, 0x44);
+  GTLS_RecordKeys z;
+  ASSERT_EQ(gtls_record_keys_from_raw(&z, GTLS_SUITE_AES_128_GCM_SHA256, key.data(), iv.data(), 0), GTLS_OK);
+  Bytes inner(30, 0), header = {0x17, 3, 3, 0, 46}, ct(30), tag(16);
+  ASSERT_EQ(gsec_aes_gcm_encrypt(key.data(), 16, iv.data(), 12, header.data(), 5, inner.data(), 30,
+                ct.data(), tag.data(), 16),
+      GSEC_OK);
+  Bytes zero = header;
+  zero.insert(zero.end(), ct.begin(), ct.end());
+  zero.insert(zero.end(), tag.begin(), tag.end());
+  /* A zero plaintext is zero whether or not it was wiped, so this case checks
+   * the verdict and that nothing past the body was touched, not the wipe. */
+  EXPECT_EQ(open_into_sentinel(&z, zero, 100, &buf, &n, &type), GTLS_ERR_PROTOCOL);
+  EXPECT_TRUE(all_equal(buf, 0, 30, 0));
+  EXPECT_TRUE(all_equal(buf, 30, buf.size(), kSentinel));
+
+  /* Refused before any decryption: nothing was written, so nothing to wipe. */
+  Bytes big(GTLS_RECORD_CIPHER_MAX + 1, 0);
+  buf.assign(GTLS_RECORD_CIPHER_MAX, kSentinel);
+  EXPECT_EQ(gtls_record_open(&r, header.data(), big.data(), big.size(), 100, buf.data(), &n, &type),
+      GTLS_ERR_LIMIT);
+  EXPECT_TRUE(all_equal(buf, 0, buf.size(), kSentinel));
+  EXPECT_EQ(gtls_record_open(&r, header.data(), big.data(), 15, 100, buf.data(), &n, &type), GTLS_ERR_MISMATCH);
+  EXPECT_TRUE(all_equal(buf, 0, buf.size(), kSentinel));
+}
+
 TEST(Records, TheCapsOnSizeAreTheRfcs) {
   Bytes secret(32, 7);
   GTLS_RecordKeys w;
