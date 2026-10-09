@@ -36,7 +36,7 @@
 # for more than $CONTROLS_TIMEOUT seconds, 600 by default, which is counted as
 # caught: a planted loop is a failed test). The exit status is non-zero for
 # any SURVIVED or ERROR, and the last line says how many of each and how long
-# it took.
+# it took. CONTROLS_VERBOSE=N prints the first N failure lines of each caught plant.
 
 set -u
 
@@ -283,7 +283,7 @@ early-server-reserve	src/server/server.c	    result = gtls_buf_reserve(\&c->earl
 early-server-ee	src/server/server.c	  ee.early_data = early;	  ee.early_data = 0;	testEarly	Early.*
 early-server-secret	src/server/server.c	  if (result == GTLS_OK \&\& early) {\n    result = gtls_schedule_early_traffic(\&c->sec.schedule, k->th_ch);\n  }\n		testEarly	Early.*
 early-server-transcript	src/server/server.c	    result = gtls_transcript_snapshot(\&c->sec.transcript, hash, k->th_ch);	    result = GTLS_OK;	testEarly	Early.*
-early-server-state	src/server/server.c	  c->state = early ? GTLS_STATE_S_WAIT_EOED : GTLS_STATE_S_WAIT_FIN;	  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;	testEarly	EarlyEnd.*
+early-server-state	src/server/server.c	  c->state = early \&\& !c->context->omit_end_of_early_data ? GTLS_STATE_S_WAIT_EOED\n                                                           : GTLS_STATE_S_WAIT_FIN;	  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;	testEarly	EarlyEnd.*
 early-eoed-state	src/server/server.c	  c->state = GTLS_STATE_S_WAIT_FIN;\n  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	testEarly	EarlyEnd.*
 early-eoed-transcript	src/server/server.c	  result = gtls_transcript_update(\&c->sec.transcript, msg, msg_len);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  /* The early key has done its work: nothing is read under it again. */	  result = GTLS_OK;\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  /* The early key has done its work: nothing is read under it again. */	testEarly	Early.*
 early-eoed-parse	src/server/server.c	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  (void)result;	testEarly	EarlyEnd.*
@@ -366,6 +366,12 @@ limit-zero-ticket-bytes	src/core/core.c	  GTLS_RESOLVE_ZERO(max_ticket_bytes)	  
 limit-zero-cookie	src/core/core.c	  GTLS_RESOLVE_ZERO(max_cookie_bytes)	  GTLS_RESOLVE(max_cookie_bytes)	testMsg	ServerHello.AZeroCookieCap*
 limit-zero-early-bytes	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_data_bytes)	  GTLS_RESOLVE(max_early_data_bytes)	testEarly	EarlyContext.AZeroLimit*
 limit-zero-early-skip	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_skip_bytes)	  GTLS_RESOLVE(max_early_skip_bytes)	testEarly	EarlyRejected.AZeroSkip*
+quic-client-eoed	src/client/client.c	c->early_status == GTLS_EARLY_ACCEPTED \&\&\n      !c->context->omit_end_of_early_data) {	c->early_status == GTLS_EARLY_ACCEPTED) {	testEarly	QuicNoEndOfEarlyData.*
+quic-server-wait	src/server/server.c	early \&\& !c->context->omit_end_of_early_data ?	early ?	testEarly	QuicNoEndOfEarlyData.*
+quic-secret-wipe	src/client/client.c	  if (c->context->omit_end_of_early_data \&\& c->sec.schedule.has_e \&\&\n      c->sec.schedule.stage >= 2) {	  if (0) {	testEarly	QuicNoEndOfEarlyData.*
+quic-secret-wipe-early	src/client/client.c	      c->sec.schedule.stage >= 2) {\n    /* Nothing under QUIC	      c->sec.schedule.stage >= 1) {\n    /* Nothing under QUIC	testEarly	QuicNoEndOfEarlyData.*
+quic-no-stream	src/client/stream.c	c->mode == GTLS_MODE_MESSAGE || c->context->omit_end_of_early_data	c->mode == GTLS_MODE_MESSAGE	testEarly	QuicNoEndOfEarlyData.*
+quic-context-copy	src/client/context.c	  c->omit_end_of_early_data = config->omit_end_of_early_data != 0;	  c->omit_end_of_early_data = 0;	testEarly	QuicNoEndOfEarlyData.*
 PLANTS
 }
 
@@ -524,6 +530,9 @@ while IFS="$tab" read -r name file from to test filter mode; do
     echo "controls: $name: $test still PASSES with the check removed" >&2
     survived=$((survived + 1))
   else
+    if [ -n "${CONTROLS_VERBOSE:-}" ]; then
+      grep -E "Failure|FAILED|Segmentation|Expected|Which is|actual" "$scratch/out.txt" | head -${CONTROLS_VERBOSE} >&2
+    fi
     if [ "$rc" -eq 124 ]; then
       echo "controls: $name: $test timed out with the check removed (counted as failing)"
     else

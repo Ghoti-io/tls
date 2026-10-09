@@ -902,7 +902,10 @@ static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resum
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  c->state = early ? GTLS_STATE_S_WAIT_EOED : GTLS_STATE_S_WAIT_FIN;
+  /* Under QUIC nothing ends the early data by message (RFC 9001 section 8.3):
+   * the next thing the client sends is its Finished. */
+  c->state = early && !c->context->omit_end_of_early_data ? GTLS_STATE_S_WAIT_EOED
+                                                           : GTLS_STATE_S_WAIT_FIN;
   return GTLS_OK;
 }
 

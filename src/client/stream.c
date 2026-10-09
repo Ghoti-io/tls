@@ -591,7 +591,7 @@ static GTLS_Result check_header(GTLS_Conn * c) {
 }
 
 static GTLS_Result stream_ready(GTLS_Conn * c) {
-  if (c->mode == GTLS_MODE_MESSAGE) {
+  if (c->mode == GTLS_MODE_MESSAGE || c->context->omit_end_of_early_data) {
     return GTLS_ERR_INVALID;
   }
   c->mode = GTLS_MODE_STREAM;

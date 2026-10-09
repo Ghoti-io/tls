@@ -99,6 +99,7 @@ struct GTLS_Context {
   uint32_t max_early_data;
   GTLS_AntiReplayFn anti_replay;
   void * anti_replay_user;
+  int omit_end_of_early_data;       /* QUIC: no EndOfEarlyData is sent, hashed or waited for */
 };
 
 /**

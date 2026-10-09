@@ -193,6 +193,27 @@ typedef struct GTLS_ContextConfig {
   GTLS_AntiReplayFn anti_replay;  ///< A server's replay decision.
   void * anti_replay_user;        ///< Passed to ::anti_replay.
   /** @} */
+  /**
+   * Non-zero for a connection that carries its handshake over QUIC, where
+   * EndOfEarlyData does not exist (RFC 9001 section 8.3: the end of early data
+   * is the transport's, and a client MUST NOT send the message nor a server
+   * wait for it). Zero, the default, is TLS over a stream, which needs it.
+   *
+   * With it set, in the message interface: a client never queues or hashes
+   * EndOfEarlyData, so its Finished covers the transcript without it, and a
+   * server goes from sending its flight straight to waiting for the client's
+   * Finished at ::GTLS_EPOCH_HANDSHAKE, so an EndOfEarlyData in any epoch is
+   * ::GTLS_ERR_PROTOCOL (`unexpected_message`). The early secret
+   * (::gtls_conn_secret at ::GTLS_EPOCH_EARLY) is available as before, from
+   * the ClientHello (a client) or the call that accepts early data (a
+   * server), and is wiped by the first ::gtls_conn_feed after the call in which
+   * the handshake secrets were derived: the caller reads both from the same
+   * call, and has had its return to take the early one. The stream interface is
+   * not available to such a connection (every ::gtls_conn_stream_feed and
+   * its relatives return ::GTLS_ERR_INVALID): the records it would send carry
+   * no end of early data, which a stream peer needs.
+   */
+  int omit_end_of_early_data;
   /** @name Reserved for later pieces; must be zero or NULL today.
    * @{ */
   const void * psk;               ///< A pre-shared key.

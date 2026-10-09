@@ -344,8 +344,22 @@ is `unexpected_message` (the server tries the handshake key on a record that
 does not open, to tell this from damage), an `EndOfEarlyData` with a body is
 `decode_error` and one sent to a server that did not accept is
 `unexpected_message`. At the message interface the same are enforced by epoch.
-QUIC forbids `EndOfEarlyData` (RFC 9001 section 8.3); using early data under QUIC
-is not what this is.
+QUIC forbids `EndOfEarlyData` (RFC 9001 section 8.3), and
+`GTLS_ContextConfig::omit_end_of_early_data` (off by default) is how a QUIC caller
+says so. With it set, at the message interface: a client that has early data accepted
+never queues the message and never hashes it, so its Finished covers the transcript
+without it; a server goes from its flight to waiting for the client's Finished at the
+handshake epoch, so an `EndOfEarlyData` in any epoch is `GTLS_ERR_PROTOCOL`
+(`unexpected_message`); the early secret stays readable through the call that derived
+the handshake secrets (a server derives both in the one `gtls_conn_feed` that takes the
+ClientHello, so it cannot be wiped inside it) and is wiped by the next
+`gtls_conn_feed`, which is when nothing else would; and the stream interface is
+`GTLS_ERR_INVALID`, since a stream peer needs the message. Tests run both roles through
+the message interface at every chunk size, and show that the two transcripts differ by
+exactly that message (a Finished made with it does not verify without it, and the other
+way about). Nothing else of QUIC is built here: no packet protection, no transport
+parameters, no key discard rules (planning/tls.md step 9). It is not checked against
+another stack's QUIC transcript; that comes with step 9's interop.
 
 **The client.** After `gtls_conn_start` and before the server's first message is
 fed, `gtls_conn_write_early` seals records under the early key behind the

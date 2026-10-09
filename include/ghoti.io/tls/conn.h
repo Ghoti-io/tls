@@ -68,7 +68,7 @@ extern "C" {
 /** @brief The keys a piece of handshake is protected with (RFC 9001 section 4). */
 typedef enum GTLS_Epoch {
   GTLS_EPOCH_INITIAL = 0,     ///< No keys: ClientHello and ServerHello.
-  GTLS_EPOCH_EARLY = 1,       ///< Early data keys: the client's, so a client's write and a server's read only. EndOfEarlyData is queued and fed at this epoch.
+  GTLS_EPOCH_EARLY = 1,       ///< Early data keys: the client's, so a client's write and a server's read only. EndOfEarlyData is queued and fed at this epoch (not under ::GTLS_ContextConfig::omit_end_of_early_data).
   GTLS_EPOCH_HANDSHAKE = 2,   ///< Handshake traffic keys.
   GTLS_EPOCH_APPLICATION = 3, ///< Application traffic keys.
   GTLS_EPOCH_COUNT = 4
@@ -214,7 +214,10 @@ GTLS_API unsigned gtls_conn_alert(const GTLS_Conn * conn);
  * as the client queues EndOfEarlyData, and as the server reads it; after that
  * it is ::GTLS_ERR_INVALID. It is the client's: only the client's
  * ::GTLS_DIR_WRITE and the server's ::GTLS_DIR_READ are it, and the other
- * direction is ::GTLS_ERR_INVALID.
+ * direction is ::GTLS_ERR_INVALID. Under
+ * ::GTLS_ContextConfig::omit_end_of_early_data (QUIC, RFC 9001 section 8.3)
+ * nothing ends it by message, so it is wiped by the first ::gtls_conn_feed
+ * after the call in which the handshake secrets were derived.
  *
  * @param epoch ::GTLS_EPOCH_EARLY, ::GTLS_EPOCH_HANDSHAKE or ::GTLS_EPOCH_APPLICATION.
  * @param out Receives one digest of the suite's hash; at least

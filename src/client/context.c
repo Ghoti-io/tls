@@ -312,6 +312,7 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   c->max_early_data = config->max_early_data;
   c->anti_replay = config->anti_replay;
   c->anti_replay_user = config->anti_replay_user;
+  c->omit_end_of_early_data = config->omit_end_of_early_data != 0;
   if (config->role == GTLS_ROLE_SERVER) {
     if (config->ticket_count > GTLS_TICKET_COUNT_MAX) {
       gcu_allocator_free(allocator, c);

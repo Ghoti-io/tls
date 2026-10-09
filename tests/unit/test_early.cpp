@@ -1357,8 +1357,11 @@ struct MsgEnded {
   MessagePair m;
   Bytes eoed, fin;
   Bytes client_secret;   /* the client's early secret, taken before it wipes it */
-  MsgEnded(const GTLS_Session * session, int verdict = 1) : m(*cred) {
+  MsgEnded(const GTLS_Session * session, int verdict = 1, int client_quic = 0, int server_quic = 0)
+      : m(*cred) {
     rp.verdict = verdict;
+    m.ccfg.omit_end_of_early_data = client_quic;
+    m.scfg.omit_end_of_early_data = server_quic;
     m.keys = {ekey(1)};
     m.scfg.max_early_data = 100;
     m.scfg.anti_replay = &Replay::fn;
@@ -1446,6 +1449,175 @@ TEST(EarlyEnd, InTheMessageInterfaceEndOfEarlyDataIsAnEarlyEpochMessageAndTheOrd
     EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, Bytes{5, 0, 0, 0}), GTLS_ERR_PROTOCOL);
     expect_failed_with(n.m.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
+}
+
+/* ------------------------------------------- QUIC: no EndOfEarlyData (RFC 9001 8.3) */
+
+TEST(QuicNoEndOfEarlyData, AClientNeverQueuesItAndItsFinishedCoversTheTranscriptWithoutIt) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  {
+    MsgEnded n(h.s, 1, 1, 1);
+    EXPECT_EQ(status_of(n.m.c.conn), GTLS_EARLY_ACCEPTED) << "early data was accepted all the same";
+    EXPECT_EQ(n.eoed.size(), 0u) << "nothing at the early epoch";
+    ASSERT_EQ(n.fin.size(), 36u);
+    EXPECT_EQ(n.fin[0], 20) << "the Finished is what the client sends";
+    EXPECT_EQ(gtls_conn_state(n.m.s.conn), GTLS_STATE_S_WAIT_FIN) << "and the server waits for nothing else";
+    EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, n.fin), GTLS_OK) << "which verifies against the transcript without it";
+    EXPECT_TRUE(gtls_conn_is_connected(n.m.s.conn));
+  }
+  {
+    /* The transcripts differ by exactly that message: a Finished made without it
+     * is not one a server that hashed it accepts, and the other way about. */
+    MsgEnded n(h.s, 1, 1, 0);
+    EXPECT_EQ(gtls_conn_state(n.m.s.conn), GTLS_STATE_S_WAIT_EOED);
+    EXPECT_EQ(n.feed(GTLS_EPOCH_EARLY, Bytes{5, 0, 0, 0}), GTLS_OK);
+    EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, n.fin), GTLS_ERR_FINISHED)
+        << "a QUIC client's Finished against a stream server's transcript";
+    expect_failed_with(n.m.s.conn, GTLS_ERR_FINISHED, GTLS_ALERT_DECRYPT_ERROR);
+  }
+  {
+    MsgEnded n(h.s, 1, 0, 1);
+    EXPECT_EQ(n.eoed, (Bytes{5, 0, 0, 0})) << "a client without the option still sends it";
+    EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, n.fin), GTLS_ERR_FINISHED)
+        << "and its Finished covers it, which a QUIC server never hashed";
+    expect_failed_with(n.m.s.conn, GTLS_ERR_FINISHED, GTLS_ALERT_DECRYPT_ERROR);
+  }
+}
+
+TEST(QuicNoEndOfEarlyData, AServerDoesNotWaitForItAndTreatsItAsUnexpectedInAnyEpoch) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  const Bytes eoed = {5, 0, 0, 0};
+  for (GTLS_Epoch e : {GTLS_EPOCH_INITIAL, GTLS_EPOCH_EARLY, GTLS_EPOCH_HANDSHAKE, GTLS_EPOCH_APPLICATION}) {
+    SCOPED_TRACE(e);
+    MsgEnded n(h.s, 1, 1, 1);
+    ASSERT_EQ(gtls_conn_state(n.m.s.conn), GTLS_STATE_S_WAIT_FIN);
+    EXPECT_EQ(n.feed(e, eoed), GTLS_ERR_PROTOCOL);
+    expect_failed_with(n.m.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  /* And after the Finished, whichever way it arrives. */
+  for (size_t cut = 0; cut <= 36; cut++) {
+    SCOPED_TRACE(cut);
+    MsgEnded n(h.s, 1, 1, 1);
+    ASSERT_EQ(n.fin.size(), 36u);
+    ASSERT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, Bytes(n.fin.begin(), n.fin.begin() + static_cast<long>(cut))), GTLS_OK);
+    ASSERT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, Bytes(n.fin.begin() + static_cast<long>(cut), n.fin.end())), GTLS_OK);
+    EXPECT_TRUE(gtls_conn_is_connected(n.m.s.conn));
+    EXPECT_NE(n.feed(GTLS_EPOCH_APPLICATION, eoed), GTLS_OK) << "nor does a connected server take one";
+  }
+  /* A server that did not accept early data had never waited for one. */
+  MsgEnded none(h.s, 0, 1, 1);
+  EXPECT_EQ(none.feed(GTLS_EPOCH_HANDSHAKE, eoed), GTLS_ERR_PROTOCOL);
+}
+
+TEST(QuicNoEndOfEarlyData, TheWholeHandshakeRunsSplitAtEveryByteAndEveryChunkSize) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (size_t chunk : {size_t(0), size_t(1), size_t(2), size_t(5), size_t(37), size_t(250)}) {
+    SCOPED_TRACE(chunk);
+    for (int verdict : {1, 0}) {
+      SCOPED_TRACE(verdict);
+      EEnv e;
+      e.rp.verdict = verdict;
+      MessagePair m(*e.cred);
+      m.keys = {ekey(1)};
+      m.scfg.max_early_data = 4096;
+      m.scfg.anti_replay = &Replay::fn;
+      m.scfg.anti_replay_user = &e.rp;
+      m.ccfg.max_early_data = 4096;
+      m.ccfg.omit_end_of_early_data = 1;
+      m.scfg.omit_end_of_early_data = 1;
+      m.offer = h.s;
+      ASSERT_EQ(m.build(), GTLS_OK);
+      m.run(chunk);
+      EXPECT_TRUE(m.connected()) << result_name(gtls_conn_failure(m.c.conn)) << " / "
+                                 << result_name(gtls_conn_failure(m.s.conn));
+      EXPECT_EQ(m.s.feed_result, GTLS_OK);
+      EXPECT_EQ(m.c.feed_result, GTLS_OK);
+      EXPECT_EQ(status_of(m.c.conn), verdict ? GTLS_EARLY_ACCEPTED : GTLS_EARLY_REJECTED);
+    }
+  }
+}
+
+TEST(QuicNoEndOfEarlyData, TheEarlySecretIsReadableAfterTheCallThatDerivedTheHandshakeSecretsAndGoneAfterTheNext) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  e.rp.verdict = 1;
+  MessagePair m(*e.cred);
+  m.keys = {ekey(1)};
+  m.scfg.max_early_data = 4096;
+  m.scfg.anti_replay = &Replay::fn;
+  m.scfg.anti_replay_user = &e.rp;
+  m.ccfg.max_early_data = 4096;
+  m.ccfg.omit_end_of_early_data = 1;
+  m.scfg.omit_end_of_early_data = 1;
+  m.offer = h.s;
+  ASSERT_EQ(m.build(), GTLS_OK);
+  Bytes sec(GTLS_HASH_MAX), hs(GTLS_HASH_MAX);
+  size_t n = 0;
+  auto have = [&](GTLS_Conn * c, GTLS_Direction d) {
+    return gtls_conn_secret(c, GTLS_EPOCH_EARLY, d, sec.data(), sec.size(), &n) == GTLS_OK;
+  };
+  ASSERT_TRUE(have(m.c.conn, GTLS_DIR_WRITE)) << "the client has it from the ClientHello";
+  const Bytes client_secret(sec.begin(), sec.begin() + static_cast<long>(n));
+  EXPECT_FALSE(have(m.s.conn, GTLS_DIR_READ)) << "and the server before it has seen the hello";
+
+  Bytes hello = MessagePair::pending(m.c, GTLS_EPOCH_INITIAL);
+  ASSERT_EQ(gtls_conn_feed(m.s.conn, GTLS_EPOCH_INITIAL, hello.data(), hello.size(), m.now), GTLS_OK);
+  ASSERT_TRUE(have(m.s.conn, GTLS_DIR_READ)) << "the call that derived the handshake secrets leaves it";
+  EXPECT_EQ(Bytes(sec.begin(), sec.begin() + static_cast<long>(n)), client_secret) << "the same secret at both ends";
+  EXPECT_EQ(gtls_conn_secret(m.s.conn, GTLS_EPOCH_HANDSHAKE, GTLS_DIR_READ, hs.data(), hs.size(), &n), GTLS_OK)
+      << "and the handshake secrets are there beside it";
+
+  /* The server's flight, in order, to the client. */
+  Bytes sh = MessagePair::pending(m.s, GTLS_EPOCH_INITIAL);
+  Bytes flight = MessagePair::pending(m.s, GTLS_EPOCH_HANDSHAKE);
+  ASSERT_FALSE(sh.empty());
+  ASSERT_FALSE(flight.empty());
+  ASSERT_EQ(gtls_conn_feed(m.c.conn, GTLS_EPOCH_INITIAL, sh.data(), sh.size(), m.now), GTLS_OK);
+  EXPECT_TRUE(have(m.c.conn, GTLS_DIR_WRITE)) << "the client's call that derived them leaves it too";
+  ASSERT_EQ(gtls_conn_secret(m.c.conn, GTLS_EPOCH_HANDSHAKE, GTLS_DIR_READ, hs.data(), hs.size(), &n), GTLS_OK);
+  /* The next call: the first message of the flight (EncryptedExtensions). */
+  ASSERT_EQ(gtls_conn_feed(m.c.conn, GTLS_EPOCH_HANDSHAKE, flight.data(), 1, m.now), GTLS_OK);
+  EXPECT_FALSE(have(m.c.conn, GTLS_DIR_WRITE)) << "gone at the next call, with no EndOfEarlyData to retire it";
+  EXPECT_TRUE(zeros(m.c.conn->sec.schedule.c_e, sizeof m.c.conn->sec.schedule.c_e));
+  ASSERT_EQ(gtls_conn_feed(m.c.conn, GTLS_EPOCH_HANDSHAKE, flight.data() + 1, flight.size() - 1, m.now), GTLS_OK);
+  EXPECT_TRUE(gtls_conn_is_connected(m.c.conn));
+
+  Bytes fin = MessagePair::pending(m.c, GTLS_EPOCH_HANDSHAKE);
+  EXPECT_TRUE(have(m.s.conn, GTLS_DIR_READ)) << "the server still has it: it has not been called since";
+  ASSERT_EQ(gtls_conn_feed(m.s.conn, GTLS_EPOCH_HANDSHAKE, fin.data(), fin.size(), m.now), GTLS_OK);
+  EXPECT_FALSE(have(m.s.conn, GTLS_DIR_READ)) << "and the server's goes with the next one";
+  EXPECT_TRUE(zeros(m.s.conn->sec.schedule.c_e, sizeof m.s.conn->sec.schedule.c_e));
+}
+
+TEST(QuicNoEndOfEarlyData, TheStreamInterfaceIsNotAvailableToAConnectionWithoutIt) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Pair p(*a.cred);
+  p.keys = {ekey(1)};
+  p.ccfg.omit_end_of_early_data = 1;
+  p.scfg.omit_end_of_early_data = 1;
+  ASSERT_EQ(p.build(), GTLS_OK);
+  for (Endpoint * e : {&p.c, &p.s}) {
+    const unsigned char * out = nullptr;
+    size_t len = 0, used = 0, w = 0;
+    unsigned char buf[16];
+    EXPECT_EQ(gtls_conn_stream_output(e->conn, &out, &len), GTLS_ERR_INVALID);
+    EXPECT_EQ(gtls_conn_stream_feed(e->conn, buf, 0, p.now, &used), GTLS_ERR_INVALID);
+    EXPECT_EQ(gtls_conn_write(e->conn, "x", 1, &w), GTLS_ERR_INVALID);
+    EXPECT_EQ(gtls_conn_read(e->conn, buf, sizeof buf, &w), GTLS_ERR_INVALID);
+    EXPECT_EQ(gtls_conn_close(e->conn), GTLS_ERR_INVALID);
+  }
+  /* The message interface is. */
+  EXPECT_GT(MessagePair::pending(p.c, GTLS_EPOCH_INITIAL).size(), 0u);
 }
 
 TEST(EarlyEnd, TheEarlySecretIsExposedToTheMessageInterfaceInTheDirectionsThatExist) {

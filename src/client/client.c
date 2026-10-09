@@ -1149,8 +1149,11 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
   }
   /* Accepted early data is ended before the Finished, under the early key,
    * and it is part of what the Finished covers (section 4.5). The application
-   * secrets above are over the transcript through the server's Finished. */
-  if (result == GTLS_OK && c->early_status == GTLS_EARLY_ACCEPTED) {
+   * secrets above are over the transcript through the server's Finished. Under
+   * QUIC (RFC 9001 section 8.3) nothing ends it here: the transport does, and
+   * the Finished covers the transcript without the message. */
+  if (result == GTLS_OK && c->early_status == GTLS_EARLY_ACCEPTED &&
+      !c->context->omit_end_of_early_data) {
     GTLS_Buf eoed;
 
     gtls_buf_init(&eoed, c->allocator, 16u);
@@ -1383,6 +1386,14 @@ static GTLS_Result conn_feed(GTLS_Conn * c, GTLS_Epoch epoch, const void * data,
   }
   if (c->state == GTLS_STATE_NEW) {
     return GTLS_ERR_INVALID;
+  }
+  if (c->context->omit_end_of_early_data && c->sec.schedule.has_e &&
+      c->sec.schedule.stage >= 2) {
+    /* Nothing under QUIC ends the early secret by message, so this does: the
+     * handshake secrets were derived by an earlier call, which the caller has
+     * read the early secret after. */
+    (void)gsec_wipe(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e);
+    c->sec.schedule.has_e = 0;
   }
   if (len == 0) {
     return GTLS_OK;
