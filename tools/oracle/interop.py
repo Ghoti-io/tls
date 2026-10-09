@@ -41,6 +41,8 @@ between the two stacks that are not defects are declared in DIFFERENCES: a
 disagreement that is not declared fails the run, and a declared one that no
 longer happens fails it too.
 
+  --anchors      check that every plant's text is in the tree exactly once
+                 (needs no reference and no build; `make test` runs it).
   --plant NAME   build a scratch copy with a defect planted (see PLANTS),
                  and require the cases it must break to fail while the
                  unplanted build passes them. A gate that has never been
@@ -1027,8 +1029,8 @@ PLANTS = {
     "server-cv-label": ("src/client/verify.c", 'static const char server_label[] = "TLS 1.3, server CertificateVerify";',
                         'static const char server_label[] = "TLS 1.3, client CertificateVerify";',
                         ["server/default-ed", "server/default-p256"]),
-    "client-finished": ("src/client/client.c", "result = gtls_finished_verify_data(hash, c->sec.schedule.c_hs, th, verify);",
-                        "result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, th, verify);",
+    "client-finished": ("src/client/client.c", "result = gtls_finished_verify_data(hash, c->sec.schedule.c_hs, c->scratch.th,\n        c->scratch.verify, &c->scratch.mac);",
+                        "result = gtls_finished_verify_data(hash, c->sec.schedule.s_hs, c->scratch.th,\n        c->scratch.verify, &c->scratch.mac);",
                         ["client/default-ed", "client/default-p256"]),
     "alpn-failure": ("src/server/server.c",
                      "    if (c->alpn_selected_len == 0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,",
@@ -1064,8 +1066,8 @@ PLANTS = {
     # protocol changed, or the key renamed (the same bytes under a new name).
     # A client that took the PSK for granted breaks on a server that did not.
     "resume-binder-transcript": ("src/server/server.c",
-                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc, th);",
-                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc - 1u, th);",
+                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc, c->scratch.th);",
+                                 "result = gtls_binder_transcript(&c->sec.transcript, msg, o->psk_trunc - 1u, c->scratch.th);",
                                  ["server/resume-suite-aes128", "server/resume-suite-aes256", "server/resume-suite-chacha",
                                   "server/resume-group-x25519", "server/resume-group-p256", "server/resume-group-p384",
                                   "server/resume-retry-p256", "server/resume-retry-p384-aes256", "server/resume-alpn"]),
@@ -1078,10 +1080,10 @@ PLANTS = {
                                    "result = patch_binder(c, &c->sec.transcript, &h2);", "result = GTLS_OK;",
                                    ["client/resume-retry-p256", "client/resume-retry-p384-aes256"]),
     "resume-age-window": ("src/server/server.c",
-                          "gtls_ticket_fresh(&t, now, en->age, x->ticket_age_window * 1000u) &&", "1 &&",
+                          "gtls_ticket_fresh(t, now, en->age, x->ticket_age_window * 1000u) &&", "1 &&",
                           ["server/resume-refused-clock", "server/early-refused-clock"]),
     "resume-sni": ("src/server/server.c",
-                   "t.sni_len == o->host.len && names_equal(t.sni, o->host.p, t.sni_len) &&", "1 &&",
+                   "t->sni_len == o->host.len && names_equal(t->sni, o->host.p, t->sni_len) &&", "1 &&",
                    ["server/resume-refused-name"]),
     "resume-key-name": ("src/session/ticket.c",
                         "gsec_equal(keys[i].name, ticket, GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {", "1) {",
@@ -1090,7 +1092,7 @@ PLANTS = {
                               "if ((sh.flags & GTLS_SH_FLAG_PSK) != 0) {", "if (c->offer != NULL) {",
                               ["client/resume-refused-new-server", "client/early-refused-new-server"]),
     "resume-alpn": ("src/server/server.c",
-                    "(t.alpn_len == 0 || offered_alpn(o, t.alpn, t.alpn_len));", "1;",
+                    "(t->alpn_len == 0 || offered_alpn(o, t->alpn, t->alpn_len));", "1;",
                     ["server/resume-refused-alpn"]),
     "resume-selected": ("src/server/server.c", "sp.psk = resumed;", "sp.psk = 0;",
                         ["server/resume-suite-aes128", "server/resume-group-p256", "server/resume-retry-p256"]),
@@ -1114,7 +1116,8 @@ PLANTS = {
                               "      gsec_equal(r->plain.alpn, c->alpn_selected, c->alpn_selected_len) != GSEC_OK) {",
                               "      0) {", ["server/early-refused-alpn"]),
     "early-server-eoed-not-awaited": ("src/server/server.c",
-                                      "  c->state = early ? GTLS_STATE_S_WAIT_EOED : GTLS_STATE_S_WAIT_FIN;",
+                                      "  c->state = early && !c->context->omit_end_of_early_data ? GTLS_STATE_S_WAIT_EOED\n"
+                                      "                                                           : GTLS_STATE_S_WAIT_FIN;",
                                       "  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;",
                                       ["server/early-suite-aes128", "server/early-group-p256", "server/early-alpn",
                                        "server/early-compat"]),
@@ -1230,7 +1233,26 @@ def main():
     ap.add_argument("--only")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--plant")
+    ap.add_argument("--anchors", action="store_true")
     args = ap.parse_args()
+    if args.anchors:
+        # Needs no reference and no build: every plant's text is in the tree
+        # exactly once, so a plant that stopped applying (the code moved) fails
+        # `make test` rather than going unmeasured until the next interop run.
+        bad = 0
+        for name, (rel, old, _new, _must) in sorted(PLANTS.items()):
+            with open(os.path.join(ROOT, rel)) as f:
+                n = f.read().count(old)
+            if n != 1:
+                print("interop: plant %s: its text occurs %d times in %s (stale plant)" % (name, n, rel),
+                      file=sys.stderr)
+                bad = 1
+        problems = plant_coverage_problems(population())
+        for p in problems:
+            print("interop: %s" % p, file=sys.stderr)
+        if not bad and not problems:
+            print("interop: %d plants, each applying exactly once" % len(PLANTS))
+        return 1 if bad or problems else 0
     cases = population()
     if args.list:
         for c in cases:

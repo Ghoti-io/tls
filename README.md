@@ -192,6 +192,13 @@ against OpenSSL in both roles, accepted and refused (a callback that says no, a
 replay, another ALPN protocol, a retry, a ticket that did not resume), with the
 pump fuzzer sending early data in both directions.
 
+**Built (2026-10-09):** a connection that is told it is QUIC
+(`GTLS_ContextConfig::omit_end_of_early_data`) leaves out `EndOfEarlyData` in both roles at
+the message interface (RFC 9001 section 8.3); a limit can be written as zero
+(`GTLS_LIMIT_ZERO`); and the temporaries that hold a secret are kept where a test can see
+them, with a plant for each wipe. `make check-controls` runs every planted defect
+(`tools/controls.sh`) incrementally.
+
 **Not built, in the order the plan takes them** (`planning/tls.md`): the `http`
 adapter; mutual authentication and revocation in the handshake; TLS 1.2;
 QUIC hardening and DTLS.

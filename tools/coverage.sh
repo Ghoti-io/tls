@@ -70,6 +70,7 @@ awk '
     } else if (!(key in hit)) {
       body[key] = text
     }
+    if (count == "#####" || count == "$$$$$") { missed[key] = text }
     file_of[key] = src
   }
 
@@ -109,6 +110,18 @@ awk '
     }
     printf "%-52s %8d %6.1f%%\n", "TOTAL", grand_total,
       (grand_total ? grand_covered * 100 / grand_total : 0)
+
+    # GTLS_COVERAGE_LINES=1 lists every line no test executed, file by file, so
+    # each can be given a reason (STATUS.md keeps them).
+    if (ENVIRON["GTLS_COVERAGE_LINES"] != "") {
+      printf "\nLines never executed:\n"
+      for (key in seen) {
+        if (!(key in hit)) {
+          split(key, kp, ":")
+          printf "%s:%06d:%s\n", kp[1], kp[2], missed[key]
+        }
+      }
+    }
 
     if (gap_count > 0) {
       printf "\n%d growth/capacity lines never executed:\n", gap_count

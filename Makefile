@@ -266,7 +266,8 @@ TESTFLAGS := `PKG_CONFIG_PATH=$(PKG_CONFIG_LOOKUP_PATH) pkg-config --libs --cfla
 # coverage clears this: --coverage links the gcov runtime, whose mangle_path
 # check-symbols is right to reject in a shipping library.
 TEST_GATES ?= check-symbols check-aliasing check-stamps check-secret check-harden \
-	check-depfiles check-analyzer check-foundation check-ct check-fuzz-ub check-controls-anchors
+	check-depfiles check-analyzer check-foundation check-ct check-fuzz-ub check-controls-anchors \
+	check-interop-anchors
 
 VALGRIND_FLAGS := --leak-check=full --show-leak-kinds=definite,indirect,possible --track-origins=yes --error-exitcode=1 --suppressions=tests/valgrind.supp
 
@@ -385,7 +386,7 @@ $(APP_DIR)/examples/%$(EXE_EXTENSION): examples/%.c $(APP_DIR)/$(STATIC_TARGET) 
 
 .PHONY: clean cloc docs docs-pdf examples coverage check-symbols check-stamps check-aliasing
 .PHONY: check-secret check-foundation check-ct check-fuzz-ub check-harden check-depfiles
-.PHONY: check-analyzer analyze check-interop interop-plants check-controls check-controls-anchors
+.PHONY: check-analyzer analyze check-interop interop-plants check-controls check-controls-anchors check-interop-anchors
 .PHONY: all install test test-quiet test-asan test-valgrind test-valgrind-quiet test-watch uninstall watch
 .PHONY: all-debug install-debug test-debug test-valgrind-debug test-watch-debug uninstall-debug watch-debug
 .PHONY: fuzz fuzz-clean
@@ -512,6 +513,9 @@ check-fuzz-ub: ## Fail unless the fuzz flags make undefined behaviour a failing 
 
 check-controls-anchors: ## Fail if a planted defect in tools/controls.sh no longer applies exactly once
 	@sh tools/controls.sh --anchors
+
+check-interop-anchors: ## Fail if a planted defect in tools/oracle/interop.py no longer applies exactly once
+	@python3 tools/oracle/interop.py --anchors
 
 check-controls: ## Plant every defect in tools/controls.sh in a scratch copy, incrementally, and require its test to fail (needs PREFIX; an hour or so)
 	@sh tools/controls.sh
