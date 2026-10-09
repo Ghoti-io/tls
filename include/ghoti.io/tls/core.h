@@ -124,10 +124,31 @@ GTLS_API const char * gtls_result_string(GTLS_Result result);
 #define GTLS_HANDSHAKE_MESSAGE_DEFAULT 262144u
 
 /**
+ * A limit of zero, for the fields below that say they take it.
+ *
+ * In a ::GTLS_Limits field 0 means "the default", so a caller who wants the
+ * cap to be zero cannot write zero. For the seven fields that name this
+ * constant, @c GTLS_LIMIT_ZERO (the largest 32-bit value) is resolved to a
+ * real zero when a context is made: ::GTLS_Limits::max_record_padding,
+ * ::GTLS_Limits::max_key_updates, ::GTLS_Limits::max_ticket_bytes,
+ * ::GTLS_Limits::max_cookie_bytes, ::GTLS_Limits::max_early_data_bytes and
+ * ::GTLS_Limits::max_early_skip_bytes. That also means a cap of 4294967295
+ * cannot be written for those six (it is zero); no cap that large is useful,
+ * since each is bounded by a smaller wire field. In every other field the
+ * value is an ordinary one. Most have no use for a zero (a handshake with no
+ * messages). ::GTLS_Limits::max_tickets does, but only as a way to make every
+ * client that offers a ticket fatal, which is not what "no resumption" means:
+ * that is a server with no ticket keys or a ::GTLS_ContextConfig::ticket_count
+ * of 0, and a client that never offers a session.
+ */
+#define GTLS_LIMIT_ZERO 0xffffffffu
+
+/**
  * @brief Caps on quantities a peer can ask the library to spend.
  *
  * NULL at a call means these defaults, and 0 in a field means that field's
- * default. A cap reached is ::GTLS_ERR_LIMIT, never a truncation.
+ * default. A cap reached is ::GTLS_ERR_LIMIT, never a truncation. To ask for
+ * a cap of zero where zero is meaningful, write ::GTLS_LIMIT_ZERO.
  */
 typedef struct GTLS_Limits {
   /**
@@ -156,15 +177,18 @@ typedef struct GTLS_Limits {
    * and discards it, and a server passes over a larger identity as not its
    * own (the handshake is a full one). Default 16384. A server with ticket
    * keys needs at least the largest ticket it seals (::GTLS_ERR_LIMIT at
-   * context creation otherwise).
+   * context creation otherwise). ::GTLS_LIMIT_ZERO: a client keeps no ticket
+   * and a server tries no identity, so nothing resumes; a server with ticket
+   * keys is refused as above.
    */
   uint32_t max_ticket_bytes;
-  /** Largest cookie a HelloRetryRequest may ask to be echoed. Default 1024. */
+  /** Largest cookie a HelloRetryRequest may ask to be echoed. Default 1024. ::GTLS_LIMIT_ZERO: a HelloRetryRequest that carries a cookie is ::GTLS_ERR_LIMIT. */
   uint32_t max_cookie_bytes;
   /**
    * Most post-handshake NewSessionTicket messages one connection accepts,
    * and most identities a ClientHello's `pre_shared_key` may offer to a
-   * server (more is fatal on either side). Default 16.
+   * server (more is fatal on either side). Default 16. There is no zero (see
+   * ::GTLS_LIMIT_ZERO).
    */
   uint32_t max_tickets;
   /** Most bytes of output a connection holds unconsumed, per epoch. Default 65536. */
@@ -183,7 +207,7 @@ typedef struct GTLS_Limits {
    * Default 2^24.
    */
   uint32_t max_records_per_key;
-  /** Most bytes of zero padding accepted inside one received record. Default 16384. */
+  /** Most bytes of zero padding accepted inside one received record. Default 16384. ::GTLS_LIMIT_ZERO: a record with any padding is ::GTLS_ERR_LIMIT. */
   uint32_t max_record_padding;
   /**
    * Most bytes of decrypted application data a connection holds unread. When
@@ -191,7 +215,7 @@ typedef struct GTLS_Limits {
    * caller reads. Default 65536.
    */
   uint32_t max_app_buffer;
-  /** Most KeyUpdate messages one connection accepts. Default 65536. */
+  /** Most KeyUpdate messages one connection accepts. Default 65536. ::GTLS_LIMIT_ZERO: the first KeyUpdate received is ::GTLS_ERR_LIMIT. */
   uint32_t max_key_updates;
   /**
    * Most plaintext bytes of a client's early-data records a server discards
@@ -200,7 +224,9 @@ typedef struct GTLS_Limits {
    * the 17 bytes of inner type and tag (one byte, at least), which is what the
    * allowances count; the budget is this or the context's ::GTLS_ContextConfig::max_early_data,
    * whichever is larger. Past it the connection fails with ::GTLS_ERR_LIMIT.
-   * Default 16384 plus the record overhead (16384 + 256 + 5).
+   * Default 16384 plus the record overhead (16384 + 256 + 5). ::GTLS_LIMIT_ZERO:
+   * the first skipped record that costs anything is ::GTLS_ERR_LIMIT, unless
+   * the context's allowance covers it.
    */
   uint32_t max_early_skip_bytes;
   /**
@@ -208,6 +234,7 @@ typedef struct GTLS_Limits {
    * this as `max_early_data_size`, and a client holds at most this many bytes
    * it has sent as early data until the server's answer is known. A context
    * whose @c max_early_data is above it is ::GTLS_ERR_LIMIT. Default 16384.
+   * ::GTLS_LIMIT_ZERO: no context may allow any early data.
    */
   uint32_t max_early_data_bytes;
 } GTLS_Limits;

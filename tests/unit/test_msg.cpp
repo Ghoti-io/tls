@@ -531,6 +531,24 @@ TEST(ServerHello, CookieLargerThanTheLimitIsALimitNotATruncation) {
   EXPECT_EQ(gtls_msg_parse_server_hello(body.data(), body.size(), &l, &s), GTLS_OK);
 }
 
+TEST(ServerHello, AZeroCookieCapRefusesAnyCookie) {
+  Bytes hrr(32);
+  ASSERT_EQ(gsec_sha256("HelloRetryRequest", 17, hrr.data()), GSEC_OK);
+  Bytes cookie;
+  put16(cookie, 1);
+  cookie.push_back(7);
+  Bytes body = server_hello_body({ext(GTLS_EXT_COOKIE, cookie), versions13()}, true, 0x1301, &hrr);
+  GTLS_ServerHello s;
+  for (bool zero : {false, true}) {
+    GTLS_Limits in, l;
+    gtls_limits_default(&in);
+    in.max_cookie_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    gtls_limits_resolve(&in, &l);
+    EXPECT_EQ(gtls_msg_parse_server_hello(body.data(), body.size(), &l, &s),
+        zero ? GTLS_ERR_LIMIT : GTLS_OK);
+  }
+}
+
 TEST(ServerHello, MoreExtensionsThanTheLimitIsALimit) {
   GTLS_Limits l = limits();
   l.max_extensions = 3;

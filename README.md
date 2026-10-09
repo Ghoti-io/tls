@@ -155,7 +155,9 @@ fail. `make test` runs no container. `make fuzz` runs the six fuzzers
   (message size, whole-handshake size, ClientHello size, certificates,
   extensions, signature, ticket and cookie sizes, tickets, padding in a record,
   unread data, key updates, queued output). A cap reached is
-  `GTLS_ERR_LIMIT`, never a truncation.
+  `GTLS_ERR_LIMIT`, never a truncation. 0 in a field is the default, so a cap
+  of zero where it means something (padding, key updates, ticket size, cookie
+  size, early data) is written `GTLS_LIMIT_ZERO`.
 
 What it checks is in [`documentation/design.md`](documentation/design.md), with
 the version and deviations it implements: RFC 8446 (TLS 1.3), RFC 6066 (SNI),

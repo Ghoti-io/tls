@@ -484,6 +484,22 @@ header as additional data, and the outer type says application data
 | the peer sent a fatal alert | `GTLS_ERR_ALERT` | none |
 | the stream ended without close_notify | `GTLS_ERR_TRUNCATED` | none |
 
+**A cap of zero.** In `GTLS_Limits` a field of 0 is that field's default, so zero
+itself cannot be written. Six fields can be asked for a true zero with
+`GTLS_LIMIT_ZERO` (`0xffffffff`), which `gtls_limits_resolve` turns into 0 when the
+context is made: `max_record_padding` (a record with any padding is
+`GTLS_ERR_LIMIT`, `record_overflow`), `max_key_updates` (the first KeyUpdate
+received is `GTLS_ERR_LIMIT`, `unexpected_message`), `max_ticket_bytes` (a client
+keeps no ticket and a server tries no identity; a server with ticket keys is refused
+at the context, as for any size below the largest ticket), `max_cookie_bytes` (a
+HelloRetryRequest with a cookie is `GTLS_ERR_LIMIT`), `max_early_data_bytes` (no
+context may allow early data) and `max_early_skip_bytes` (a server that does not
+take early data fails on the first record of it that costs anything). A cap of
+4294967295 cannot be written for those six. The others have no use for a zero,
+and `max_tickets` is left out on purpose: zero would make every client that
+offers a ticket fatal to a server, which is not what turning resumption off means
+(no ticket keys, or `ticket_count` 0).
+
 The chain is built and validated by `gcert_chain_build`, whose verdict is
 `gcert_x509_path`'s; the name by `gcert_x509_verify_host`; the signature by
 `gcert_x509_verify_signature` over the 64-space context string and the

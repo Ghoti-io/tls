@@ -538,6 +538,34 @@ TEST(Stream, PaddingInAReceivedRecordIsAcceptedAndCapped) {
   gtls_buf_free(&b);
 }
 
+TEST(Stream, AZeroPaddingCapAcceptsNoPaddingAtAll) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  for (bool zero : {false, true}) {
+    /* Without the constant, 0 is the default: padding is accepted. */
+    Pair p(*cred);
+    p.slimits.max_record_padding = zero ? GTLS_LIMIT_ZERO : 0;
+    ASSERT_EQ(p.build(), GTLS_OK);
+    p.run();
+    ASSERT_TRUE(p.connected());
+    GTLS_Buf b;
+    gtls_buf_init(&b, nullptr, 1 << 16);
+    ASSERT_EQ(gtls_record_seal(&p.c.conn->sec.wr, GTLS_CT_APPLICATION_DATA, "ab", 2, 0, &b), GTLS_OK);
+    ASSERT_EQ(give(p.s.conn, Bytes(b.data, b.data + b.len)), GTLS_OK) << "a record with no padding is fine";
+    EXPECT_EQ(read_all(p.s.conn), (Bytes{'a', 'b'}));
+    b.len = 0;
+    ASSERT_EQ(gtls_record_seal(&p.c.conn->sec.wr, GTLS_CT_APPLICATION_DATA, "cd", 2, 1, &b), GTLS_OK);
+    GTLS_Result r = give(p.s.conn, Bytes(b.data, b.data + b.len));
+    if (zero) {
+      EXPECT_EQ(r, GTLS_ERR_LIMIT) << "one byte of padding is past a cap of zero";
+      EXPECT_EQ(gtls_conn_alert(p.s.conn), GTLS_ALERT_RECORD_OVERFLOW);
+    } else {
+      EXPECT_EQ(r, GTLS_OK) << "the default accepts it";
+      EXPECT_EQ(read_all(p.s.conn), (Bytes{'c', 'd'}));
+    }
+    gtls_buf_free(&b);
+  }
+}
+
 TEST(Stream, ARecordOfNothingButPaddingIsRefused) {
   std::unique_ptr<Cred> cred = ed_cred();
   Pair p(*cred);
@@ -1063,6 +1091,26 @@ TEST(KeyUpdate, OneRequestIsAnsweredOnceAndAFloodIsCapped) {
   EXPECT_TRUE(gtls_conn_is_failed(p.s.conn));
   EXPECT_EQ(gtls_conn_failure(p.s.conn), GTLS_ERR_LIMIT);
   EXPECT_EQ(gtls_conn_alert(p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+TEST(KeyUpdate, AZeroCapRefusesTheFirstOneReceived) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  for (bool zero : {false, true}) {
+    Pair p(*cred);
+    p.slimits.max_key_updates = zero ? GTLS_LIMIT_ZERO : 0;
+    ASSERT_EQ(p.build(), GTLS_OK);
+    p.run();
+    ASSERT_TRUE(p.connected());
+    ASSERT_EQ(gtls_conn_key_update(p.c.conn, 1), GTLS_OK);
+    p.run();
+    if (zero) {
+      EXPECT_TRUE(gtls_conn_is_failed(p.s.conn));
+      EXPECT_EQ(gtls_conn_failure(p.s.conn), GTLS_ERR_LIMIT);
+      EXPECT_EQ(gtls_conn_alert(p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+    } else {
+      EXPECT_FALSE(gtls_conn_is_failed(p.s.conn)) << "without the constant 0 is the default, 65536";
+    }
+  }
 }
 
 TEST(KeyUpdate, MalformedAndMisplacedUpdatesAreRefused) {

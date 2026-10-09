@@ -552,6 +552,26 @@ TEST(EarlyContext, TheAllowanceIsAtMostTheLimitAndTheLimitIsTheDefault) {
   EXPECT_EQ(e.build(), GTLS_ERR_LIMIT);
 }
 
+TEST(EarlyContext, AZeroLimitAllowsNoEarlyDataInEitherRole) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  Replay rp;
+  for (bool zero : {false, true}) {
+    Pair p(*cred);
+    p.slimits.max_early_data_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    p.scfg.anti_replay = &Replay::fn;
+    p.scfg.anti_replay_user = &rp;
+    p.scfg.max_early_data = 1;
+    EXPECT_EQ(p.build(), zero ? GTLS_ERR_LIMIT : GTLS_OK) << "a server allowing one byte";
+    Pair c(*cred);
+    c.climits.max_early_data_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    c.ccfg.max_early_data = 1;
+    EXPECT_EQ(c.build(), zero ? GTLS_ERR_LIMIT : GTLS_OK) << "a client offering one byte";
+    Pair n(*cred);
+    n.slimits.max_early_data_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    EXPECT_EQ(n.build(), GTLS_OK) << "and a context that allows none is still fine";
+  }
+}
+
 TEST(EarlyContext, AClientDoesNotTakeTheReplayDecision) {
   std::unique_ptr<Cred> cred = ed_cred();
   Replay rp;
@@ -1853,6 +1873,31 @@ TEST(EarlyRejected, TheSkipBudgetIsTheLargerOfTheLimitAndTheContextsAllowanceAnd
         EXPECT_EQ(gtls_conn_failure(e.p.s.conn), GTLS_ERR_LIMIT);
         EXPECT_EQ(gtls_conn_alert(e.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
       }
+    }
+  }
+}
+
+TEST(EarlyRejected, AZeroSkipBudgetFailsOnTheFirstRecordOfAServerWithEarlyDataOff) {
+  EEnv a(4096);
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (bool zero : {false, true}) {
+    EEnv e(4096);
+    e.p.scfg.max_early_data = 0;          /* this server takes none, so what the client sends is skipped */
+    e.p.scfg.anti_replay = nullptr;
+    e.p.slimits.max_early_skip_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    e.p.offer = h.s;
+    ASSERT_EQ(e.p.build(), GTLS_OK);
+    size_t w = 0;
+    ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, "x", 1, &w), GTLS_OK);
+    e.p.run();
+    if (zero) {
+      EXPECT_TRUE(gtls_conn_is_failed(e.p.s.conn));
+      EXPECT_EQ(gtls_conn_failure(e.p.s.conn), GTLS_ERR_LIMIT);
+      EXPECT_EQ(gtls_conn_alert(e.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+    } else {
+      ASSERT_TRUE(e.p.connected()) << "0 is the default budget, which has room for a byte";
+      EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_REJECTED);
     }
   }
 }

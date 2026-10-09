@@ -80,6 +80,68 @@ TEST(Limits, ZeroFieldsResolveToTheDefaultAndSetOnesStay) {
   EXPECT_EQ(out.max_certificates, defaults.max_certificates);
 }
 
+namespace {
+
+/** Every field of the struct as an array, by name, so a table can walk them. */
+struct LimitField {
+  const char * name;
+  uint32_t GTLS_Limits::*member;
+  bool zeroable;
+};
+
+const LimitField kLimitFields[] = {
+    {"max_handshake_message", &GTLS_Limits::max_handshake_message, false},
+    {"max_handshake_total", &GTLS_Limits::max_handshake_total, false},
+    {"max_certificates", &GTLS_Limits::max_certificates, false},
+    {"max_certificate_bytes", &GTLS_Limits::max_certificate_bytes, false},
+    {"max_extensions", &GTLS_Limits::max_extensions, false},
+    {"max_signature_bytes", &GTLS_Limits::max_signature_bytes, false},
+    {"max_ticket_bytes", &GTLS_Limits::max_ticket_bytes, true},
+    {"max_cookie_bytes", &GTLS_Limits::max_cookie_bytes, true},
+    {"max_tickets", &GTLS_Limits::max_tickets, false},
+    {"max_output_bytes", &GTLS_Limits::max_output_bytes, false},
+    {"max_client_hello", &GTLS_Limits::max_client_hello, false},
+    {"max_records_per_key", &GTLS_Limits::max_records_per_key, false},
+    {"max_record_padding", &GTLS_Limits::max_record_padding, true},
+    {"max_app_buffer", &GTLS_Limits::max_app_buffer, false},
+    {"max_key_updates", &GTLS_Limits::max_key_updates, true},
+    {"max_early_skip_bytes", &GTLS_Limits::max_early_skip_bytes, true},
+    {"max_early_data_bytes", &GTLS_Limits::max_early_data_bytes, true},
+};
+
+}  // namespace
+
+TEST(Limits, TheTableNamesEveryFieldOfTheStruct) {
+  EXPECT_EQ(sizeof kLimitFields / sizeof *kLimitFields * sizeof(uint32_t), sizeof(GTLS_Limits))
+      << "a field was added to GTLS_Limits and not to this table, so it is not tested";
+}
+
+TEST(Limits, AZeroCapIsWrittenAsTheNamedConstantAndOnlyWhereZeroMeansSomething) {
+  GTLS_Limits defaults;
+  gtls_limits_default(&defaults);
+  for (const LimitField & f : kLimitFields) {
+    SCOPED_TRACE(f.name);
+    GTLS_Limits in, out;
+    std::memset(&in, 0, sizeof in);
+    gtls_limits_resolve(&in, &out);
+    EXPECT_EQ(out.*f.member, defaults.*f.member) << "0 is the default";
+    in.*f.member = 7;
+    gtls_limits_resolve(&in, &out);
+    EXPECT_EQ(out.*f.member, 7u) << "a set value stays";
+    in.*f.member = GTLS_LIMIT_ZERO;
+    gtls_limits_resolve(&in, &out);
+    EXPECT_EQ(out.*f.member, f.zeroable ? 0u : GTLS_LIMIT_ZERO)
+        << (f.zeroable ? "the named constant is a real zero" : "no zero here: the value is the value");
+    /* One field's constant does not move another's. */
+    for (const LimitField & g : kLimitFields) {
+      if (&g != &f) {
+        EXPECT_EQ(out.*g.member, defaults.*g.member) << g.name;
+      }
+    }
+  }
+  EXPECT_EQ(GTLS_LIMIT_ZERO, 0xffffffffu);
+}
+
 TEST(Version, StringMatchesTheGeneratedHeader) {
   EXPECT_STREQ(gtls_version_string(), GTLS_VERSION_STRING);
   EXPECT_EQ(gtls_version_number(), GTLS_VERSION_NUMBER);

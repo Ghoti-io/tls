@@ -131,22 +131,30 @@ void gtls_limits_resolve(const GTLS_Limits * in, GTLS_Limits * out) {
   if (out->field == 0) { \
     out->field = defaults.field; \
   }
+/* The fields where a cap of zero means something: GTLS_LIMIT_ZERO is the zero. */
+#define GTLS_RESOLVE_ZERO(field) \
+  if (out->field == 0) { \
+    out->field = defaults.field; \
+  } else if (out->field == GTLS_LIMIT_ZERO) { \
+    out->field = 0; \
+  }
   GTLS_RESOLVE(max_handshake_message)
   GTLS_RESOLVE(max_handshake_total)
   GTLS_RESOLVE(max_certificates)
   GTLS_RESOLVE(max_certificate_bytes)
   GTLS_RESOLVE(max_extensions)
   GTLS_RESOLVE(max_signature_bytes)
-  GTLS_RESOLVE(max_ticket_bytes)
-  GTLS_RESOLVE(max_cookie_bytes)
+  GTLS_RESOLVE_ZERO(max_ticket_bytes)
+  GTLS_RESOLVE_ZERO(max_cookie_bytes)
   GTLS_RESOLVE(max_tickets)
   GTLS_RESOLVE(max_output_bytes)
   GTLS_RESOLVE(max_client_hello)
   GTLS_RESOLVE(max_records_per_key)
-  GTLS_RESOLVE(max_record_padding)
+  GTLS_RESOLVE_ZERO(max_record_padding)
   GTLS_RESOLVE(max_app_buffer)
-  GTLS_RESOLVE(max_key_updates)
-  GTLS_RESOLVE(max_early_skip_bytes)
-  GTLS_RESOLVE(max_early_data_bytes)
+  GTLS_RESOLVE_ZERO(max_key_updates)
+  GTLS_RESOLVE_ZERO(max_early_skip_bytes)
+  GTLS_RESOLVE_ZERO(max_early_data_bytes)
 #undef GTLS_RESOLVE
+#undef GTLS_RESOLVE_ZERO
 }

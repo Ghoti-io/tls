@@ -1039,6 +1039,23 @@ TEST(Limits, ATicketLargerThanTheLimitIsDiscardedAndDoesNotFailTheConnection) {
   }
 }
 
+TEST(Limits, AZeroTicketCapKeepsNoTicketAndDoesNotFailTheConnection) {
+  for (bool zero : {false, true}) {
+    World w;
+    w.limits.max_ticket_bytes = zero ? GTLS_LIMIT_ZERO : 0;
+    w.build();
+    SimServer s(w.server_options());
+    ASSERT_EQ(w.run(s), GTLS_OK);
+    Vec v("simple-1rtt");
+    const Bytes nst = v["server.construct-a-newsessionticket-handshake-message.newsessionticket"];
+    EXPECT_EQ(w.feed(GTLS_EPOCH_APPLICATION, nst), GTLS_OK);
+    EXPECT_FALSE(gtls_conn_is_failed(w.conn));
+    EXPECT_EQ(w.conn->tickets, 1u);
+    EXPECT_EQ(gtls_conn_session_count(w.conn), zero ? 0u : 1u)
+        << "a cap of zero keeps none, and 0 without the constant is the default";
+  }
+}
+
 /* ---------------------------------------------- failure is terminal and wipes */
 
 TEST(Failure, TheSecretsExistBeforeTheFailureAndAreGoneAfter) {

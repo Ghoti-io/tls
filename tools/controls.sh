@@ -146,7 +146,7 @@ psk-binder-31	src/msg/msg.c	gtls_reader_vector(\&binders, 1, 32, 0, \&binder)	gt
 psk-modes-parse-result	src/server/server.c	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (0) {	testPsk
 early-data-parse-result	src/server/server.c	result = gtls_msg_parse_ch_early_data(e);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_early_data(e);\n    if (0) {	testPsk
 early-data-needs-psk	src/server/server.c	    if (o.early_data \&\& o.psk) {	    if (o.early_data) {	testPsk
-early-limit-resolve	src/core/core.c	  GTLS_RESOLVE(max_early_skip_bytes)\n	  (void)0;\n	testPsk
+early-limit-resolve	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_skip_bytes)\n	  (void)0;\n	testPsk
 early-skip-only-mismatch	src/client/stream.c	if (result == GTLS_ERR_MISMATCH \&\& c->early_skip	if (result != GTLS_OK \&\& c->early_skip	testPsk
 early-skip-header-type	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	!c->early_skip	testPsk
 early-skip-seq-advance	src/client/stream.c	(void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	c->sec.rd.seq++;\n      (void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	testPsk
@@ -359,6 +359,13 @@ fuzz-early-close-window	src/client/stream.c	  if (c->wr_epoch == GTLS_EPOCH_EARL
 fuzz-early-write-limit	src/client/stream.c	  if (len > c->early_max - c->early_used) {\n    return GTLS_ERR_LIMIT;\n  }\n  if (len == 0) {	  if (0) {\n    return GTLS_ERR_LIMIT;\n  }\n  if (len == 0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
 fuzz-early-write-zero	src/client/stream.c	  if (len == 0) {\n    return GTLS_OK;\n  }\n  /* The ClientHello goes first, and the dummy record after it. */	  /* The ClientHello goes first, and the dummy record after it. */	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
 fuzz-early-pin	src/client/client.c	      result = gtls_stream_pin_early(c);	      result = GTLS_OK;	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+limit-zero-const	src/core/core.c	  } else if (out->field == GTLS_LIMIT_ZERO) { \	  } else if (0) { \	testCore	Limits.AZeroCap*
+limit-zero-padding	src/core/core.c	  GTLS_RESOLVE_ZERO(max_record_padding)	  GTLS_RESOLVE(max_record_padding)	testStream	Stream.AZeroPaddingCap*
+limit-zero-key-updates	src/core/core.c	  GTLS_RESOLVE_ZERO(max_key_updates)	  GTLS_RESOLVE(max_key_updates)	testStream	KeyUpdate.AZeroCap*
+limit-zero-ticket-bytes	src/core/core.c	  GTLS_RESOLVE_ZERO(max_ticket_bytes)	  GTLS_RESOLVE(max_ticket_bytes)	testNegative	Limits.AZeroTicketCap*
+limit-zero-cookie	src/core/core.c	  GTLS_RESOLVE_ZERO(max_cookie_bytes)	  GTLS_RESOLVE(max_cookie_bytes)	testMsg	ServerHello.AZeroCookieCap*
+limit-zero-early-bytes	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_data_bytes)	  GTLS_RESOLVE(max_early_data_bytes)	testEarly	EarlyContext.AZeroLimit*
+limit-zero-early-skip	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_skip_bytes)	  GTLS_RESOLVE(max_early_skip_bytes)	testEarly	EarlyRejected.AZeroSkip*
 PLANTS
 }
 
