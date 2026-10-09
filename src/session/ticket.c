@@ -115,7 +115,8 @@ GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
       p->lifetime > GTLS_TICKET_LIFETIME_MAX) {
     return GTLS_ERR_INVALID;
   }
-  plain[n++] = (unsigned char)GTLS_TICKET_STATE_VERSION;
+  plain[n++] = (unsigned char)(p->max_early_data != 0 ? GTLS_TICKET_STATE_VERSION_EARLY
+                                                     : GTLS_TICKET_STATE_VERSION);
   plain[n++] = (unsigned char)(p->suite >> 8);
   plain[n++] = (unsigned char)p->suite;
   plain[n++] = (unsigned char)p->psk_len;
@@ -127,6 +128,10 @@ GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
   n += 8;
   put32(plain + n, p->lifetime);
   n += 4;
+  if (p->max_early_data != 0) {
+    put32(plain + n, p->max_early_data);
+    n += 4;
+  }
   plain[n++] = (unsigned char)p->alpn_len;
   memcpy(plain + n, p->alpn, p->alpn_len);
   n += p->alpn_len;
@@ -165,6 +170,7 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
   size_t n;
   size_t at = 0;
   size_t aad_len;
+  unsigned version;
   GSEC_Result opened;
   GTLS_Result result = GTLS_ERR_MISMATCH;
 
@@ -196,7 +202,11 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
    * version of this code, or another program, would still have to be read
    * with the bounds checked. */
   memset(&t, 0, sizeof t);
-  if (n < 1u + 2u + 1u || plain[at++] != GTLS_TICKET_STATE_VERSION) {
+  if (n < 1u + 2u + 1u) {
+    goto done;
+  }
+  version = plain[at++];
+  if (version != GTLS_TICKET_STATE_VERSION && version != GTLS_TICKET_STATE_VERSION_EARLY) {
     goto done;
   }
   t.suite = ((uint32_t)plain[at] << 8) | plain[at + 1u];
@@ -215,6 +225,13 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
   at += 8;
   t.lifetime = get32(plain + at);
   at += 4;
+  if (version == GTLS_TICKET_STATE_VERSION_EARLY) {
+    if (n - at < 4u + 1u) {
+      goto done;
+    }
+    t.max_early_data = get32(plain + at);
+    at += 4;
+  }
   t.alpn_len = plain[at++];
   if (t.lifetime > GTLS_TICKET_LIFETIME_MAX || n - at < t.alpn_len + 1u) {
     goto done;

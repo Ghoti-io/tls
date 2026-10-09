@@ -82,6 +82,7 @@ typedef enum {
   GTLS_ERR_ALERT,              ///< The peer sent a fatal alert; see ::gtls_conn_peer_alert.
   GTLS_ERR_NO_COMMON,          ///< The server found no suite, group or signature scheme both ends accept.
   GTLS_ERR_ALPN,               ///< Both ends have ALPN lists and no protocol is in both.
+  GTLS_ERR_EARLY_REJECTED,     ///< Early data was offered and the server did not accept it; see ::gtls_conn_early_status.
   GTLS_RESULT_COUNT
 } GTLS_Result;
 
@@ -195,12 +196,18 @@ typedef struct GTLS_Limits {
   /**
    * Most bytes (headers included) of a client's early-data records a server
    * discards without reading them, after a ClientHello that offered
-   * `early_data` (RFC 8446 section 4.2.10; this server never accepts early
-   * data, so it has to skip it). Past this the connection fails with
-   * ::GTLS_ERR_LIMIT. Default 16384 plus the record overhead (one maximal
-   * record: 16384 + 256 + 5 bytes).
+   * `early_data` and does not accept it (RFC 8446 section 4.2.10). Past this
+   * the connection fails with ::GTLS_ERR_LIMIT. Default 16384 plus the record
+   * overhead (one maximal record: 16384 + 256 + 5 bytes).
    */
   uint32_t max_early_skip_bytes;
+  /**
+   * Most early data a context may allow: a server's tickets carry at most
+   * this as `max_early_data_size`, and a client holds at most this many bytes
+   * it has sent as early data until the server's answer is known. A context
+   * whose @c max_early_data is above it is ::GTLS_ERR_LIMIT. Default 16384.
+   */
+  uint32_t max_early_data_bytes;
 } GTLS_Limits;
 
 /**

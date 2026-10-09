@@ -278,6 +278,9 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
           config->ticket_age_window != 0)) {
     return GTLS_ERR_INVALID; /* tickets are a server's; a client holds the ones it is sent */
   }
+  if (config->role == GTLS_ROLE_CLIENT && config->anti_replay != NULL) {
+    return GTLS_ERR_INVALID; /* the replay decision is a server's */
+  }
   for (i = 0; i < config->ticket_key_count; i++) {
     if (config->ticket_keys[i].not_after <= config->ticket_keys[i].not_before) {
       return GTLS_ERR_INVALID;
@@ -300,6 +303,15 @@ GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,
   c->trust = config->trust;
   c->middlebox_compat = config->middlebox_compat != 0;
   gtls_limits_resolve(config->limits, &c->limits);
+  if (config->max_early_data > c->limits.max_early_data_bytes ||
+      (config->role == GTLS_ROLE_SERVER &&
+          (config->max_early_data != 0) != (config->anti_replay != NULL))) {
+    gcu_allocator_free(allocator, c);
+    return GTLS_ERR_LIMIT; /* early data without a replay decision, or more than the limit */
+  }
+  c->max_early_data = config->max_early_data;
+  c->anti_replay = config->anti_replay;
+  c->anti_replay_user = config->anti_replay_user;
   if (config->role == GTLS_ROLE_SERVER) {
     if (config->ticket_count > GTLS_TICKET_COUNT_MAX) {
       gcu_allocator_free(allocator, c);

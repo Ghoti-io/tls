@@ -21,7 +21,7 @@ namespace {
 const GTLS_State kAll[] = {GTLS_STATE_NEW, GTLS_STATE_WAIT_SH, GTLS_STATE_WAIT_SH2,
     GTLS_STATE_WAIT_EE, GTLS_STATE_WAIT_CERT, GTLS_STATE_WAIT_CV, GTLS_STATE_WAIT_FIN,
     GTLS_STATE_CONNECTED, GTLS_STATE_FAILED};
-const size_t kServerOnly = 3; /* S_WAIT_CH, S_WAIT_CH2, S_WAIT_FIN */
+const size_t kServerOnly = 4; /* S_WAIT_CH, S_WAIT_CH2, S_WAIT_FIN, S_WAIT_EOED */
 
 const char * name(GTLS_State s) {
   switch (s) {

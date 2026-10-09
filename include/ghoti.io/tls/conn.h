@@ -68,7 +68,7 @@ extern "C" {
 /** @brief The keys a piece of handshake is protected with (RFC 9001 section 4). */
 typedef enum GTLS_Epoch {
   GTLS_EPOCH_INITIAL = 0,     ///< No keys: ClientHello and ServerHello.
-  GTLS_EPOCH_EARLY = 1,       ///< Early data keys. Not built; never produced.
+  GTLS_EPOCH_EARLY = 1,       ///< Early data keys: the client's, so a client's write and a server's read only. EndOfEarlyData is queued and fed at this epoch.
   GTLS_EPOCH_HANDSHAKE = 2,   ///< Handshake traffic keys.
   GTLS_EPOCH_APPLICATION = 3, ///< Application traffic keys.
   GTLS_EPOCH_COUNT = 4
@@ -207,12 +207,18 @@ GTLS_API unsigned gtls_conn_alert(const GTLS_Conn * conn);
  * and stay what they were after a key update: that is the stream interface's
  * to track.
  *
- * @param epoch ::GTLS_EPOCH_HANDSHAKE or ::GTLS_EPOCH_APPLICATION.
- *   ::GTLS_EPOCH_EARLY is ::GTLS_ERR_UNSUPPORTED.
+ * The early secret (RFC 8446 section 7.1, client_early_traffic_secret) exists
+ * for a client that has offered early data, from the moment its ClientHello is
+ * built until the server's answer rejects it (then it is wiped), and for a
+ * server that has accepted early data. It is the client's: only the client's
+ * ::GTLS_DIR_WRITE and the server's ::GTLS_DIR_READ are it, and the other
+ * direction is ::GTLS_ERR_INVALID.
+ *
+ * @param epoch ::GTLS_EPOCH_EARLY, ::GTLS_EPOCH_HANDSHAKE or ::GTLS_EPOCH_APPLICATION.
  * @param out Receives one digest of the suite's hash; at least
  *   ::GTLS_HASH_MAX bytes unless @p cap is exact.
  * @param len Receives the digest length. Not NULL.
- * @return ::GTLS_OK, ::GTLS_ERR_INVALID, ::GTLS_ERR_UNSUPPORTED,
+ * @return ::GTLS_OK, ::GTLS_ERR_INVALID,
  *   ::GTLS_ERR_LIMIT when @p cap is too small, or ::GTLS_ERR_FAILED.
  */
 GTLS_API GTLS_Result gtls_conn_secret(const GTLS_Conn * conn, GTLS_Epoch epoch,

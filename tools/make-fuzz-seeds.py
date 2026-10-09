@@ -158,12 +158,18 @@ assert _c.hex() == "cea7403d4d606b6e074ec5d3baf39d18" and _t.hex() == "d0d1c8a79
 
 
 def ticket_state(suite=0x1301, psk_len=None, age_add=0, issued=1700000000 - 4, lifetime=3600,
-                 alpn=b"", sni=b"server", version=1, alpn_len=None, sni_len=None, tail=b""):
-    """The state a ticket seals (session/ticket.c), with any field made wrong on request."""
+                 alpn=b"", sni=b"server", version=1, alpn_len=None, sni_len=None, tail=b"",
+                 early=None):
+    """The state a ticket seals (session/ticket.c), with any field made wrong on request.
+    `early` is the allowance of a version 2 state, written after the lifetime."""
     hlen = 48 if suite == 0x1302 else 32
     n = hlen if psk_len is None else psk_len
+    if early is not None and version == 1:
+        version = 2
     st = bytes([version]) + struct.pack(">H", suite) + bytes([n]) + bytes([0x55]) * n
     st += struct.pack(">IqI", age_add, issued, lifetime)
+    if early is not None:
+        st += struct.pack(">I", early)
     st += bytes([len(alpn) if alpn_len is None else alpn_len]) + alpn
     st += bytes([len(sni) if sni_len is None else sni_len]) + sni
     return st + tail
@@ -452,6 +458,106 @@ def main():
     srv["ticket-of-an-unknown-key"] = bytes([0]) + with_ext(c_ch, 0x29, psk_ticket(
         seal_ticket(0x6b, 0x6a, ticket_state())))
 
+    # Early data (spec 8b). A ticket whose state is version 2 carries an
+    # allowance; a ClientHello that offers it with early_data, with a binder that
+    # is right (computed here from the RFC's hashes: SHA-384, HMAC and HKDF are in
+    # the standard library) opens the early key, and the records after it are
+    # sealed under that key (AES-256-GCM, written out above). The server accepts
+    # when the size of the whole input is even, and refuses when it is odd (the
+    # harness's replay decision), so a pad byte after the records, which a
+    # server in S_WAIT_FIN reads as the start of a record, chooses.
+    import hmac as _hmac
+
+    def _expand_label(h, secret, label, context, length):
+        info = struct.pack(">H", length) + bytes([6 + len(label)]) + b"tls13 " + label + bytes([len(context)]) + context
+        out, block, i = b"", b"", 1
+        while len(out) < length:
+            block = _hmac.new(secret, block + info + bytes([i]), h).digest()
+            out += block
+            i += 1
+        return out[:length]
+
+    def early_flight(suite=0x1302, allowance=100, ticket_kw=None, alpn=None, extra_ext=True):
+        """(ClientHello record, the early key and IV, hash name) for a ticket sealed
+        under server_one's key with this allowance."""
+        h = hashlib.sha384 if suite == 0x1302 else hashlib.sha256
+        hl = 48 if suite == 0x1302 else 32
+        psk = bytes([0x55]) * hl
+        kw = dict(suite=suite, early=allowance)
+        kw.update(ticket_kw or {})
+        ticket = seal_ticket(0x6b, 0x6b, ticket_state(**kw))
+        rec = c_ch
+        if alpn is not None:
+            lst = bytes([len(alpn)]) + alpn
+            rec = with_ext(rec, 0x10, struct.pack(">H", len(lst)) + lst)
+        if extra_ext:
+            rec = with_ext(rec, 0x2a, b"")
+        ids = struct.pack(">H", len(ticket)) + ticket + b"\x00\x00\x00\x00"
+        placeholder = struct.pack(">H", len(ids)) + ids + struct.pack(">H", 1 + hl) + bytes([hl]) + bytes(hl)
+        rec = with_ext(rec, 0x29, placeholder)
+        hs = rec[5:]
+        early = _hmac.new(bytes(hl), psk, h).digest()
+        binder_key = _expand_label(h, early, b"res binder", h(b"").digest(), hl)
+        fin_key = _expand_label(h, binder_key, b"finished", b"", hl)
+        binder = _hmac.new(fin_key, h(hs[:-(2 + 1 + hl)]).digest(), h).digest()
+        hs = hs[:-hl] + binder
+        rec = rec[:5] + hs
+        c_e = _expand_label(h, early, b"c e traffic", h(hs).digest(), hl)
+        key = _expand_label(h, c_e, b"key", b"", 32)
+        iv = _expand_label(h, c_e, b"iv", b"", 12)
+        return rec, key, iv
+
+    def seal_record(key, iv, seq, inner_type, data):
+        nonce = bytes(a ^ b for a, b in zip(iv, bytes(4) + struct.pack(">Q", seq)))
+        plain = data + bytes([inner_type])
+        header = b"\x17\x03\x03" + struct.pack(">H", len(plain) + 16)
+        ct, tag = gcm_seal(key, nonce, header, plain)
+        return header + ct + tag
+
+    def even_input(opt, build):
+        """build(n) with n bytes of early data, with n chosen so that the input, opt included, is even."""
+        for n in (40, 41):
+            body = build(n)
+            if (1 + len(body)) % 2 == 0:
+                return bytes([opt]) + body
+        return bytes([opt]) + body + b"\x00"   # a stray byte, which a server reads as the start of a record
+
+    def odd_input(opt, build):
+        for n in (40, 41):
+            body = build(n)
+            if (1 + len(body)) % 2 == 1:
+                return bytes([opt]) + body
+        return bytes([opt]) + body + b"\x00"   # a stray byte, which a server reads as the start of a record
+
+    ch_e, ek, eiv = early_flight()
+    eoed = lambda seq: seal_record(ek, eiv, seq, 22, bytes([5, 0, 0, 0]))
+    srv["early-accepted"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + c_fin)
+    srv["early-accepted-bytewise"] = even_input(0x02, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + c_fin)
+    srv["early-accepted-act"] = even_input(0x20, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + c_fin)
+    srv["early-accepted-small-limits"] = even_input(0x40, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + c_fin)
+    srv["early-accepted-two-records"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + seal_record(ek, eiv, 1, 23, b"F" * 20) + eoed(2) + c_fin)
+    srv["early-refused-by-the-callback"] = odd_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + c_fin)
+    srv["early-no-end"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + c_fin)
+    srv["early-end-first"] = even_input(0x00, lambda n: ch_e + eoed(0) + c_fin)
+    srv["early-bad-record"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n)[:-1] + b"\x00" + eoed(1))
+    srv["early-over-the-allowance"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * 60) + seal_record(ek, eiv, 1, 23, b"E" * (n + 20)))
+    srv["early-exactly-the-allowance"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * 100) + eoed(1) + c_fin[:n % 3])
+    srv["early-eoed-with-a-body"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + seal_record(ek, eiv, 1, 22, bytes([5, 0, 0, 1, 0])))
+    srv["early-eoed-twice"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1) + eoed(2))
+    srv["early-wrong-message-for-eoed"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 23, b"E" * n) + seal_record(ek, eiv, 1, 22, bytes([20, 0, 0, 0])))
+    srv["early-alert-in-the-early-phase"] = even_input(0x00, lambda n: ch_e + seal_record(ek, eiv, 0, 21, bytes([1, 0])))
+    srv["early-ccs-in-the-early-phase"] = even_input(0x00, lambda n: ch_e + bytes.fromhex("140303000101") + seal_record(ek, eiv, 0, 23, b"E" * n) + eoed(1))
+    ch_small, sk, siv = early_flight(allowance=4)
+    srv["early-empty-records-end-it"] = even_input(0x00, lambda n: ch_small + b"".join(seal_record(sk, siv, i, 23, b"") for i in range(6)) + c_fin[:n % 2])
+    ch_alpn, ak, aiv = early_flight(alpn=b"http/1.1")
+    srv["early-refused-alpn-differs"] = even_input(0x00, lambda n: ch_alpn + seal_record(ak, aiv, 0, 23, b"E" * n) + c_fin)
+    ch_none, nk, niv = early_flight(allowance=0, ticket_kw={"early": None})
+    srv["early-ticket-without-an-allowance"] = even_input(0x00, lambda n: ch_none + seal_record(nk, niv, 0, 23, b"E" * n) + c_fin)
+    ch_256, k256, iv256 = early_flight(suite=0x1301)
+    srv["early-sha256-suite"] = even_input(0x00, lambda n: ch_256 + c_fin[:n % 2])
+    ch_retry_e, rk, riv = early_flight()
+    srv["early-then-retry"] = even_input(0x10, lambda n: ch_retry_e + seal_record(rk, riv, 0, 23, b"E" * n) + c_ch)
+
     # The client, fed the RFC's server records.
     s_sh = simple["server.send-handshake-record.complete-record"]
     s_flight = simple["server.send-handshake-record@2.complete-record"]
@@ -579,7 +685,9 @@ def main():
     # the sealer would not write: each fails a different check of the decode.
     def bad_ticket(state):
         return bytes([0x71]) + seal_ticket(0x42, 0x24, state)
-    se["ticket-state-version"] = bad_ticket(ticket_state(version=2))
+    se["ticket-state-version"] = bad_ticket(ticket_state(version=3))
+    se["ticket-state-v2-without-allowance"] = bad_ticket(ticket_state(version=2))
+    se["ticket-state-v2-short-allowance"] = bad_ticket(ticket_state(early=7)[:55])
     se["ticket-state-unknown-suite"] = bad_ticket(ticket_state(suite=0x1234, psk_len=32))
     se["ticket-state-psk-wrong-size"] = bad_ticket(ticket_state(suite=0x1301, psk_len=48))
     se["ticket-state-short-for-sha384"] = bad_ticket(ticket_state(suite=0x1302)[:54])

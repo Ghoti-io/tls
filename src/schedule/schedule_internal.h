@@ -100,6 +100,8 @@ typedef struct GTLS_Schedule {
   unsigned char s_ap[GTLS_HASH_MAX];
   unsigned char res[GTLS_HASH_MAX];   /* resumption_master_secret, once the client's Finished is in the transcript */
   int has_res;
+  unsigned char c_e[GTLS_HASH_MAX];   /* client_early_traffic_secret, once the ClientHello is in the transcript */
+  int has_e;
 } GTLS_Schedule;
 
 /** Begin: Early Secret = HKDF-Extract(0, 0^Hash.length), no PSK. */
@@ -112,6 +114,16 @@ GTLS_Result gtls_schedule_early(GTLS_Schedule * s, GTLS_Hash hash);
  */
 GTLS_Result gtls_schedule_early_psk(GTLS_Schedule * s, GTLS_Hash hash,
     const void * psk, size_t psk_len);
+
+/**
+ * client_early_traffic_secret (RFC 8446 section 7.1): Derive-Secret(Early
+ * Secret, "c e traffic", ClientHello), kept in the schedule. @p th_client_hello
+ * is the transcript hash through the whole ClientHello, binders included. The
+ * schedule must hold an early stage (::gtls_schedule_early_psk); the key and
+ * IV of the early records come from it with ::gtls_traffic_keys.
+ */
+GTLS_Result gtls_schedule_early_traffic(GTLS_Schedule * s,
+    const void * th_client_hello);
 
 /**
  * Handshake Secret from the (EC)DHE shared secret, and the two handshake

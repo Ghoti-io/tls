@@ -102,8 +102,8 @@ TEST(FuzzSeeds, EachHarnessAloneReachesItsOwnRolesStates) {
       (1u << GTLS_STATE_WAIT_CV) | (1u << GTLS_STATE_WAIT_FIN) | (1u << GTLS_STATE_CONNECTED) |
       (1u << GTLS_STATE_FAILED);
   const unsigned server_states = (1u << GTLS_STATE_NEW) | (1u << GTLS_STATE_S_WAIT_CH) |
-      (1u << GTLS_STATE_S_WAIT_CH2) | (1u << GTLS_STATE_S_WAIT_FIN) | (1u << GTLS_STATE_CONNECTED) |
-      (1u << GTLS_STATE_FAILED);
+      (1u << GTLS_STATE_S_WAIT_CH2) | (1u << GTLS_STATE_S_WAIT_FIN) | (1u << GTLS_STATE_S_WAIT_EOED) |
+      (1u << GTLS_STATE_CONNECTED) | (1u << GTLS_STATE_FAILED);
   /* The RFC's flight is one protected record, so a client fed records goes
    * from waiting for EncryptedExtensions to connected in one call: the
    * message-level harness is the one that stops between the messages. */
@@ -134,10 +134,18 @@ TEST(FuzzSeeds, EachHarnessAloneReachesItsOwnRolesStates) {
     gtlsfuzz::pump_one(b.data(), b.size());
   }
   EXPECT_EQ(gtlsfuzz::visited() | (1u << GTLS_STATE_WAIT_CERT) | (1u << GTLS_STATE_WAIT_CV) |
-                (1u << GTLS_STATE_WAIT_FIN),
+                (1u << GTLS_STATE_WAIT_FIN) | (1u << GTLS_STATE_S_WAIT_EOED),
       (1u << GTLS_STATE_COUNT) - 1u)
       << "two real endpoints with a few flipped bytes visit every state of both roles but the three "
-         "a record-fed client passes through inside one call";
+         "a record-fed client passes through inside one call, and the one a server waits in for early "
+         "data, which only a resumption reaches (the resume harness does)";
+  gtlsfuzz::visited() = 0;
+  for (const std::string & p : seeds("resume")) {
+    gtlsfuzz::Bytes b = read(p);
+    gtlsfuzz::resume_one(b.data(), b.size());
+  }
+  EXPECT_NE(gtlsfuzz::visited() & (1u << GTLS_STATE_S_WAIT_EOED), 0u)
+      << "a resumption with early data waits for EndOfEarlyData";
 }
 
 TEST(FuzzSeeds, ByteFlipsAndTruncationsAtAStrideOfEveryStreamSeed) {

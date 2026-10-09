@@ -676,6 +676,17 @@ struct ServerRandom {
   }
 };
 
+/** The replay decision of the harnesses that accept early data: a verdict the input chose. */
+struct FuzzReplay {
+  int verdict = 1;
+  int calls = 0;
+  static int fn(void * user, const unsigned char[32], int64_t, uint32_t) {
+    FuzzReplay * self = static_cast<FuzzReplay *>(user);
+    self->calls++;
+    return self->verdict;
+  }
+};
+
 struct FuzzSign {
   const Bytes * sig;
   static GTLS_Result fn(void * user, const GTLS_Conn *, unsigned, const unsigned char *, size_t,
@@ -703,6 +714,14 @@ inline void check_end_state(GTLS_Conn * conn) {
     if (gtls_conn_read(conn, b, sizeof b, &n) != GTLS_ERR_FAILED && n != 0) die("read after failure");
     size_t w = 0;
     if (gtls_conn_write(conn, b, 1, &w) != GTLS_ERR_FAILED || w != 0) die("write after failure");
+    /* Early data neither side hands out nor takes once the connection has failed. */
+    GTLS_Result early = gtls_conn_read_early(conn, b, sizeof b, &n);
+    if ((early != GTLS_ERR_FAILED && early != GTLS_ERR_INVALID) || n != 0) die("early data read after failure");
+    if (gtls_conn_write_early(conn, b, 1, &w) != GTLS_ERR_FAILED || w != 0) die("early write after failure");
+    GTLS_EarlyStatus status = GTLS_EARLY_NONE;
+    if (gtls_conn_early_status(conn, &status) != GTLS_ERR_FAILED) die("early status after failure");
+    early = gtls_conn_early_resend(conn, b, sizeof b, &n);
+    if ((early != GTLS_ERR_FAILED && early != GTLS_ERR_INVALID) || n != 0) die("early data handed back after failure");
     size_t used = 7;
     if (gtls_conn_stream_feed(conn, b, 1, 1700000000, &used) != GTLS_ERR_FAILED || used != 0) {
       die("a record accepted after a failure");
@@ -781,6 +800,14 @@ inline int server_one(const uint8_t * data, size_t size) {
     lim.max_ticket_bytes = 12;
   }
   cfg.limits = &lim;
+  /* Early data: allowed, with a replay decision the input's size chooses (even
+   * accepts, odd refuses), so a seed with a ticket that carries an allowance can
+   * be accepted and the same seed a byte longer refused. */
+  FuzzReplay replay;
+  replay.verdict = (size & 1u) == 0 ? 1 : 0;
+  cfg.max_early_data = 1024;
+  cfg.anti_replay = FuzzReplay::fn;
+  cfg.anti_replay_user = &replay;
   /* A keyring, so that a ticket in an offer is opened. No mutation can seal one;
    * the seeds carry tickets sealed under this key (name and key all 0x6b) by
    * tools/make-fuzz-seeds.py. The small-limits server has a ticket cap too
@@ -835,11 +862,23 @@ inline int server_one(const uint8_t * data, size_t size) {
     size_t k = 0;
     while (gtls_conn_read(conn, rd, sizeof rd, &k) == GTLS_OK && k != 0) {
     }
+    k = 0;
+    while (gtls_conn_read_early(conn, rd, sizeof rd, &k) == GTLS_OK && k != 0) {
+    }
     const unsigned char * p = nullptr;
     size_t m = 0;
     if (gtls_conn_stream_output(conn, &p, &m) != GTLS_OK) die("output");
     if (m > 0) (void)gtls_conn_stream_consume(conn, m);
     if (used == 0 && r == GTLS_OK) break;
+  }
+  {
+    GTLS_EarlyStatus st = GTLS_EARLY_NONE;
+    GTLS_Result sr = gtls_conn_early_status(conn, &st);
+    if (!gtls_conn_is_failed(conn) && (sr == GTLS_ERR_EARLY_REJECTED) != (st == GTLS_EARLY_REJECTED)) {
+      die("the early status and its result disagree");
+    }
+    if (st == GTLS_EARLY_ACCEPTED && replay.calls != 1) die("early data accepted without one decision");
+    if (st != GTLS_EARLY_ACCEPTED && replay.calls > 1) die("the replay decision was asked twice");
   }
   if ((opt & 0x20u) != 0 && gtls_conn_is_connected(conn)) {
     size_t w = 0;
@@ -1055,6 +1094,13 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   ticket_key.not_after = 1700100000;
   scfg.ticket_keys = &ticket_key;      /* every pump server issues tickets; resume mode uses one */
   scfg.ticket_key_count = 1;
+  /* Early data on both sides: the tickets carry an allowance, and a resuming
+   * client sends some. The server's replay decision is always yes. */
+  FuzzReplay replay;
+  scfg.max_early_data = 512;
+  scfg.anti_replay = FuzzReplay::fn;
+  scfg.anti_replay_user = &replay;
+  ccfg.max_early_data = 512;
   GTLS_Context * cctx = nullptr;
   GTLS_Context * sctx = nullptr;
   GTLS_Conn * c = nullptr;
@@ -1114,6 +1160,17 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   if (gtls_conn_start(c) != GTLS_OK || gtls_conn_start(s) != GTLS_OK) die("start");
   note(c);
   note(s);
+  /* A resuming client sends early data, ahead of anything the server has said. */
+  const Bytes early_bytes(200, 0x5a);
+  Bytes got_early;
+  bool early_sent = false;
+  if (session != nullptr) {
+    size_t w = 0;
+    if (gtls_conn_write_early(c, early_bytes.data(), early_bytes.size(), &w) != GTLS_OK || w != early_bytes.size()) {
+      die("early data could not be written by a client resuming a ticket that allows it");
+    }
+    early_sent = true;
+  }
 
   struct Flip {
     int dir;
@@ -1160,6 +1217,9 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
         while (gtls_conn_read(to, rd, sizeof rd, &got) == GTLS_OK && got != 0) {
           if (to == s) got_up.insert(got_up.end(), rd, rd + got);
         }
+        while (to == s && gtls_conn_read_early(to, rd, sizeof rd, &got) == GTLS_OK && got != 0) {
+          got_early.insert(got_early.end(), rd, rd + got);
+        }
         if (used == 0 && r == GTLS_OK) break;
       }
     }
@@ -1178,6 +1238,25 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
     if (!gtls_conn_is_connected(c) || !gtls_conn_is_connected(s)) die("an unmutated pump did not connect");
     if (got_up.size() != 12 * expect_up.size()) die("an unmutated pump lost data");
     if (resume && (!gtls_conn_resumed(c) || !gtls_conn_resumed(s))) die("an unmutated resume did not resume");
+    if (early_sent) {
+      /* Accepted and delivered once, or (after a HelloRetryRequest) refused and handed back. */
+      GTLS_EarlyStatus cs = GTLS_EARLY_NONE;
+      GTLS_EarlyStatus ss = GTLS_EARLY_NONE;
+      (void)gtls_conn_early_status(c, &cs);
+      (void)gtls_conn_early_status(s, &ss);
+      if ((opt & 0x10u) != 0) {
+        unsigned char back[256];
+        size_t n = 0;
+        if (cs != GTLS_EARLY_REJECTED || ss != GTLS_EARLY_REJECTED || !got_early.empty() ||
+            gtls_conn_early_resend(c, back, sizeof back, &n) != GTLS_OK || n != early_bytes.size() ||
+            std::memcmp(back, early_bytes.data(), n) != 0) {
+          die("early data after a HelloRetryRequest was not refused and handed back");
+        }
+      } else if (cs != GTLS_EARLY_ACCEPTED || ss != GTLS_EARLY_ACCEPTED || got_early != early_bytes ||
+                 replay.calls != 1) {
+        die("an unmutated resume did not deliver its early data once");
+      }
+    }
     (void)gtls_conn_close(c);
     (void)gtls_conn_close(s);
   }
@@ -1296,6 +1375,7 @@ inline int session_one(const uint8_t * data, size_t size) {
                            : 7u;
       p.issued = 500;
       p.lifetime = 1u + static_cast<uint32_t>(len % 1000u);
+      p.max_early_data = len % 3u == 0 ? 0u : static_cast<uint32_t>(len) * 100u;   /* sealed as state 1 or 2 */
       p.alpn_len = len < 100 ? len : 100;
       std::memcpy(p.alpn, body, p.alpn_len);
       p.sni_len = len < 200 ? len / 2 : 100;
@@ -1312,6 +1392,7 @@ inline int session_one(const uint8_t * data, size_t size) {
       if (gtls_ticket_open(&key, 1, 500, ticket, n, &back) != GTLS_OK || back.suite != p.suite ||
           back.psk_len != p.psk_len || std::memcmp(back.psk, p.psk, p.psk_len) != 0 ||
           back.age_add != p.age_add || back.issued != p.issued || back.lifetime != p.lifetime ||
+          back.max_early_data != p.max_early_data ||
           back.alpn_len != p.alpn_len || std::memcmp(back.alpn, p.alpn, p.alpn_len) != 0 ||
           back.sni_len != p.sni_len || std::memcmp(back.sni, p.sni, p.sni_len) != 0) {
         die("a sealed state does not open to itself");

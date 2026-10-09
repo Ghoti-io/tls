@@ -42,10 +42,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/** Version of the sealed state. */
+/**
+ * Versions of the sealed state. 1 is the state of a ticket that permits no
+ * early data; 2 is the same with the early-data allowance (a u32) after the
+ * lifetime. A ticket is sealed as 1 when its allowance is 0, so a server that
+ * sends no early data seals what it always did; both are opened.
+ */
 #define GTLS_TICKET_STATE_VERSION 1u
-/** Largest state: version, suite, PSK, age_add, issued, lifetime, ALPN, SNI. */
-#define GTLS_TICKET_PLAIN_MAX (1u + 2u + 1u + GTLS_HASH_MAX + 4u + 8u + 4u + 1u + 255u + 1u + 255u)
+#define GTLS_TICKET_STATE_VERSION_EARLY 2u
+/** Largest state: version, suite, PSK, age_add, issued, lifetime, allowance, ALPN, SNI. */
+#define GTLS_TICKET_PLAIN_MAX (1u + 2u + 1u + GTLS_HASH_MAX + 4u + 8u + 4u + 4u + 1u + 255u + 1u + 255u)
 #define GTLS_TICKET_NONCE_LEN 12u
 #define GTLS_TICKET_TAG_LEN 16u
 /** Largest ticket this library seals. */
@@ -61,6 +67,7 @@ typedef struct GTLS_TicketPlain {
   uint32_t age_add;
   int64_t issued;                   /* Unix second */
   uint32_t lifetime;                /* seconds */
+  uint32_t max_early_data;          /* early-data allowance in bytes; 0: none */
   unsigned char alpn[255];
   size_t alpn_len;
   unsigned char sni[255];

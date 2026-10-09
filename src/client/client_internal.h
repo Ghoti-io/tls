@@ -42,6 +42,7 @@
 
 #include <ghoti.io/tls/conn.h>
 #include <ghoti.io/tls/context.h>
+#include <ghoti.io/tls/record.h>
 
 #include "../msg/msg_internal.h"
 #include "../record/record_internal.h"
@@ -94,6 +95,10 @@ struct GTLS_Context {
   unsigned ticket_count;            /* sent after each handshake; 0 sends none */
   uint32_t ticket_lifetime;         /* seconds */
   uint32_t ticket_age_window;       /* seconds */
+  /* Early data: a server's allowance and replay decision, a client's offer cap. */
+  uint32_t max_early_data;
+  GTLS_AntiReplayFn anti_replay;
+  void * anti_replay_user;
 };
 
 /**
@@ -114,6 +119,7 @@ typedef enum GTLS_State {
   GTLS_STATE_S_WAIT_CH,     /* started; wants the first ClientHello */
   GTLS_STATE_S_WAIT_CH2,    /* HelloRetryRequest sent; wants the second ClientHello */
   GTLS_STATE_S_WAIT_FIN,    /* flight sent; wants the client's Finished */
+  GTLS_STATE_S_WAIT_EOED,   /* flight sent with early data accepted; wants early records and EndOfEarlyData */
   GTLS_STATE_COUNT
 } GTLS_State;
 
@@ -228,6 +234,16 @@ struct GTLS_Conn {
   GTLS_Session ** sessions;         /* client: the sessions the server has sent */
   size_t session_count;
   size_t session_cap;
+
+  /* Early data. */
+  GTLS_EarlyStatus early_status;    /* none; client: offered, not yet answered; accepted; rejected */
+  uint32_t early_max;               /* client: the most it may send; server: the most it takes */
+  uint32_t early_used;              /* client: bytes sent; server: bytes taken (an empty record counts one) */
+  GTLS_Buf early_in;                /* server: early data received, until read */
+  GTLS_Buf early_sent;              /* client: early data sent, until the answer is known; handed back if rejected */
+  GTLS_Suite early_suite;           /* client: the suite of the session, whose PSK keys the early records */
+  unsigned char early_alpn[255];    /* client: the ALPN protocol of the session */
+  size_t early_alpn_len;
 };
 
 /* ------------------------------------------------ shared by the two roles */
@@ -344,7 +360,8 @@ typedef enum GTLS_SecretId {
   GTLS_SECRET_CLIENT_HS,
   GTLS_SECRET_SERVER_HS,
   GTLS_SECRET_CLIENT_AP,
-  GTLS_SECRET_SERVER_AP
+  GTLS_SECRET_SERVER_AP,
+  GTLS_SECRET_CLIENT_EARLY
 } GTLS_SecretId;
 
 /** Copy out one of the schedule's secrets; the digest length is in @p len. */

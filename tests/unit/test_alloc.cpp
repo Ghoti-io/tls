@@ -383,6 +383,130 @@ INSTANTIATE_TEST_SUITE_P(Flows, ResumeAllocationSweep,
           (std::get<1>(info.param) ? "Retry" : "Plain");
     });
 
+
+/* Early data: the offer (the secret and the room kept for the bytes sent), the
+ * early write, the acceptance (the room for the bytes received, the early
+ * key) or the refusal (the bytes handed back). Only the second handshake is
+ * swept; the first, which makes the session, uses the default allocator. */
+
+namespace {
+
+int sweep_replay(void * user, const unsigned char[32], int64_t, uint32_t) {
+  return *static_cast<int *>(user);
+}
+
+ResumeRun early_with_failure_at(long n, TestAlloc & alloc, Cred & cred, int verdict, GTLS_Session ** keep) {
+  ResumeRun out;
+  GTLS_TicketKey key;
+  std::memset(&key, 0, sizeof key);
+  std::memset(key.name, 0x11, sizeof key.name);
+  std::memset(key.key, 0x22, sizeof key.key);
+  key.not_before = kNow - 100;
+  key.not_after = kNow + 100000;
+  const Bytes data(700, 0x3c);
+
+  alloc.count = 0;
+  alloc.fail_at = -1;
+  if (*keep == nullptr) {
+    Pair p1(cred);
+    p1.keys = {key};
+    p1.scfg.max_early_data = 2000;
+    p1.scfg.anti_replay = &sweep_replay;
+    p1.scfg.anti_replay_user = &verdict;
+    p1.ccfg.max_early_data = 2000;
+    EXPECT_EQ(p1.build(), GTLS_OK);
+    p1.run();
+    EXPECT_TRUE(p1.connected());
+    EXPECT_EQ(gtls_conn_session(p1.c.conn, 0, keep), GTLS_OK);
+  }
+  alloc.count = 0;
+  alloc.fail_at = n;
+  Pair p2(cred);
+  p2.keys = {key};
+  p2.scfg.max_early_data = 2000;
+  p2.scfg.anti_replay = &sweep_replay;
+  p2.scfg.anti_replay_user = &verdict;
+  p2.ccfg.max_early_data = 2000;
+  p2.allocator = &alloc.a;
+  p2.offer = *keep;
+  out.create = p2.build();
+  if (out.create != GTLS_OK) {
+    return out;
+  }
+  size_t w = 0;
+  GTLS_Result wr = gtls_conn_write_early(p2.c.conn, data.data(), 400, &w);
+  if (wr == GTLS_OK) {
+    wr = gtls_conn_write_early(p2.c.conn, data.data() + 400, 300, &w);
+  }
+  if (wr != GTLS_OK) {
+    out.any_oom |= wr == GTLS_ERR_OOM;
+  }
+  p2.run();
+  bool good = wr == GTLS_OK && p2.connected() && gtls_conn_resumed(p2.s.conn) == 1;
+  if (good && verdict == 1) {
+    Bytes got;
+    unsigned char b[256];
+    size_t k = 0;
+    while (gtls_conn_read_early(p2.s.conn, b, sizeof b, &k) == GTLS_OK && k != 0) {
+      got.insert(got.end(), b, b + k);
+    }
+    good = got == data && p2.s.got.empty();
+  } else if (good) {
+    Bytes back;
+    unsigned char b[256];
+    size_t k = 0;
+    while (gtls_conn_early_resend(p2.c.conn, b, sizeof b, &k) == GTLS_OK && k != 0) {
+      back.insert(back.end(), b, b + k);
+    }
+    good = back == data;
+  }
+  out.clean = good;
+  for (GTLS_Conn * c : {p2.c.conn, p2.s.conn}) {
+    if (gtls_conn_is_failed(c)) {
+      out.any_oom |= gtls_conn_failure(c) == GTLS_ERR_OOM;
+      EXPECT_TRUE(gtls_conn_secrets_are_wiped(c)) << "failure at allocation " << n;
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+class EarlyAllocationSweep : public ::testing::TestWithParam<int> {};
+
+TEST_P(EarlyAllocationSweep, FailingEachAllocationLeaksNothingAndIsNeverSilent) {
+  const int verdict = GetParam();
+  std::unique_ptr<Cred> cred = ed_cred();
+  GTLS_Session * session = nullptr;
+  TestAlloc probe;
+  ResumeRun clean = early_with_failure_at(-1, probe, *cred, verdict, &session);
+  ASSERT_EQ(clean.create, GTLS_OK);
+  ASSERT_TRUE(clean.clean);
+  EXPECT_EQ(probe.live, 0);
+  const long total = probe.count;
+  ASSERT_GT(total, 20);
+  ASSERT_LT(total, 800);
+  for (long n = 0; n < total; n++) {
+    TestAlloc alloc;
+    ResumeRun r = early_with_failure_at(n, alloc, *cred, verdict, &session);
+    EXPECT_EQ(alloc.live, 0) << "allocation " << n << " of " << total << " leaked";
+    EXPECT_FALSE(r.clean) << "allocation " << n << " failed and nothing noticed";
+    if (r.create != GTLS_OK) {
+      EXPECT_EQ(r.create, GTLS_ERR_OOM) << n;
+    } else {
+      EXPECT_TRUE(r.any_oom) << "allocation " << n << " failed and no one reported out-of-memory";
+    }
+  }
+  TestAlloc past;
+  ResumeRun after = early_with_failure_at(total, past, *cred, verdict, &session);
+  EXPECT_TRUE(after.clean);
+  EXPECT_EQ(past.live, 0);
+  gtls_session_free(session);
+}
+
+INSTANTIATE_TEST_SUITE_P(Flows, EarlyAllocationSweep, ::testing::Values(1, 0),
+    [](const ::testing::TestParamInfo<int> & info) { return info.param == 1 ? "Accepted" : "Refused"; });
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

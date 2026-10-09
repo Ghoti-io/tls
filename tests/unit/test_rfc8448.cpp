@@ -65,7 +65,7 @@ TEST_P(Rfc8448, HandshakeSecretsAndTheTranscriptAfterServerHello) {
   EXPECT_EQ(gtls_conn_secret(r.conn, GTLS_EPOCH_INITIAL, GTLS_DIR_WRITE, out.data(),
                 out.size(), &n), GTLS_ERR_INVALID);
   EXPECT_EQ(gtls_conn_secret(r.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, out.data(),
-                out.size(), &n), GTLS_ERR_UNSUPPORTED);
+                out.size(), &n), GTLS_ERR_INVALID) << "a handshake that offered no early data has none";
 }
 
 TEST_P(Rfc8448, TheWholeHandshakeToApplicationSecrets) {

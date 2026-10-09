@@ -96,6 +96,29 @@ typedef struct GTLS_Identity {
 } GTLS_Identity;
 
 /**
+ * @brief A server's replay decision for early data (RFC 8446 section 8).
+ *
+ * Called once for a ClientHello that offers early data with a ticket this
+ * server sealed, after every check that can be made locally has passed and the
+ * binder has verified, and so only for a ticket whose holder proved it has
+ * the PSK. The library keeps no state across connections, so it cannot know
+ * whether this ticket was shown before; the caller can.
+ *
+ * @param user ::GTLS_ContextConfig::anti_replay_user.
+ * @param ticket_id SHA-256 of the identity the client offered: stable for a
+ *   ticket, and the same each time it is presented. Use it as the key of the
+ *   store; it is not secret.
+ * @param issued The Unix second the ticket was sealed.
+ * @param age_ms The age the client reports for the ticket, in milliseconds.
+ * @return 1 to accept the early data. 0 rejects it, and so does any other
+ *   value: the handshake continues without early data and the client resends.
+ *   The callback must not block for long and must not call back into the
+ *   connection.
+ */
+typedef int (*GTLS_AntiReplayFn)(void * user, const unsigned char ticket_id[32],
+    int64_t issued, uint32_t age_ms);
+
+/**
  * @brief What a context is made from. Fill it with ::gtls_context_config_default.
  *
  * A NULL list with a count of 0 means the default list.
@@ -155,6 +178,21 @@ typedef struct GTLS_ContextConfig {
   uint32_t ticket_lifetime;       ///< Seconds a ticket is good for, sent to the client. 0: ::GTLS_TICKET_LIFETIME_DEFAULT. At most ::GTLS_TICKET_LIFETIME_MAX.
   uint32_t ticket_age_window;     ///< Seconds the age a client reports may differ from the server's own. 0: ::GTLS_TICKET_AGE_WINDOW_DEFAULT. At most ::GTLS_TICKET_AGE_WINDOW_MAX.
   /** @} */
+  /**
+   * @name Early data (0-RTT), RFC 8446 section 2.3
+   * Off unless set. Bytes sent as early data can be replayed by anyone who
+   * recorded them, so a server accepts them only on a caller's say-so.
+   * A server sets both ::max_early_data (the allowance its tickets carry) and
+   * ::anti_replay (the decision); either alone is ::GTLS_ERR_LIMIT. A client
+   * sets ::max_early_data to offer early data when the session it resumes
+   * permits it, up to that many bytes; a client refuses ::anti_replay
+   * (::GTLS_ERR_INVALID). Both are at most ::GTLS_Limits::max_early_data_bytes
+   * (::GTLS_ERR_LIMIT otherwise).
+   * @{ */
+  uint32_t max_early_data;        ///< 0: none (the default).
+  GTLS_AntiReplayFn anti_replay;  ///< A server's replay decision.
+  void * anti_replay_user;        ///< Passed to ::anti_replay.
+  /** @} */
   /** @name Reserved for later pieces; must be zero or NULL today.
    * @{ */
   const void * psk;               ///< A pre-shared key.
@@ -186,13 +224,17 @@ GTLS_API void gtls_context_config_default(GTLS_ContextConfig * config);
  *   or oversized name, an unknown suite or group, a count with a NULL
  *   list, a ticket key list that is too long, repeats a name or has a window
  *   that ends before it begins, a ticket count above ::GTLS_Limits::max_tickets,
- *   a lifetime or a window above its maximum, or ticket fields on a client;
+ *   a lifetime or a window above its maximum, ticket fields on a client, or
+ *   a replay callback on a client;
  *   ::GTLS_ERR_UNSUPPORTED for a reserved field or a version other
  *   than TLS 1.3; ::GTLS_ERR_LIMIT for an ALPN list that does not fit in the
  *   extension, a chain too large to send within ::GTLS_Limits::max_output_bytes,
  *   or a ticket key list with ::GTLS_Limits::max_ticket_bytes too small for
- *   the largest ticket this library seals, or a ticket count above
- *   ::GTLS_TICKET_COUNT_MAX (the ticket nonce is one byte);
+ *   the largest ticket this library seals, a ticket count above
+ *   ::GTLS_TICKET_COUNT_MAX (the ticket nonce is one byte), a server with
+ *   ::GTLS_ContextConfig::max_early_data and no replay callback or the
+ *   callback without it, or a ::GTLS_ContextConfig::max_early_data above
+ *   ::GTLS_Limits::max_early_data_bytes;
  *   ::GTLS_ERR_OOM.
  */
 GTLS_API GTLS_Result gtls_context_new(const GTLS_Allocator * allocator,

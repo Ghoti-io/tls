@@ -339,6 +339,23 @@ GTLS_Result gtls_schedule_early_psk(GTLS_Schedule * s, GTLS_Hash hash,
   return GTLS_OK;
 }
 
+GTLS_Result gtls_schedule_early_traffic(GTLS_Schedule * s,
+    const void * th_client_hello) {
+  GTLS_Result result;
+
+  if (s == NULL || s->stage != 1 || th_client_hello == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  result = gtls_derive_secret(s->hash, s->early, s->hlen, "c e traffic",
+      th_client_hello, s->c_e);
+  if (result != GTLS_OK) {
+    gtls_schedule_wipe(s);
+    return result;
+  }
+  s->has_e = 1;
+  return GTLS_OK;
+}
+
 GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
     size_t ecdhe_len, const void * th_server_hello) {
   unsigned char derived[GTLS_HASH_MAX];

@@ -99,6 +99,15 @@ GTLS_Result gtls_conn_fail(GTLS_Conn * c, GTLS_Result result, unsigned alert) {
       (void)gsec_wipe(c->app_in.data, c->app_in.cap);
     }
     c->app_in.len = 0;
+    /* Early data neither side may use once the connection has failed. */
+    if (c->early_in.data != NULL) {
+      (void)gsec_wipe(c->early_in.data, c->early_in.cap);
+    }
+    c->early_in.len = 0;
+    if (c->early_sent.data != NULL) {
+      (void)gsec_wipe(c->early_sent.data, c->early_sent.cap);
+    }
+    c->early_sent.len = 0;
   }
   return result;
 }
@@ -171,6 +180,9 @@ GTLS_Result gtls_conn_alloc(const GTLS_Context * context, GTLS_Conn ** out) {
       c->limits.max_app_buffer > GTLS_RECORD_PLAIN_MAX
           ? c->limits.max_app_buffer
           : GTLS_RECORD_PLAIN_MAX);
+  /* Sized when early data is offered or accepted: nothing before then. */
+  gtls_buf_init(&c->early_in, allocator, 0);
+  gtls_buf_init(&c->early_sent, allocator, 0);
   *out = c;
   return GTLS_OK;
 }
@@ -538,6 +550,59 @@ static GTLS_Result patch_binder(const GTLS_Conn * c, const GTLS_Transcript * bas
   return result;
 }
 
+/**
+ * The client has offered early data: the early secret from the session's PSK,
+ * client_early_traffic_secret over the transcript through the ClientHello
+ * (which begin_handshake has just absorbed), and room for the bytes sent.
+ */
+static GTLS_Result begin_early(GTLS_Conn * c) {
+  const GTLS_Session * o = c->offer;
+  GTLS_Hash hash = gtls_suite_hash(o->suite);
+  unsigned char th[GTLS_HASH_MAX];
+  GTLS_Result result;
+
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  if (result == GTLS_OK) {
+    result = gtls_schedule_early_psk(&c->sec.schedule, hash, o->psk, o->psk_len);
+  }
+  if (result == GTLS_OK) {
+    result = gtls_schedule_early_traffic(&c->sec.schedule, th);
+  }
+  (void)gsec_wipe(th, sizeof th);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->early_suite = (GTLS_Suite)o->suite;
+  memcpy(c->early_alpn, o->alpn, o->alpn_len);
+  c->early_alpn_len = o->alpn_len;
+  c->early_max = o->max_early_data < c->context->max_early_data
+      ? o->max_early_data : c->context->max_early_data;
+  c->early_in.max = 0;
+  c->early_sent.max = c->early_max;
+  /* All the room at once: a buffer that grows leaves the plaintext it held in the block it left. */
+  result = gtls_buf_reserve(&c->early_sent, c->early_max);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->early_status = GTLS_EARLY_PENDING;
+  return GTLS_OK;
+}
+
+/**
+ * The early data was not accepted: say so, and drop the keys that sealed it.
+ * What was sent stays, to be handed back.
+ */
+static void reject_early(GTLS_Conn * c) {
+  c->early_status = GTLS_EARLY_REJECTED;
+  (void)gsec_wipe(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e);
+  c->sec.schedule.has_e = 0;
+  if (c->wr_epoch == GTLS_EPOCH_EARLY) {
+    (void)gsec_wipe(&c->sec.wr, sizeof c->sec.wr);
+    (void)gsec_wipe(c->sec.wr_secret, sizeof c->sec.wr_secret);
+    c->wr_epoch = GTLS_EPOCH_INITIAL;
+  }
+}
+
 static GTLS_Result begin_handshake(GTLS_Conn * c) {
   GTLS_Result result = gtls_transcript_init(&c->sec.transcript);
 
@@ -559,6 +624,7 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   GTLS_HelloParams p;
   GTLS_PskParams psk;
   GTLS_Result result;
+  int p_early;
 
   if (c == NULL) {
     return GTLS_ERR_INVALID;
@@ -606,6 +672,11 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
     psk.binder_len = c->offer->psk_len;
     p.psk = &psk;
   }
+  /* Early data is offered when the caller's context allows it and the session
+   * permits it; nothing else turns it on. */
+  p_early = c->offer != NULL && c->offer->max_early_data != 0 &&
+      c->context->max_early_data != 0;
+  p.early_data = p_early;
   result = gtls_msg_build_client_hello(&p, &c->hello);
   (void)gsec_wipe(&p, sizeof p);
   if (result == GTLS_OK && c->offer != NULL) {
@@ -624,7 +695,11 @@ GTLS_Result gtls_conn_start(GTLS_Conn * c) {
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  return begin_handshake(c);
+  result = begin_handshake(c);
+  if (result == GTLS_OK && p_early) {
+    result = begin_early(c);
+  }
+  return result;
 }
 
 GTLS_Result gtls_conn_start_raw(GTLS_Conn * c, const void * hello,
@@ -696,6 +771,11 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
   }
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  if (c->early_status == GTLS_EARLY_PENDING) {
+    /* The second ClientHello offers none (section 4.2.10): what was sent is
+     * refused, whichever way the retry goes. */
+    reject_early(c);
   }
   if ((sh->flags & GTLS_SH_FLAG_KEY_SHARE) != 0) {
     result = gtls_conn_gen_share(c, (GTLS_Group)sh->group, &share);
@@ -807,6 +887,8 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
       return gtls_conn_illegal(c);
     }
     c->resumed = 1;
+  } else if (c->early_status == GTLS_EARLY_PENDING) {
+    reject_early(c); /* early data rides on the PSK; without it there is none */
   }
   if ((sh.flags & GTLS_SH_FLAG_KEY_SHARE) == 0) {
     return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION);
@@ -835,9 +917,13 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   if (result == GTLS_OK) {
     const GTLS_Session * psk = c->resumed ? c->offer : NULL;
 
-    result = psk != NULL
-        ? gtls_schedule_early_psk(&c->sec.schedule, hash, psk->psk, psk->psk_len)
-        : gtls_schedule_early(&c->sec.schedule, hash);
+    /* An offer of early data has the PSK's early stage already, with the
+     * traffic secret derived from it; deriving it again would lose that. */
+    if (c->early_status != GTLS_EARLY_PENDING) {
+      result = psk != NULL
+          ? gtls_schedule_early_psk(&c->sec.schedule, hash, psk->psk, psk->psk_len)
+          : gtls_schedule_early(&c->sec.schedule, hash);
+    }
   }
   if (result == GTLS_OK) {
     result = gtls_schedule_handshake(&c->sec.schedule, ecdhe, ecdhe_len, th);
@@ -903,6 +989,25 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
     c->alpn_selected_len = ee.alpn_len;
   }
   c->sni_acknowledged = ee.has_server_name;
+  if (ee.has_early_data && c->early_status != GTLS_EARLY_PENDING) {
+    /* The hello that counts offered none (it was dropped on a retry). */
+    return gtls_conn_fail(c, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNSUPPORTED_EXTENSION);
+  }
+  if (c->early_status == GTLS_EARLY_PENDING) {
+    if (!ee.has_early_data) {
+      reject_early(c);
+    } else if (!c->resumed || c->suite != c->early_suite ||
+        c->alpn_selected_len != c->early_alpn_len ||
+        gsec_equal(c->alpn_selected, c->early_alpn, c->early_alpn_len) != GSEC_OK) {
+      /* Accepted without the PSK, or with another suite or protocol than the
+       * ticket's (section 4.2.10): the server must not have. */
+      return gtls_conn_illegal(c);
+    } else {
+      c->early_status = GTLS_EARLY_ACCEPTED;
+      (void)gsec_wipe(c->early_sent.data, c->early_sent.cap);
+      c->early_sent.len = 0;
+    }
+  }
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
@@ -1041,6 +1146,30 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
   }
   if (result == GTLS_OK) {
     result = gtls_schedule_master(&c->sec.schedule, th);
+  }
+  /* Accepted early data is ended before the Finished, under the early key,
+   * and it is part of what the Finished covers (section 4.5). The application
+   * secrets above are over the transcript through the server's Finished. */
+  if (result == GTLS_OK && c->early_status == GTLS_EARLY_ACCEPTED) {
+    GTLS_Buf eoed;
+
+    gtls_buf_init(&eoed, c->allocator, 16u);
+    result = gtls_msg_build_end_of_early_data(&eoed);
+    if (result == GTLS_OK) {
+      result = gtls_transcript_update(&c->sec.transcript, eoed.data, eoed.len);
+    }
+    if (result == GTLS_OK) {
+      result = gtls_conn_queue(c, GTLS_EPOCH_EARLY, eoed.data, eoed.len);
+      if (result != GTLS_OK) {
+        gtls_buf_free(&eoed);
+        (void)gsec_wipe(th, sizeof th);
+        return result; /* gtls_conn_queue() has already failed the connection */
+      }
+    }
+    gtls_buf_free(&eoed);
+    if (result == GTLS_OK) {
+      result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+    }
   }
   /* The client's Finished is over the transcript through the server's. */
   if (result == GTLS_OK) {
@@ -1203,6 +1332,7 @@ static GTLS_Result on_message(GTLS_Conn * c, const unsigned char * msg,
     case GTLS_STATE_S_WAIT_CH:
     case GTLS_STATE_S_WAIT_CH2:
     case GTLS_STATE_S_WAIT_FIN:
+    case GTLS_STATE_S_WAIT_EOED:
       return gtls_server_on_message(c, msg, msg_len, now);
     case GTLS_STATE_NEW:
     case GTLS_STATE_FAILED:
@@ -1220,6 +1350,8 @@ GTLS_Epoch gtls_conn_expected_epoch(GTLS_State state) {
     case GTLS_STATE_WAIT_FIN:
     case GTLS_STATE_S_WAIT_FIN:
       return GTLS_EPOCH_HANDSHAKE;
+    case GTLS_STATE_S_WAIT_EOED:
+      return GTLS_EPOCH_EARLY;
     case GTLS_STATE_CONNECTED:
       return GTLS_EPOCH_APPLICATION;
     default:
@@ -1383,12 +1515,17 @@ GTLS_Result gtls_conn_secret(const GTLS_Conn * c, GTLS_Epoch epoch,
   if (c->state == GTLS_STATE_FAILED) {
     return GTLS_ERR_FAILED;
   }
-  if (epoch == GTLS_EPOCH_EARLY) {
-    return GTLS_ERR_UNSUPPORTED;
-  }
   /* The direction is the local one: a client writes with the client's
    * secret and a server with the server's. */
-  if (epoch == GTLS_EPOCH_HANDSHAKE && c->sec.schedule.stage >= 2) {
+  if (epoch == GTLS_EPOCH_EARLY) {
+    /* The early secret is the client's, so the client's write and the
+     * server's read are the only ones; and it exists only while early data is
+     * on offer or accepted. */
+    if (!c->sec.schedule.has_e || (direction == GTLS_DIR_WRITE) != (c->role == GTLS_ROLE_CLIENT)) {
+      return GTLS_ERR_INVALID;
+    }
+    secret = c->sec.schedule.c_e;
+  } else if (epoch == GTLS_EPOCH_HANDSHAKE && c->sec.schedule.stage >= 2) {
     secret = (direction == GTLS_DIR_WRITE) == (c->role == GTLS_ROLE_CLIENT)
         ? c->sec.schedule.c_hs : c->sec.schedule.s_hs;
   } else if (epoch == GTLS_EPOCH_APPLICATION && c->sec.schedule.stage >= 3) {
@@ -1415,6 +1552,7 @@ static int negotiated(const GTLS_Conn * c) {
     case GTLS_STATE_WAIT_FIN:
     case GTLS_STATE_CONNECTED:
     case GTLS_STATE_S_WAIT_FIN:
+    case GTLS_STATE_S_WAIT_EOED:
       return 1;
     default:
       return 0;
@@ -1498,6 +1636,7 @@ GTLS_Result gtls_conn_debug_secret(const GTLS_Conn * c, GTLS_SecretId id,
     case GTLS_SECRET_CLIENT_HS: s = c->sec.schedule.c_hs; break;
     case GTLS_SECRET_SERVER_HS: s = c->sec.schedule.s_hs; break;
     case GTLS_SECRET_CLIENT_AP: s = c->sec.schedule.c_ap; break;
+    case GTLS_SECRET_CLIENT_EARLY: s = c->sec.schedule.c_e; break;
     case GTLS_SECRET_SERVER_AP: s = c->sec.schedule.s_ap; break;
     default: return GTLS_ERR_INVALID;
   }

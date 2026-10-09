@@ -518,6 +518,116 @@ TEST(WipeResume, AFreedSessionLeavesNeitherThePskNorTheTicketBehind) {
   EXPECT_EQ(watch.found, 1) << "and the session's own free adds nothing";
 }
 
+/* Early data: the early traffic secret, and the bytes themselves, on both
+ * ends, when it is accepted and when it is refused (the client keeps the bytes
+ * to hand back), and when the connection fails in the middle of it. */
+
+namespace {
+
+int wipe_replay(void * user, const unsigned char[32], int64_t, uint32_t) {
+  return *static_cast<int *>(user);
+}
+
+struct EarlyWorld {
+  std::unique_ptr<Cred> cred = ed_cred();
+  GTLS_Session * session = nullptr;
+  int verdict = 1;
+  Bytes data = Bytes(300, 0xe7);
+  ~EarlyWorld() { gtls_session_free(session); }
+  void configure(Pair & p) {
+    p.keys = {wipe_key()};
+    p.scfg.max_early_data = 1000;
+    p.scfg.anti_replay = &wipe_replay;
+    p.scfg.anti_replay_user = &verdict;
+    p.ccfg.max_early_data = 1000;
+  }
+  void prime() {
+    Pair p1(*cred);
+    configure(p1);
+    ASSERT_EQ(p1.build(), GTLS_OK);
+    p1.run();
+    ASSERT_TRUE(p1.connected());
+    ASSERT_EQ(gtls_conn_session(p1.c.conn, 0, &session), GTLS_OK);
+    ASSERT_EQ(session->max_early_data, 1000u);
+  }
+};
+
+}  // namespace
+
+TEST(WipeEarly, NeitherTheEarlySecretNorTheEarlyBytesReachAFreedBlock) {
+  for (int verdict : {1, 0}) {
+    EarlyWorld w;
+    w.verdict = verdict;
+    ASSERT_NO_FATAL_FAILURE(w.prime());
+    TestAlloc alloc;
+    Watch watch;
+    {
+      Pair p2(*w.cred);
+      w.configure(p2);
+      p2.allocator = &alloc.a;
+      p2.offer = w.session;
+      ASSERT_EQ(p2.build(), GTLS_OK);
+      const Bytes c_e(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32);
+      size_t n = 0;
+      ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data(), 150, &n), GTLS_OK);
+      ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data() + 150, 150, &n), GTLS_OK);
+      p2.run();
+      ASSERT_TRUE(p2.connected());
+      watch.secrets = {c_e, w.data, Bytes(w.data.begin(), w.data.begin() + 64)};
+      if (verdict == 1) {
+        EXPECT_TRUE(contains(reinterpret_cast<const unsigned char *>(p2.s.conn), sizeof(GTLS_Conn),
+            Bytes(p2.s.conn->sec.schedule.c_e, p2.s.conn->sec.schedule.c_e + 32)))
+            << "so the scan is looking for something that was there";
+        EXPECT_EQ(p2.s.conn->early_in.len, 300u) << "and the server still holds the bytes unread";
+        EXPECT_TRUE(contains(p2.s.conn->early_in.data, p2.s.conn->early_in.len, w.data));
+        EXPECT_FALSE(contains(p2.c.conn->early_sent.data, p2.c.conn->early_sent.cap, w.data))
+            << "the client let go of its copy at the acceptance";
+      } else {
+        EXPECT_TRUE(contains(p2.c.conn->early_sent.data, p2.c.conn->early_sent.len, w.data))
+            << "a refused client holds the bytes to hand back";
+        EXPECT_EQ(Bytes(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32), Bytes(32, 0))
+            << "but not the key";
+      }
+      watch.install(alloc);
+    }
+    EXPECT_EQ(watch.found, 0) << "verdict " << verdict;
+    EXPECT_EQ(alloc.live, 0);
+  }
+}
+
+TEST(WipeEarly, AConnectionThatFailsInTheEarlyPhaseKeepsNothing) {
+  EarlyWorld w;
+  ASSERT_NO_FATAL_FAILURE(w.prime());
+  TestAlloc alloc;
+  Watch watch;
+  {
+    Pair p2(*w.cred);
+    w.configure(p2);
+    p2.allocator = &alloc.a;
+    p2.offer = w.session;
+    ASSERT_EQ(p2.build(), GTLS_OK);
+    const Bytes c_e(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32);
+    size_t n = 0;
+    ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data(), 300, &n), GTLS_OK);
+    Bytes out = stream_out(p2.c.conn);
+    ASSERT_GT(out.size(), 300u);
+    size_t used = 0;
+    /* The hello and the early records go in; the last record is damaged. */
+    out[out.size() - 3] ^= 1;
+    p2.auto_read = false;
+    EXPECT_EQ(gtls_conn_stream_feed(p2.s.conn, out.data(), out.size(), kNow, &used), GTLS_ERR_MISMATCH);
+    EXPECT_TRUE(gtls_conn_secrets_are_wiped(p2.s.conn));
+    EXPECT_EQ(p2.s.conn->early_in.len, 0u);
+    EXPECT_FALSE(contains(p2.s.conn->early_in.data, p2.s.conn->early_in.cap, Bytes(w.data.begin(), w.data.begin() + 64)))
+        << "what the server had read is wiped at the failure";
+    EXPECT_FALSE(contains(reinterpret_cast<const unsigned char *>(p2.s.conn), sizeof(GTLS_Conn), c_e));
+    watch.secrets = {c_e, Bytes(w.data.begin(), w.data.begin() + 64)};
+    watch.install(alloc);
+  }
+  EXPECT_EQ(watch.found, 0);
+  EXPECT_EQ(alloc.live, 0);
+}
+
 int main(int argc, char ** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

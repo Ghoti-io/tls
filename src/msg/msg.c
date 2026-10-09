@@ -88,6 +88,36 @@ GTLS_Result gtls_buf_append(GTLS_Buf * b, const void * data, size_t n) {
   return GTLS_OK;
 }
 
+GTLS_Result gtls_buf_reserve(GTLS_Buf * b, size_t n) {
+  unsigned char * room;
+
+  if (b->err != GTLS_OK) {
+    return b->err;
+  }
+  if (n > b->max) {
+    b->err = GTLS_ERR_LIMIT;
+    return b->err;
+  }
+  if (n <= b->cap) {
+    return GTLS_OK;
+  }
+  room = gcu_allocator_calloc(b->allocator, 1, n);
+  if (room == NULL) {
+    b->err = GTLS_ERR_OOM;
+    return b->err;
+  }
+  if (b->len != 0) {
+    memcpy(room, b->data, b->len);
+  }
+  if (b->data != NULL) {
+    (void)gsec_wipe(b->data, b->cap);
+    gcu_allocator_free(b->allocator, b->data);
+  }
+  b->data = room;
+  b->cap = n;
+  return GTLS_OK;
+}
+
 void gtls_buf_u8(GTLS_Buf * b, unsigned v) {
   unsigned char c = (unsigned char)v;
   (void)gtls_buf_append(b, &c, 1);
@@ -397,6 +427,7 @@ GTLS_Result gtls_msg_build_client_hello(const GTLS_HelloParams * p,
       p->groups == NULL || p->group_count == 0 || p->sig_algs == NULL ||
       p->sig_alg_count == 0 || (p->session_id_len != 0 && p->session_id_len != 32u) ||
       (p->host == NULL && p->host_len != 0) ||
+      (p->early_data && p->psk == NULL) ||
       (p->psk != NULL && (p->psk->identity == NULL || p->psk->identity_len == 0 ||
           p->psk->identity_len > 0xffffu || p->psk->binder_len < 32u ||
           p->psk->binder_len > GTLS_HASH_MAX))) {
@@ -456,6 +487,10 @@ GTLS_Result gtls_msg_build_client_hello(const GTLS_HelloParams * p,
   write_key_share(out, &p->share);
   if (p->psk != NULL) {
     write_psk_modes(out);
+  }
+  if (p->early_data) {
+    ext_begin(out, GTLS_EXT_EARLY_DATA, &at);
+    gtls_buf_end(out, at, 2);
   }
   finish_hello(out, ext_at, p->psk);
   return out->err;
@@ -548,6 +583,9 @@ GTLS_Result gtls_msg_retry_client_hello_psk(const void * hello1, size_t hello1_l
 
     if (e->type == GTLS_EXT_PADDING || e->type == GTLS_EXT_PRE_SHARED_KEY) {
       continue; /* the padding is recomputed, the PSK rewritten last */
+    }
+    if (e->type == GTLS_EXT_EARLY_DATA) {
+      continue; /* the second hello offers none (section 4.2.10) */
     }
     if (e->type == GTLS_EXT_COOKIE) {
       continue; /* replaced below, or dropped */
@@ -753,6 +791,13 @@ GTLS_Result gtls_msg_parse_encrypted_extensions(const void * body, size_t len,
       return GTLS_ERR_PROTOCOL;
     }
     ee.has_server_name = 1;
+  }
+  e = gtls_msg_find_ext(ee.exts, ee.ext_count, GTLS_EXT_EARLY_DATA);
+  if (e != NULL) {
+    if (e->len != 0) {
+      return GTLS_ERR_CORRUPT;
+    }
+    ee.has_early_data = 1;
   }
   *out = ee;
   return GTLS_OK;
@@ -1320,6 +1365,10 @@ GTLS_Result gtls_msg_build_encrypted_extensions(const GTLS_EeParams * p,
     gtls_buf_end(out, list, 2);
     gtls_buf_end(out, at, 2);
   }
+  if (p->early_data) {
+    ext_begin(out, GTLS_EXT_EARLY_DATA, &at);
+    gtls_buf_end(out, at, 2);
+  }
   gtls_buf_end(out, ext_at, 2);
   return finish_message(out, start);
 }
@@ -1408,6 +1457,22 @@ GTLS_Result gtls_msg_build_finished(const void * verify_data, size_t len,
   begin_message(out, GTLS_HS_FINISHED);
   (void)gtls_buf_append(out, verify_data, len);
   return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_build_end_of_early_data(GTLS_Buf * out) {
+  size_t start;
+
+  if (out == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  start = out->len;
+  begin_message(out, GTLS_HS_END_OF_EARLY_DATA);
+  return finish_message(out, start);
+}
+
+GTLS_Result gtls_msg_parse_end_of_early_data(const void * body, size_t len) {
+  (void)body;
+  return len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;
 }
 
 GTLS_Result gtls_msg_build_key_update(unsigned request, GTLS_Buf * out) {

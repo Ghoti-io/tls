@@ -174,6 +174,82 @@ GTLS_API GTLS_Result gtls_conn_read(GTLS_Conn * conn, void * out, size_t cap,
     size_t * n);
 
 /**
+ * @brief Where an offer of early data (0-RTT) stands.
+ *
+ * Early data is replayable: whoever recorded the connection can send the same
+ * bytes again. The calls below keep it apart from ordinary application data,
+ * so that what the caller does with it can differ.
+ */
+typedef enum GTLS_EarlyStatus {
+  GTLS_EARLY_NONE = 0,   ///< No early data was offered, or this end did not take part in an offer.
+  GTLS_EARLY_PENDING,    ///< A client has offered it and the server has not answered.
+  GTLS_EARLY_ACCEPTED,   ///< The server accepted it.
+  GTLS_EARLY_REJECTED    ///< It was offered and not accepted: nothing of it was delivered.
+} GTLS_EarlyStatus;
+
+/**
+ * @brief Send early data (a client; RFC 8446 section 2.3).
+ *
+ * Only for a connection that is resuming a session whose ticket permits it
+ * (::GTLS_SessionInfo::max_early_data), in a context with
+ * ::GTLS_ContextConfig::max_early_data set, after ::gtls_conn_start and before
+ * the server's first message has been fed. The ClientHello is queued ahead of
+ * the data. The total over all calls is at most the smaller of the session's
+ * allowance and the context's; a call that would pass it takes nothing and is
+ * ::GTLS_ERR_LIMIT (the connection is not failed). The library keeps the bytes
+ * until the server answers, so that they can be handed back if it refuses
+ * them (::gtls_conn_early_resend). Like ::gtls_conn_write, a call may take
+ * fewer bytes than offered when the output is full.
+ *
+ * @param written Receives the bytes taken. Not NULL.
+ * @return ::GTLS_OK; ::GTLS_ERR_INVALID when this is not a client, no session
+ *   is being resumed, the session or the context does not permit early data,
+ *   the server has already answered, or the stream interface is not in use;
+ *   ::GTLS_ERR_LIMIT; ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_write_early(GTLS_Conn * conn, const void * data,
+    size_t len, size_t * written);
+
+/**
+ * @brief Take early data a server has accepted (a server).
+ *
+ * These bytes may have been replayed; ::gtls_conn_read never returns them. They
+ * can be read as soon as they have been received, before the handshake is
+ * done. A connection that accepted none returns ::GTLS_OK with @p n 0.
+ *
+ * @param n Receives the bytes copied. Not NULL.
+ * @return ::GTLS_OK; ::GTLS_ERR_INVALID for a client or the message interface;
+ *   ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_read_early(GTLS_Conn * conn, void * out,
+    size_t cap, size_t * n);
+
+/**
+ * @brief What became of an offer of early data.
+ *
+ * @param status Receives a ::GTLS_EarlyStatus. Not NULL. A server reports
+ *   ::GTLS_EARLY_REJECTED when the ClientHello offered it and it was not
+ *   accepted for any reason, ::GTLS_EARLY_ACCEPTED when it was.
+ * @return ::GTLS_OK, or ::GTLS_ERR_EARLY_REJECTED when @p status is
+ *   ::GTLS_EARLY_REJECTED; ::GTLS_ERR_FAILED; ::GTLS_ERR_INVALID.
+ */
+GTLS_API GTLS_Result gtls_conn_early_status(const GTLS_Conn * conn,
+    GTLS_EarlyStatus * status);
+
+/**
+ * @brief Take back the early data a server refused (a client).
+ *
+ * Copies and removes up to @p cap of the bytes ::gtls_conn_write_early took,
+ * for the caller to send again as ordinary data once the handshake is done.
+ *
+ * @param n Receives the bytes copied; 0 when none are left. Not NULL.
+ * @return ::GTLS_OK; ::GTLS_ERR_INVALID unless ::gtls_conn_early_status says
+ *   ::GTLS_EARLY_REJECTED; ::GTLS_ERR_FAILED.
+ */
+GTLS_API GTLS_Result gtls_conn_early_resend(GTLS_Conn * conn, void * out,
+    size_t cap, size_t * n);
+
+/**
  * @brief Send close_notify: this end will write no more.
  *
  * The peer's own close_notify is still read. Writes after this are

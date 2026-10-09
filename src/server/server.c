@@ -38,8 +38,14 @@
  * the full one it would have been without the offer; one that is good has
  * its binder checked, and a binder that is wrong is fatal. A good offer gives
  * the abbreviated handshake: ServerHello with the selected identity,
- * EncryptedExtensions, Finished. early_data is checked for shape and not
- * accepted: its records are skipped (spec 8b builds the rest).
+ * EncryptedExtensions, Finished.
+ *
+ * Early data (RFC 8446 sections 2.3 and 4.2.10). An early_data offer is
+ * accepted only when every check that can be made here holds and the caller's
+ * replay callback says yes (accept_early); anything else is a rejection, and
+ * the client's early records are skipped. On acceptance the early records are
+ * opened under client_early_traffic_secret, kept apart from ordinary data, and
+ * the handshake waits for EndOfEarlyData before the client's Finished.
  */
 
 #include <ghoti.io/tls/macros.h>
@@ -692,6 +698,7 @@ typedef struct FlightScratch {
   unsigned char verify[GTLS_HASH_MAX];
   unsigned char content[GTLS_CV_CONTENT_MAX];
   unsigned char sig[GCERT_SIG_MAX];
+  unsigned char th_ch[GTLS_HASH_MAX];   /* the transcript through the ClientHello, for the early secret */
 } FlightScratch;
 
 /** Certificate and CertificateVerify, the part of the flight a resumed handshake leaves out. */
@@ -767,7 +774,7 @@ static GTLS_Result send_authentication(GTLS_Conn * c, FlightScratch * k, GTLS_Ha
 }
 
 static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resume * r,
-    GTLS_Group group, const GTLS_ClientShare * share, FlightScratch * k) {
+    GTLS_Group group, const GTLS_ClientShare * share, int early, FlightScratch * k) {
   GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
   size_t hlen = gtls_hash_len(hash);
   const int resumed = r->active;
@@ -782,6 +789,14 @@ static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resum
   memset(&mine, 0, sizeof mine);
   c->group = group;
   c->resumed = resumed;
+  if (early) {
+    /* Only the ClientHello is in the transcript now; the ServerHello is not
+     * part of what the early traffic secret covers. */
+    result = gtls_transcript_snapshot(&c->sec.transcript, hash, k->th_ch);
+    if (result != GTLS_OK) {
+      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    }
+  }
   result = gtls_conn_draw(c, sp.random, 32);
   if (result == GTLS_OK) {
     result = gtls_conn_gen_share(c, group, &mine);
@@ -819,6 +834,9 @@ static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resum
     result = resumed ? gtls_schedule_early_psk(&c->sec.schedule, hash, r->plain.psk, r->plain.psk_len)
                      : gtls_schedule_early(&c->sec.schedule, hash);
   }
+  if (result == GTLS_OK && early) {
+    result = gtls_schedule_early_traffic(&c->sec.schedule, k->th_ch);
+  }
   if (result == GTLS_OK) {
     result = gtls_schedule_handshake(&c->sec.schedule, k->ecdhe, ecdhe_len, k->th);
   }
@@ -836,6 +854,7 @@ static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resum
   ee.ack_server_name = c->sni_acknowledged;
   ee.alpn = c->alpn_selected_len != 0 ? c->alpn_selected : NULL;
   ee.alpn_len = c->alpn_selected_len;
+  ee.early_data = early;
   gtls_buf_init(&m, c->allocator, c->limits.max_output_bytes);
   result = gtls_msg_build_encrypted_extensions(&ee, &m);
   if (result == GTLS_OK) {
@@ -883,18 +902,18 @@ static GTLS_Result send_flight_inner(GTLS_Conn * c, const Offer * o, const Resum
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  c->state = GTLS_STATE_S_WAIT_FIN;
+  c->state = early ? GTLS_STATE_S_WAIT_EOED : GTLS_STATE_S_WAIT_FIN;
   return GTLS_OK;
 }
 
 
 static GTLS_Result send_flight(GTLS_Conn * c, const Offer * o, const Resume * r,
-    GTLS_Group group, const GTLS_ClientShare * share) {
+    GTLS_Group group, const GTLS_ClientShare * share, int early) {
   FlightScratch k;
   GTLS_Result result;
 
   memset(&k, 0, sizeof k);
-  result = send_flight_inner(c, o, r, group, share, &k);
+  result = send_flight_inner(c, o, r, group, share, early, &k);
   (void)gsec_wipe(&k, sizeof k);
   return result;
 }
@@ -970,6 +989,38 @@ static GTLS_Result verify_binder(GTLS_Conn * c, const Offer * o, const Resume * 
   return GTLS_OK;
 }
 
+/**
+ * Does this server accept the early data on offer? Yes only when the ClientHello
+ * offered it, its PSK was accepted and the binder verified (the caller's
+ * position), the context allows it, no HelloRetryRequest was sent, the ticket
+ * carries an allowance, the suite is the ticket's, the ALPN protocol selected is
+ * the ticket's (section 4.2.10), and last, the caller's callback says so. That
+ * the ticket's age is inside the window was settled in try_resume. The callback
+ * is the last because it is the one with a side effect: it is called only for a
+ * ticket nothing else rules out, and so only once for it.
+ */
+static int accept_early(const GTLS_Conn * c, const Offer * o, const Resume * r) {
+  const GTLS_Context * x = c->context;
+  const GTLS_PskEntry * en;
+  unsigned char id[GSEC_SHA256_DIGEST_LEN];
+  int verdict;
+
+  if (!o->early_data || !r->active || c->retried || x->max_early_data == 0 ||
+      x->anti_replay == NULL || r->plain.max_early_data == 0 ||
+      r->plain.suite != (uint32_t)c->suite ||
+      r->plain.alpn_len != c->alpn_selected_len ||
+      gsec_equal(r->plain.alpn, c->alpn_selected, c->alpn_selected_len) != GSEC_OK) {
+    return 0;
+  }
+  en = &o->psk_offer.entries[r->index];
+  if (gsec_sha256(en->identity, en->identity_len, id) != GSEC_OK) {
+    return 0;
+  }
+  verdict = x->anti_replay(x->anti_replay_user, id, r->plain.issued,
+      en->age - r->plain.age_add);
+  return verdict == 1;
+}
+
 static GTLS_Result on_client_hello_inner(GTLS_Conn * c, const unsigned char * msg,
     size_t msg_len, int64_t now, Resume * r) {
   const int second = c->state == GTLS_STATE_S_WAIT_CH2;
@@ -989,8 +1040,12 @@ static GTLS_Result on_client_hello_inner(GTLS_Conn * c, const unsigned char * ms
     }
     /* The early data came before the retry was answered, so none follows. */
     c->early_skip = 0;
-  } else if (o.early_data && o.psk) {
-    c->early_skip = 1;
+  } else {
+    /* Offered and, until accept_early says otherwise, rejected. */
+    c->early_status = o.early_data ? GTLS_EARLY_REJECTED : GTLS_EARLY_NONE;
+    if (o.early_data && o.psk) {
+      c->early_skip = 1;
+    }
   }
   result = copy_sni(c, &o.host);
   if (result != GTLS_OK) {
@@ -1033,7 +1088,21 @@ static GTLS_Result on_client_hello_inner(GTLS_Conn * c, const unsigned char * ms
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
-  return send_flight(c, &o, r, group, share);
+  if (accept_early(c, &o, r)) {
+    uint32_t cap = r->plain.max_early_data < c->context->max_early_data
+        ? r->plain.max_early_data : c->context->max_early_data;
+
+    c->early_status = GTLS_EARLY_ACCEPTED;
+    c->early_skip = 0; /* the records that follow are opened, not skipped */
+    c->early_max = cap;
+    c->early_in.max = cap;
+    result = gtls_buf_reserve(&c->early_in, cap); /* once, so nothing is left behind by a growth */
+    if (result != GTLS_OK) {
+      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+    }
+    return send_flight(c, &o, r, group, share, 1);
+  }
+  return send_flight(c, &o, r, group, share, 0);
 }
 
 static GTLS_Result on_client_hello(GTLS_Conn * c, const unsigned char * msg,
@@ -1094,6 +1163,7 @@ GTLS_Result gtls_server_issue_tickets(GTLS_Conn * c, int64_t now) {
           ((uint32_t)age[2] << 8) | age[3];
       p.issued = now;
       p.lifetime = x->ticket_lifetime;
+      p.max_early_data = x->max_early_data;
       memcpy(p.alpn, c->alpn_selected, c->alpn_selected_len);
       p.alpn_len = c->alpn_selected_len;
       if (c->client_sni_len != 0) {
@@ -1109,6 +1179,8 @@ GTLS_Result gtls_server_issue_tickets(GTLS_Conn * c, int64_t now) {
     if (result == GTLS_OK) {
       t.lifetime = p.lifetime;
       t.age_add = p.age_add;
+      t.early_data = p.max_early_data != 0;
+      t.max_early_data = p.max_early_data;
       t.nonce = &nonce;
       t.nonce_len = 1;
       t.ticket = ticket;
@@ -1129,6 +1201,26 @@ GTLS_Result gtls_server_issue_tickets(GTLS_Conn * c, int64_t now) {
           : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
     }
   }
+  return GTLS_OK;
+}
+
+/**
+ * EndOfEarlyData ends the early records (section 4.5). It joins the transcript
+ * the client's Finished covers; after it the keys are the handshake keys, so
+ * nothing more is accepted under the early one.
+ */
+static GTLS_Result on_end_of_early_data(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len) {
+  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);
+
+  if (result != GTLS_OK) {
+    return gtls_conn_fail_parse(c, result);
+  }
+  result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
+  if (result != GTLS_OK) {
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  c->state = GTLS_STATE_S_WAIT_FIN;
   return GTLS_OK;
 }
 
@@ -1180,6 +1272,11 @@ GTLS_Result gtls_server_on_message(GTLS_Conn * c, const unsigned char * msg,
         return gtls_conn_unexpected(c);
       }
       return on_client_hello(c, msg, msg_len, now);
+    case GTLS_STATE_S_WAIT_EOED:
+      if (type != GTLS_HS_END_OF_EARLY_DATA) {
+        return gtls_conn_unexpected(c);
+      }
+      return on_end_of_early_data(c, msg, msg_len);
     case GTLS_STATE_S_WAIT_FIN:
       if (type != GTLS_HS_FINISHED) {
         return gtls_conn_unexpected(c);
@@ -1219,7 +1316,8 @@ GTLS_Result gtls_conn_identity(const GTLS_Conn * c, size_t * index) {
   if (c->role != GTLS_ROLE_SERVER) {
     return GTLS_ERR_INVALID;
   }
-  if (c->state != GTLS_STATE_S_WAIT_FIN && c->state != GTLS_STATE_CONNECTED) {
+  if (c->state != GTLS_STATE_S_WAIT_FIN && c->state != GTLS_STATE_S_WAIT_EOED &&
+      c->state != GTLS_STATE_CONNECTED) {
     return GTLS_ERR_INVALID; /* not chosen yet */
   }
   *index = c->identity_index;

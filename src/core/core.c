@@ -86,6 +86,8 @@ const char * gtls_result_string(GTLS_Result result) {
       return "No suite, group or signature scheme in common";
     case GTLS_ERR_ALPN:
       return "No application protocol in common";
+    case GTLS_ERR_EARLY_REJECTED:
+      return "Early data was not accepted";
     case GTLS_RESULT_COUNT:
       break;
   }
@@ -113,6 +115,7 @@ void gtls_limits_default(GTLS_Limits * limits) {
   limits->max_app_buffer = 65536u;
   limits->max_key_updates = 65536u;
   limits->max_early_skip_bytes = 16384u + 256u + 5u;
+  limits->max_early_data_bytes = 16384u;
 }
 
 void gtls_limits_resolve(const GTLS_Limits * in, GTLS_Limits * out) {
@@ -144,5 +147,6 @@ void gtls_limits_resolve(const GTLS_Limits * in, GTLS_Limits * out) {
   GTLS_RESOLVE(max_app_buffer)
   GTLS_RESOLVE(max_key_updates)
   GTLS_RESOLVE(max_early_skip_bytes)
+  GTLS_RESOLVE(max_early_data_bytes)
 #undef GTLS_RESOLVE
 }

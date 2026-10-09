@@ -105,6 +105,12 @@ typedef struct GTLS_Buf {
 void gtls_buf_init(GTLS_Buf * b, const GTLS_Allocator * allocator, size_t max);
 void gtls_buf_free(GTLS_Buf * b);
 GTLS_Result gtls_buf_append(GTLS_Buf * b, const void * data, size_t n);
+/**
+ * Make room for @p n bytes at once, zeroed, so that what is kept in the buffer
+ * is never moved to a larger block by a growth (which would leave the old block
+ * freed with the bytes still in it). ::GTLS_ERR_LIMIT past the buffer's maximum.
+ */
+GTLS_Result gtls_buf_reserve(GTLS_Buf * b, size_t n);
 void gtls_buf_u8(GTLS_Buf * b, unsigned v);
 void gtls_buf_u16(GTLS_Buf * b, unsigned v);
 void gtls_buf_u24(GTLS_Buf * b, unsigned v);
@@ -218,6 +224,7 @@ typedef struct GTLS_HelloParams {
   size_t sig_alg_count;
   GTLS_KeyShare share;
   const GTLS_PskParams * psk;       /* a session to resume, or NULL */
+  int early_data;                   /* offer early_data (section 4.2.10); needs a psk */
 } GTLS_HelloParams;
 
 /** Build a whole ClientHello message, header included, into @p out. */
@@ -297,6 +304,7 @@ typedef struct GTLS_EncryptedExtensions {
   const unsigned char * alpn;       /* the one protocol name */
   size_t alpn_len;
   int has_server_name;
+  int has_early_data;               /* early_data (empty), the server's acceptance */
 } GTLS_EncryptedExtensions;
 
 GTLS_Result gtls_msg_parse_encrypted_extensions(const void * body, size_t len,
@@ -483,6 +491,7 @@ typedef struct GTLS_EeParams {
   const unsigned char * prefix;     /* whole extensions to put first (test seam); NULL for none */
   size_t prefix_len;
   int ack_server_name;              /* an empty server_name extension */
+  int early_data;                   /* an empty early_data extension: early data is accepted */
   const unsigned char * alpn;       /* the one protocol chosen; NULL for none */
   size_t alpn_len;
 } GTLS_EeParams;
@@ -499,6 +508,12 @@ GTLS_Result gtls_msg_build_certificate_verify(unsigned scheme,
 
 GTLS_Result gtls_msg_build_finished(const void * verify_data, size_t len,
     GTLS_Buf * out);
+
+/** EndOfEarlyData (section 4.5): the four bytes of a message with no body. */
+GTLS_Result gtls_msg_build_end_of_early_data(GTLS_Buf * out);
+
+/** The body of an EndOfEarlyData: empty, else ::GTLS_ERR_CORRUPT. */
+GTLS_Result gtls_msg_parse_end_of_early_data(const void * body, size_t len);
 
 /** KeyUpdate (section 4.6.3): @p request is 0 or 1. */
 GTLS_Result gtls_msg_build_key_update(unsigned request, GTLS_Buf * out);

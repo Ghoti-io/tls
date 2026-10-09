@@ -62,9 +62,13 @@ void gtls_stream_free(GTLS_Conn * c) {
   wipe_buf(&c->rbuf);
   wipe_buf(&c->wire);
   wipe_buf(&c->app_in);
+  wipe_buf(&c->early_in);
+  wipe_buf(&c->early_sent);
   gtls_buf_free(&c->rbuf);
   gtls_buf_free(&c->wire);
   gtls_buf_free(&c->app_in);
+  gtls_buf_free(&c->early_in);
+  gtls_buf_free(&c->early_sent);
 }
 
 /* -------------------------------------------------------------------- keys */
@@ -80,12 +84,21 @@ static const unsigned char * traffic_secret(const GTLS_Conn * c, GTLS_Epoch epoc
   if (epoch == GTLS_EPOCH_APPLICATION && s->stage >= 3) {
     return client_secret ? s->c_ap : s->s_ap;
   }
+  /* Early records are the client's, so only its write keys and the server's
+   * read keys exist. */
+  if (epoch == GTLS_EPOCH_EARLY && s->has_e && client_secret) {
+    return s->c_e;
+  }
   return NULL;
 }
 
 static GTLS_Result install_keys(GTLS_Conn * c, GTLS_Epoch epoch, int write) {
   const unsigned char * secret = traffic_secret(c, epoch, write);
   size_t hlen = c->sec.schedule.hlen;
+  /* A client has not yet heard which suite the server chose; the early
+   * records are under the one of the session it resumes. */
+  uint32_t suite = epoch == GTLS_EPOCH_EARLY && c->role == GTLS_ROLE_CLIENT
+      ? (uint32_t)c->early_suite : (uint32_t)c->suite;
   GTLS_Result result;
 
   if (secret == NULL || hlen == 0) {
@@ -93,13 +106,13 @@ static GTLS_Result install_keys(GTLS_Conn * c, GTLS_Epoch epoch, int write) {
   }
   if (write) {
     memcpy(c->sec.wr_secret, secret, hlen);
-    result = gtls_record_keys_from_secret(&c->sec.wr, (uint32_t)c->suite,
+    result = gtls_record_keys_from_secret(&c->sec.wr, suite,
         c->sec.wr_secret,
         epoch == GTLS_EPOCH_APPLICATION ? c->limits.max_records_per_key : 0);
     c->wr_epoch = epoch;
   } else {
     memcpy(c->sec.rd_secret, secret, hlen);
-    result = gtls_record_keys_from_secret(&c->sec.rd, (uint32_t)c->suite,
+    result = gtls_record_keys_from_secret(&c->sec.rd, suite,
         c->sec.rd_secret, 0);
     c->rd_epoch = epoch;
   }
@@ -198,6 +211,35 @@ GTLS_Result gtls_stream_flush(GTLS_Conn * c) {
       }
     }
   }
+  /* A client that offers early data puts the dummy record right after its
+   * ClientHello, ahead of the early records (appendix D.4). */
+  if (c->role == GTLS_ROLE_CLIENT && c->early_status != GTLS_EARLY_NONE &&
+      c->context->middlebox_compat && c->hello_flushed) {
+    result = put_ccs(c);
+    if (result != GTLS_OK) {
+      return result;
+    }
+  }
+  /* EndOfEarlyData is the last record under the early key (section 4.5). */
+  q = &c->out[GTLS_EPOCH_EARLY];
+  while (q->len > 0) {
+    size_t n = q->len < GTLS_RECORD_PLAIN_MAX ? q->len : GTLS_RECORD_PLAIN_MAX;
+
+    if (c->wr_epoch != GTLS_EPOCH_EARLY) {
+      if (c->wr_epoch > GTLS_EPOCH_EARLY) {
+        return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+      }
+      result = install_keys(c, GTLS_EPOCH_EARLY, 1);
+      if (result != GTLS_OK) {
+        return result;
+      }
+    }
+    result = put_sealed(c, GTLS_CT_HANDSHAKE, q->data, n);
+    if (result != GTLS_OK) {
+      return result;
+    }
+    gtls_buf_consume(q, n);
+  }
   q = &c->out[GTLS_EPOCH_HANDSHAKE];
   if (q->len > 0 && c->wr_epoch < GTLS_EPOCH_HANDSHAKE) {
     if (c->role == GTLS_ROLE_CLIENT && c->context->middlebox_compat) {
@@ -227,7 +269,8 @@ GTLS_Result gtls_stream_flush(GTLS_Conn * c) {
    * the peer reads with. */
   if (q->len == 0 && c->out[GTLS_EPOCH_HANDSHAKE].len == 0 &&
       c->wr_epoch == GTLS_EPOCH_HANDSHAKE && c->sec.schedule.stage >= 3 &&
-      (c->state == GTLS_STATE_CONNECTED || c->state == GTLS_STATE_S_WAIT_FIN)) {
+      (c->state == GTLS_STATE_CONNECTED || c->state == GTLS_STATE_S_WAIT_FIN ||
+          c->state == GTLS_STATE_S_WAIT_EOED)) {
     result = install_keys(c, GTLS_EPOCH_APPLICATION, 1);
     if (result != GTLS_OK) {
       return result;
@@ -278,7 +321,8 @@ static GTLS_Result on_ccs(GTLS_Conn * c, const unsigned char * body, size_t n) {
   if (c->role == GTLS_ROLE_CLIENT) {
     allowed = c->state >= GTLS_STATE_WAIT_SH && c->state < GTLS_STATE_CONNECTED;
   } else {
-    allowed = c->state == GTLS_STATE_S_WAIT_CH2 || c->state == GTLS_STATE_S_WAIT_FIN;
+    allowed = c->state == GTLS_STATE_S_WAIT_CH2 || c->state == GTLS_STATE_S_WAIT_FIN ||
+        c->state == GTLS_STATE_S_WAIT_EOED;
   }
   if (!allowed || n != 1u || body[0] != 1u || ++c->ccs_seen > GTLS_CCS_MAX) {
     return gtls_conn_unexpected(c);
@@ -345,6 +389,60 @@ static GTLS_Result skip_early(GTLS_Conn * c, size_t body_len) {
   return GTLS_OK;
 }
 
+/**
+ * A record that did not open under the early key while the server waits for
+ * EndOfEarlyData: does it open under the handshake key? Then it is the
+ * client's Finished (or what follows it) and the client left out the
+ * EndOfEarlyData that must come first, which is unexpected_message and not a
+ * bad MAC. The keys are a copy for this one look and are wiped.
+ */
+static int opens_under_handshake(const GTLS_Conn * c, const unsigned char * header,
+    const unsigned char * body, size_t blen) {
+  GTLS_RecordKeys keys;
+  unsigned char secret[GTLS_HASH_MAX];
+  unsigned char plain[GTLS_RECORD_CIPHERTEXT_MAX];
+  size_t plain_len = 0;
+  unsigned inner = 0;
+  int opened = 0;
+
+  if (c->sec.schedule.stage < 2) {
+    return 0;
+  }
+  memcpy(secret, c->sec.schedule.c_hs, c->sec.schedule.hlen);
+  if (gtls_record_keys_from_secret(&keys, (uint32_t)c->suite, secret, 0) == GTLS_OK) {
+    opened = gtls_record_open(&keys, header, body, blen, c->limits.max_record_padding,
+        plain, &plain_len, &inner) == GTLS_OK;
+  }
+  (void)gsec_wipe(&keys, sizeof keys);
+  (void)gsec_wipe(secret, sizeof secret);
+  (void)gsec_wipe(plain, sizeof plain);
+  return opened;
+}
+
+/**
+ * A record of application data under the early key, on a server that accepted
+ * early data. Counted against the ticket's allowance (an empty record costs
+ * one, so a flood of them ends too) and kept apart from ordinary data.
+ */
+static GTLS_Result on_early_data(GTLS_Conn * c, const unsigned char * pt, size_t n) {
+  size_t cost = n != 0 ? n : 1u;
+  GTLS_Result result;
+
+  if (c->in.len != 0) {
+    return gtls_conn_unexpected(c);
+  }
+  if (cost > c->early_max - c->early_used) {
+    return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  c->early_used += (uint32_t)cost;
+  result = gtls_buf_append(&c->early_in, pt, n);
+  if (result != GTLS_OK) {
+    /* The room was the allowance, which the check above kept. */
+    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
+  }
+  return GTLS_OK;
+}
+
 /** One whole record is in rbuf. */
 static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
   const unsigned char * header = c->rbuf.data;
@@ -398,6 +496,11 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
       (void)gsec_wipe(scratch, sizeof scratch);
       return skip_early(c, blen);
     }
+    if (result == GTLS_ERR_MISMATCH && c->state == GTLS_STATE_S_WAIT_EOED &&
+        opens_under_handshake(c, header, body, blen)) {
+      (void)gsec_wipe(scratch, sizeof scratch);
+      return gtls_conn_unexpected(c); /* the Finished, with no EndOfEarlyData before it */
+    }
     if (result != GTLS_OK) {
       (void)gsec_wipe(scratch, sizeof scratch);
       return open_failed(c, result);
@@ -421,7 +524,9 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
       result = on_alert(c, pt, pt_len, epoch != GTLS_EPOCH_INITIAL);
       break;
     case GTLS_CT_APPLICATION_DATA:
-      if (c->state != GTLS_STATE_CONNECTED || c->in.len != 0) {
+      if (c->state == GTLS_STATE_S_WAIT_EOED) {
+        result = on_early_data(c, pt, pt_len);
+      } else if (c->state != GTLS_STATE_CONNECTED || c->in.len != 0) {
         result = gtls_conn_unexpected(c);
       } else {
         c->ku_run = 0; /* data between updates: they are not a flood */
@@ -737,6 +842,123 @@ GTLS_Result gtls_conn_read(GTLS_Conn * c, void * out, size_t cap, size_t * n) {
   take = c->app_in.len < cap ? c->app_in.len : cap;
   memcpy(out, c->app_in.data, take);
   gtls_buf_consume(&c->app_in, take);
+  *n = take;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_conn_write_early(GTLS_Conn * c, const void * data, size_t len,
+    size_t * written) {
+  const unsigned char * p = data;
+  GTLS_Result result;
+
+  if (c == NULL || written == NULL || (data == NULL && len != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  *written = 0;
+  if (stream_ready(c) != GTLS_OK) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  /* Only a client that offered it, before the server has said anything: the
+   * ClientHello has been built (WAIT_SH) and no answer has come. */
+  if (c->role != GTLS_ROLE_CLIENT || c->early_status != GTLS_EARLY_PENDING ||
+      c->state != GTLS_STATE_WAIT_SH) {
+    return GTLS_ERR_INVALID;
+  }
+  if (len > c->early_max - c->early_used) {
+    return GTLS_ERR_LIMIT;
+  }
+  if (len == 0) {
+    return GTLS_OK;
+  }
+  /* The ClientHello goes first, and the dummy record after it. */
+  result = gtls_stream_flush(c);
+  if (result != GTLS_OK) {
+    return result;
+  }
+  if (c->wr_epoch != GTLS_EPOCH_EARLY) {
+    result = install_keys(c, GTLS_EPOCH_EARLY, 1);
+    if (result != GTLS_OK) {
+      return result;
+    }
+  }
+  while (len > 0 && c->wire.len < c->limits.max_output_bytes) {
+    size_t n = len < GTLS_RECORD_PLAIN_MAX ? len : GTLS_RECORD_PLAIN_MAX;
+
+    result = gtls_record_seal(&c->sec.wr, GTLS_CT_APPLICATION_DATA, p, n, 0, &c->wire);
+    if (result == GTLS_ERR_LIMIT && c->wire.len != 0) {
+      break; /* the output is full */
+    }
+    if (result != GTLS_OK) {
+      return record_failed(c, result);
+    }
+    /* Kept to hand back; the room is the allowance, which was checked. */
+    result = gtls_buf_append(&c->early_sent, p, n);
+    if (result != GTLS_OK) {
+      return record_failed(c, result);
+    }
+    p += n;
+    len -= n;
+    *written += n;
+    c->early_used += (uint32_t)n;
+  }
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_conn_read_early(GTLS_Conn * c, void * out, size_t cap, size_t * n) {
+  size_t take;
+
+  if (c == NULL || n == NULL || (out == NULL && cap != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  *n = 0;
+  if (c->role != GTLS_ROLE_SERVER || stream_ready(c) != GTLS_OK) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  take = c->early_in.len < cap ? c->early_in.len : cap;
+  if (take != 0) {
+    memcpy(out, c->early_in.data, take);
+    gtls_buf_consume(&c->early_in, take);
+  }
+  *n = take;
+  return GTLS_OK;
+}
+
+GTLS_Result gtls_conn_early_status(const GTLS_Conn * c, GTLS_EarlyStatus * status) {
+  if (c == NULL || status == NULL) {
+    return GTLS_ERR_INVALID;
+  }
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  *status = c->early_status;
+  return c->early_status == GTLS_EARLY_REJECTED ? GTLS_ERR_EARLY_REJECTED : GTLS_OK;
+}
+
+GTLS_Result gtls_conn_early_resend(GTLS_Conn * c, void * out, size_t cap, size_t * n) {
+  size_t take;
+
+  if (c == NULL || n == NULL || (out == NULL && cap != 0)) {
+    return GTLS_ERR_INVALID;
+  }
+  *n = 0;
+  if (c->state == GTLS_STATE_FAILED) {
+    return GTLS_ERR_FAILED;
+  }
+  if (c->role != GTLS_ROLE_CLIENT || c->early_status != GTLS_EARLY_REJECTED) {
+    return GTLS_ERR_INVALID;
+  }
+  take = c->early_sent.len < cap ? c->early_sent.len : cap;
+  if (take != 0) {
+    memcpy(out, c->early_sent.data, take);
+    (void)gsec_wipe(c->early_sent.data, take);
+    gtls_buf_consume(&c->early_sent, take);
+  }
   *n = take;
   return GTLS_OK;
 }

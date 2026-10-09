@@ -79,7 +79,7 @@ key-update-after-close	src/client/stream.c	c->ku_queued == 0 \&\& !c->local_clos
 key-update-run-reset	src/client/stream.c	c->ku_run = 0; /* data between updates: they are not a flood */	(void)0;	testEdges
 key-update-queued-count	src/client/stream.c	      if (c->ku_queued > 0) {\n        c->ku_queued--;\n      }	      if (c->ku_queued > 0) {\n      }	testEdges
 key-update-answer-once	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0 \&\& !c->local_closed) {	if (request == 1u \&\& !c->local_closed) {	testEdges
-server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	(c->state == GTLS_STATE_CONNECTED)) {	testEdges
+server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN \|\|\n          c->state == GTLS_STATE_S_WAIT_EOED)) {	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	testEdges
 client-dummy-record	src/client/stream.c	if (c->role == GTLS_ROLE_CLIENT \&\& c->context->middlebox_compat) {	if (0) {	testEdges
 alpn-bytes	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(o->alpn[k].p, x->alpn + off + 1u, n) == GSEC_OK	o->alpn[k].len == n	testEdges
 alpn-length	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(	gsec_equal(	testEdges
@@ -115,7 +115,7 @@ early-skip-cap	src/client/stream.c	if (cost > c->limits.max_early_skip_bytes - c
 early-skip-after-retry	src/client/stream.c	if (c->early_skip \&\& epoch == GTLS_EPOCH_INITIAL \&\& type == GTLS_CT_APPLICATION_DATA) {	if (0) {	testPsk
 early-skip-header	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	1	testPsk
 retry-early-data	src/server/server.c	if (o->early_data) {\n    return gtls_conn_illegal(c);	if (0) {\n    return gtls_conn_illegal(c);	testPsk
-retry-ends-skip	src/server/server.c	    c->early_skip = 0;\n  } else if (o.early_data \&\& o.psk) {	    (void)0;\n  } else if (o.early_data \&\& o.psk) {	testPsk
+retry-ends-skip	src/server/server.c	    c->early_skip = 0;\n  } else {	    (void)0;\n  } else {	testPsk
 retry-may-drop-early-data	src/server/server.c	a->type == GTLS_EXT_EARLY_DATA \|\|	0 \|\|	testPsk
 retry-may-refresh-psk	src/server/server.c	a->type == GTLS_EXT_PRE_SHARED_KEY) {	0) {	testPsk
 psk-count-cap-edge	src/msg/msg.c	++n_ids > limits->max_tickets	++n_ids >= limits->max_tickets	testPsk
@@ -127,7 +127,7 @@ psk-ids-min-zero	src/msg/msg.c	gtls_reader_vector(\&r, 2, 7, 0, \&ids)	gtls_read
 psk-binder-31	src/msg/msg.c	gtls_reader_vector(\&binders, 1, 32, 0, \&binder)	gtls_reader_vector(\&binders, 1, 31, 0, \&binder)	testPsk
 psk-modes-parse-result	src/server/server.c	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_psk_modes(modes, \&o->psk_dhe);\n    if (0) {	testPsk
 early-data-parse-result	src/server/server.c	result = gtls_msg_parse_ch_early_data(e);\n    if (result != GTLS_OK) {	result = gtls_msg_parse_ch_early_data(e);\n    if (0) {	testPsk
-early-data-needs-psk	src/server/server.c	} else if (o.early_data \&\& o.psk) {	} else if (o.early_data) {	testPsk
+early-data-needs-psk	src/server/server.c	    if (o.early_data \&\& o.psk) {	    if (o.early_data) {	testPsk
 early-limit-resolve	src/core/core.c	  GTLS_RESOLVE(max_early_skip_bytes)\n	  (void)0;\n	testPsk
 early-skip-only-mismatch	src/client/stream.c	if (result == GTLS_ERR_MISMATCH \&\& c->early_skip	if (result != GTLS_OK \&\& c->early_skip	testPsk
 early-skip-header-type	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	!c->early_skip	testPsk
@@ -141,7 +141,7 @@ ticket-key-name	src/session/ticket.c	gsec_equal(keys[i].name, ticket, GTLS_TICKE
 ticket-key-expiry	src/session/ticket.c	if (now < keys[i].not_after \&\&	if ((now < keys[i].not_after \|\| 1) \&\&	testTicket
 ticket-sealing-newest	src/session/ticket.c	(best == NULL \|\| keys[i].not_before > best->not_before)	(best == NULL)	testTicket
 ticket-sealing-window	src/session/ticket.c	if (keys[i].not_before <= now \&\& now < keys[i].not_after \&\&	if (now < keys[i].not_after \&\&	testTicket
-ticket-state-version	src/session/ticket.c	if (n < 1u + 2u + 1u \|\| plain[at++] != GTLS_TICKET_STATE_VERSION) {	if (n < 1u + 2u + 1u \|\| (at++, 0)) {	testTicket
+ticket-state-version	src/session/ticket.c	  if (version != GTLS_TICKET_STATE_VERSION \&\& version != GTLS_TICKET_STATE_VERSION_EARLY) {	  if (0) {	testTicket
 ticket-state-lifetime	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at < t.alpn_len + 1u) {	if (n - at < t.alpn_len + 1u) {	testTicket
 ticket-state-exact	src/session/ticket.c	if (n - at != t.sni_len) {	if (n - at < t.sni_len) {	testTicket
 ticket-fresh-lifetime	src/session/ticket.c	if (elapsed_s >= p->lifetime) {	if (0) {	testTicket
