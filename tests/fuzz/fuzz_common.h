@@ -711,7 +711,8 @@ inline void check_end_state(GTLS_Conn * conn) {
     GTLS_Result why = gtls_conn_failure(conn);
     if (why == GTLS_OK) die("a failed connection has no reason");
     /* A peer's alert and the end of the stream have nobody to be answered. */
-    if (gtls_conn_alert(conn) == GTLS_ALERT_NONE && why != GTLS_ERR_ALERT && why != GTLS_ERR_TRUNCATED) {
+    if (gtls_conn_alert(conn) == GTLS_ALERT_NONE && why != GTLS_ERR_ALERT && why != GTLS_ERR_TRUNCATED &&
+        why != GTLS_ERR_CLOSED) {
       die("a failed connection has no alert");
     }
     unsigned char b[8];
@@ -1028,12 +1029,37 @@ struct PumpRandom {
  * order), bits 2-3 the group (3: the default order, a retry when the server
  * wants P-256 only), bit 4 a server that wants P-256 only, bits 5-7 the
  * feed size.
+ *
+ * A resume run whose size is 2 more than a multiple of 3 (the flips use whole
+ * triples) ends in a byte that picks a hostile peer, by its low three bits (bit 3 has the client
+ * write no early data, bit 4 puts it in compatibility mode, bit 5 makes the server's decision yes;
+ * 3 and 5 make it yes too):
+ *   1 a server that does not take the PSK and says `early_data` in EncryptedExtensions anyway;
+ *   2 a session whose suite is another of the same hash than the ticket's, so that the
+ *     acceptance the server gives is for a suite the early records were not sealed under;
+ *   3 a session whose ALPN protocol is not the ticket's;
+ *   4 a server that answers with an ALPN protocol the client never offered;
+ *   5 a wire that loses the client's EndOfEarlyData and keeps the Finished behind it;
+ *   6 a server that has turned early data off in its context but holds a ticket with an allowance;
+ *   7 a client that closes before the handshake is complete.
+ * Modes 1-6 make the server's replay decision yes. What each must come to when
+ * nothing else is changed is checked at the end of the run.
  */
 inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   if (size < 1) {
     return 0;
   }
   const unsigned opt = data[0];
+  unsigned mode = 0;
+  bool no_early = false;
+  bool compat = false;
+  bool accept = false;
+  if (resume && size >= 3 && (size - 1) % 3 == 2) {
+    mode = data[size - 1] & 7u;
+    no_early = (data[size - 1] & 8u) != 0;   /* the client offers early data and writes none */
+    compat = (data[size - 1] & 0x10u) != 0;  /* the client is in compatibility mode */
+    accept = (data[size - 1] & 0x20u) != 0;  /* the server's decision is yes */
+  }
   static const GTLS_Suite suites[3] = {GTLS_SUITE_AES_128_GCM_SHA256, GTLS_SUITE_AES_256_GCM_SHA384,
       GTLS_SUITE_CHACHA20_POLY1305_SHA256};
   static const GTLS_Group groups[3] = {GTLS_GROUP_X25519, GTLS_GROUP_SECP256R1, GTLS_GROUP_SECP384R1};
@@ -1067,6 +1093,7 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   static const char * const salpn[] = {"http/1.1"};
   ccfg.alpn = calpn;
   ccfg.alpn_count = 2;
+  ccfg.middlebox_compat = compat ? 1 : 0;
   scfg.alpn = salpn;
   scfg.alpn_count = 1;
   GTLS_Suite suite = suites[(opt & 3u) % 3u];
@@ -1103,7 +1130,7 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
    * client sends some. The server's replay decision is the input's size: even
    * says yes, odd says no. */
   FuzzReplay replay;
-  replay.verdict = (size & 1u) == 0 ? 1 : 0;
+  replay.verdict = (size & 1u) == 0 || (mode >= 1 && mode <= 6) || no_early || accept ? 1 : 0;
   scfg.max_early_data = 512;
   scfg.anti_replay = FuzzReplay::fn;
   scfg.anti_replay_user = &replay;
@@ -1156,11 +1183,64 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
     gtls_conn_free(c1);
     gtls_conn_free(s1);
   }
+  /* The hostile servers are made from a context of their own, once the first handshake has given the
+   * ticket: one with another ticket key (so the PSK is not taken), one with no ALPN list, one with
+   * early data off. */
+  static const unsigned char hostile_early[] = {0x00, 0x2a, 0x00, 0x00};
+  static const unsigned char hostile_alpn[] = {0x00, 0x10, 0x00, 0x09, 0x00, 0x07, 0x06, 's', 'p', 'd', 'y', '/', '3'};
+  const unsigned char * prefix = nullptr;
+  size_t prefix_len = 0;
+  GTLS_Context * sctx2 = nullptr;
+  GTLS_TicketKey ticket_key2;
+  if (session != nullptr && (mode == 1 || mode == 4 || mode == 6)) {
+    GTLS_ContextConfig scfg2 = scfg;
+    std::memset(&ticket_key2, 0x6d, sizeof ticket_key2);
+    ticket_key2.not_before = 1699990000;
+    ticket_key2.not_after = 1700100000;
+    if (mode == 1) {
+      scfg2.ticket_keys = &ticket_key2;
+      prefix = hostile_early;
+      prefix_len = sizeof hostile_early;
+    } else if (mode == 4) {
+      scfg2.alpn = nullptr;
+      scfg2.alpn_count = 0;
+      prefix = hostile_alpn;
+      prefix_len = sizeof hostile_alpn;
+    } else {
+      scfg2.max_early_data = 0;
+      scfg2.anti_replay = nullptr;
+      scfg2.anti_replay_user = nullptr;
+    }
+    if (gtls_context_new(nullptr, &scfg2, &sctx2) != GTLS_OK) die("the hostile server's context");
+    gtls_conn_free(s);
+    s = nullptr;
+    if (gtls_conn_new_server(sctx2, &s) != GTLS_OK) die("the hostile server");
+  }
+  /* Sessions that say something the server will not bear out (the early records are sealed under the
+   * session's suite and the client believes an acceptance only for it). */
+  bool tampered = false;
+  if (session != nullptr && mode == 2) {
+    if (session->suite == GTLS_SUITE_AES_128_GCM_SHA256) {
+      session->suite = GTLS_SUITE_CHACHA20_POLY1305_SHA256;
+      tampered = true;
+    } else if (session->suite == GTLS_SUITE_CHACHA20_POLY1305_SHA256) {
+      session->suite = GTLS_SUITE_AES_128_GCM_SHA256;
+      tampered = true;
+    }
+  }
+  if (session != nullptr && mode == 3) {
+    std::memcpy(session->alpn, "h2", 2);
+    session->alpn_len = 2;
+    tampered = true;
+  }
   PumpRandom crnd, srnd;
   crnd.pcg.state = 0x1234567;
   srnd.pcg.state = 0x7654321;
   gtls_conn_set_hooks(c, PumpRandom::fn, &crnd, nullptr, nullptr);
   gtls_conn_set_hooks(s, PumpRandom::fn, &srnd, nullptr, nullptr);
+  if (prefix != nullptr) {
+    gtls_conn_set_server_hooks(s, nullptr, nullptr, nullptr, nullptr, 0, 0, prefix, prefix_len);
+  }
   note(c);
   note(s);
   if (session != nullptr && gtls_conn_set_session(c, session, 1700000000) != GTLS_OK) die("set session");
@@ -1172,11 +1252,31 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   Bytes got_early;
   bool early_sent = false;
   if (session != nullptr) {
-    size_t w = 0;
-    if (gtls_conn_write_early(c, early_bytes.data(), early_bytes.size(), &w) != GTLS_OK || w != early_bytes.size()) {
-      die("early data could not be written by a client resuming a ticket that allows it");
+    size_t w = 7;
+    /* Nothing to write takes nothing and sends nothing; more than any allowance is refused whole. */
+    if (gtls_conn_write_early(c, early_bytes.data(), 0, &w) != GTLS_OK || w != 0) {
+      die("an empty early write was not taken as nothing");
     }
-    early_sent = true;
+    if (c->wr_epoch != GTLS_EPOCH_INITIAL || c->wire.len != 0 || c->hello_flushed) {
+      die("an empty early write flushed the hello or installed a key");
+    }
+    static const Bytes too_much(100000, 0x5a);
+    w = 7;
+    if (gtls_conn_write_early(c, too_much.data(), too_much.size(), &w) != GTLS_ERR_LIMIT || w != 0) {
+      die("an early write past the allowance was not refused whole");
+    }
+    /* A session of another suite has the records sealed under it, which a server that accepts cannot
+     * open: it would fail before the client reads what it sent, so that client writes none. */
+    if (mode != 2 && !no_early) {
+      if (gtls_conn_write_early(c, early_bytes.data(), early_bytes.size(), &w) != GTLS_OK ||
+          w != early_bytes.size()) {
+        die("early data could not be written by a client resuming a ticket that allows it");
+      }
+      early_sent = true;
+    }
+    if (mode == 7 && gtls_conn_close(c) != GTLS_ERR_CLOSED) {
+      die("a close in the early window was not told to the caller");
+    }
   }
 
   struct Flip {
@@ -1192,6 +1292,7 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   size_t sent[2] = {0, 0};
   GTLS_Conn * ends[2] = {c, s};
   bool wrote = false;
+  bool dropped = false;
   Bytes expect_up(300, 0x55);
   Bytes got_up;
   for (int round = 0; round < 60; round++) {
@@ -1210,6 +1311,14 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
       }
       sent[dir] += n;
       (void)gtls_conn_stream_consume(from, n);
+      if (mode == 5 && dir == 0 && !dropped && gtls_conn_state(s) == GTLS_STATE_S_WAIT_EOED && wire.size() >= 5) {
+        /* The first record of what the client sends now is its EndOfEarlyData. */
+        const size_t first = 5 + ((static_cast<size_t>(wire[3]) << 8) | wire[4]);
+        if (first < wire.size()) {
+          wire.erase(wire.begin(), wire.begin() + static_cast<long>(first));
+          dropped = true;
+        }
+      }
       size_t at = 0;
       while (at < wire.size() && !gtls_conn_is_failed(to)) {
         size_t k = chunk == 0 ? wire.size() - at : (wire.size() - at < chunk ? wire.size() - at : chunk);
@@ -1240,8 +1349,49 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
     }
     if (!moved) break;
   }
-  /* With no mutation at all, the run must have gone through completely. */
-  if (flips.empty()) {
+  /* What a hostile peer, left alone, must bring about. */
+  const bool retried = (opt & 0x10u) != 0;
+  if (flips.empty() && mode == 1) {
+    if (!gtls_conn_is_failed(c) || gtls_conn_failure(c) != GTLS_ERR_PROTOCOL ||
+        gtls_conn_alert(c) != GTLS_ALERT_UNSUPPORTED_EXTENSION) {
+      die("early_data from a server that did not take the PSK was believed");
+    }
+  } else if (flips.empty() && mode == 4) {
+    if (!gtls_conn_is_failed(c) || gtls_conn_failure(c) != GTLS_ERR_PROTOCOL ||
+        gtls_conn_alert(c) != GTLS_ALERT_ILLEGAL_PARAMETER) {
+      die("an ALPN protocol that was never offered was believed");
+    }
+  } else if (flips.empty() && (mode == 2 || mode == 3) && tampered && !retried) {
+    if (!gtls_conn_is_failed(c) || gtls_conn_failure(c) != GTLS_ERR_PROTOCOL ||
+        gtls_conn_alert(c) != GTLS_ALERT_ILLEGAL_PARAMETER) {
+      die("an acceptance for another suite or protocol than the ticket's was believed");
+    }
+  } else if (flips.empty() && mode == 5 && !retried) {
+    if (!dropped || !gtls_conn_is_failed(s) || gtls_conn_failure(s) != GTLS_ERR_PROTOCOL ||
+        gtls_conn_alert(s) != GTLS_ALERT_UNEXPECTED_MESSAGE) {
+      die("a Finished with no EndOfEarlyData before it was not unexpected_message");
+    }
+  } else if (flips.empty() && mode == 6) {
+    unsigned char back[256];
+    size_t n = 0;
+    GTLS_EarlyStatus cs = GTLS_EARLY_NONE;
+    GTLS_EarlyStatus ss = GTLS_EARLY_NONE;
+    (void)gtls_conn_early_status(c, &cs);
+    (void)gtls_conn_early_status(s, &ss);
+    if (!gtls_conn_is_connected(c) || !gtls_conn_is_connected(s) || cs != GTLS_EARLY_REJECTED ||
+        ss != GTLS_EARLY_REJECTED || !got_early.empty() || replay.calls != 0 ||
+        gtls_conn_early_resend(c, back, sizeof back, &n) != GTLS_OK || n != early_bytes.size()) {
+      die("a server with early data off did not refuse it and hand it back");
+    }
+  } else if (flips.empty() && mode == 7) {
+    if (!gtls_conn_is_failed(c) || gtls_conn_failure(c) != GTLS_ERR_CLOSED || gtls_conn_alert(c) != GTLS_ALERT_NONE) {
+      die("a close in the early window did not end the connection");
+    }
+    const unsigned char * p = nullptr;
+    size_t n = 1;
+    if (gtls_conn_stream_output(c, &p, &n) != GTLS_OK || n != 0) die("a close in the early window left output");
+  } else if (flips.empty() && !(mode == 5 || ((mode == 2 || mode == 3) && tampered))) {
+    /* With no mutation at all, the run must have gone through completely. */
     if (!gtls_conn_is_connected(c) || !gtls_conn_is_connected(s)) die("an unmutated pump did not connect");
     if (got_up.size() != 12 * expect_up.size()) die("an unmutated pump lost data");
     if (resume && (!gtls_conn_resumed(c) || !gtls_conn_resumed(s))) die("an unmutated resume did not resume");
@@ -1290,6 +1440,7 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   gtls_session_free(session);
   gtls_context_free(cctx);
   gtls_context_free(sctx);
+  gtls_context_free(sctx2);
   gcert_key_free(key);
   gcert_trust_free(store);
   return 0;

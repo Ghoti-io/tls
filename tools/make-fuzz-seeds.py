@@ -484,7 +484,7 @@ def main():
             i += 1
         return out[:length]
 
-    def early_flight(suite=0x1302, allowance=100, ticket_kw=None, alpn=None, extra_ext=True):
+    def early_flight(suite=0x1302, allowance=100, ticket_kw=None, alpn=None, extra_ext=True, unknown_first=False):
         """(ClientHello record, the early key and IV, hash name) for a ticket sealed
         under server_one's key with this allowance."""
         h = hashlib.sha384 if suite == 0x1302 else hashlib.sha256
@@ -500,13 +500,19 @@ def main():
         if extra_ext:
             rec = with_ext(rec, 0x2a, b"")
         ids = struct.pack(">H", len(ticket)) + ticket + b"\x00\x00\x00\x00"
-        placeholder = struct.pack(">H", len(ids)) + ids + struct.pack(">H", 1 + hl) + bytes([hl]) + bytes(hl)
+        n_binders = 1
+        if unknown_first:
+            # A second identity behind one that is no ticket: the PSK selected is not the first offered.
+            ids = struct.pack(">H", 8) + bytes([0x7e]) * 8 + b"\x00\x00\x00\x00" + ids
+            n_binders = 2
+        placeholder = struct.pack(">H", len(ids)) + ids + struct.pack(">H", n_binders * (1 + hl)) + \
+            (bytes([hl]) + bytes(hl)) * n_binders
         rec = with_ext(rec, 0x29, placeholder)
         hs = rec[5:]
         early = _hmac.new(bytes(hl), psk, h).digest()
         binder_key = _expand_label(h, early, b"res binder", h(b"").digest(), hl)
         fin_key = _expand_label(h, binder_key, b"finished", b"", hl)
-        binder = _hmac.new(fin_key, h(hs[:-(2 + 1 + hl)]).digest(), h).digest()
+        binder = _hmac.new(fin_key, h(hs[:-(2 + n_binders * (1 + hl))]).digest(), h).digest()
         hs = hs[:-hl] + binder
         rec = rec[:5] + hs
         c_e = _expand_label(h, early, b"c e traffic", h(hs).digest(), hl)
@@ -562,6 +568,8 @@ def main():
     srv["early-ticket-without-an-allowance"] = even_input(0x00, lambda n: ch_none + seal_record(nk, niv, 0, 23, b"E" * n) + c_fin)
     ch_256, k256, iv256 = early_flight(suite=0x1301)
     srv["early-sha256-suite"] = even_input(0x00, lambda n: ch_256 + c_fin[:n % 2])
+    ch_two, tk, tiv = early_flight(unknown_first=True)
+    srv["early-psk-not-first-is-not-early"] = even_input(0x00, lambda n: ch_two + seal_record(tk, tiv, 0, 23, b"E" * n) + c_fin)
     ch_retry_e, rk, riv = early_flight()
     srv["early-then-retry"] = even_input(0x10, lambda n: ch_retry_e + seal_record(rk, riv, 0, 23, b"E" * n) + c_ch)
 
@@ -650,6 +658,34 @@ def main():
     rs["clean-early-accepted-threes"] = bytes([0x4f, 0])
     rs["clean-bytewise"] = bytes([0x2f])
     rs["clean-threes"] = bytes([0x4f])
+    # A hostile peer, picked by the last byte of an input whose size is 2 more than a
+    # multiple of 3 (a stray byte, then the mode; see pump_core): 1 early_data from a
+    # server that did not take the PSK, 2 a session of another suite of the same hash,
+    # 3 a session of another ALPN protocol, 4 an ALPN protocol never offered, 5 the
+    # client's EndOfEarlyData lost on the wire with the Finished kept, 6 a server with
+    # early data off, 7 a client that closes before the handshake is complete.
+    rs["hostile-early-data-psk-refused"] = bytes([0x0f, 0, 1])
+    rs["hostile-early-data-psk-refused-retry"] = bytes([0x1f, 0, 1])
+    rs["hostile-suite-same-hash-aes128"] = bytes([0x00, 0, 2])
+    rs["hostile-suite-same-hash-chacha"] = bytes([0x06, 0, 2])
+    rs["hostile-alpn-not-the-tickets"] = bytes([0x0f, 0, 3])
+    rs["hostile-alpn-never-offered"] = bytes([0x0f, 0, 4])
+    rs["hostile-end-of-early-data-lost"] = bytes([0x0f, 0, 5])
+    rs["hostile-end-of-early-data-lost-bytewise"] = bytes([0x2f, 0, 5])
+    rs["hostile-end-of-early-data-lost-in-chunks"] = bytes([0x4f, 0, 5])
+    rs["server-with-early-data-off"] = bytes([0x0f, 0, 6])
+    rs["server-with-early-data-off-retry"] = bytes([0x1f, 0, 6])
+    rs["client-closes-in-the-early-window"] = bytes([0x0f, 0, 7])
+    # Bit 3 of the mode: early data is offered and none is written; the server accepts. The
+    # client ends it with an EndOfEarlyData under keys it installed as it queued it.
+    rs["early-offered-none-written"] = bytes([0x0f, 0, 8])
+    rs["early-offered-none-written-bytewise"] = bytes([0x2f, 0, 8])
+    # Bit 4 of the mode: compatibility mode (the dummy change_cipher_spec after the hello
+    # and after the early records); bit 5: the server says yes.
+    rs["compat-early-accepted"] = bytes([0x0f, 0, 0x30])
+    rs["compat-early-accepted-bytewise"] = bytes([0x2f, 0, 0x30])
+    rs["compat-early-refused"] = bytes([0x0f, 0, 0x10])
+    rs["compat-none-written"] = bytes([0x0f, 0, 0x18])
     rs["flip-hello-random"] = bytes([0x0f]) + flip(0, 20, 1)
     rs["flip-hello-name"] = bytes([0x0f]) + flip(0, 80, 1)
     rs["flip-hello-ticket"] = bytes([0x0f]) + flip(0, 300, 1)

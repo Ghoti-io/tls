@@ -332,6 +332,15 @@ early-close-connected	src/client/stream.c	c->wr_epoch == GTLS_EPOCH_EARLY \&\& c
 early-close-discard	src/client/stream.c	    wipe_buf(\&c->wire);\n    c->wire.len = 0;\n	    (void)0;\n	testEarly	EarlyClose.*
 early-close-report	src/client/stream.c	    return gtls_conn_fail(c, GTLS_ERR_CLOSED, GTLS_ALERT_NONE);	    return GTLS_OK;	testEarly	EarlyClose.*
 ccs-once	src/client/stream.c	  if (c->ccs_sent) {\n    return GTLS_OK;\n  }\n  c->ccs_sent = 1;	  c->ccs_sent = 1;	testEarly	Early.*
+fuzz-early-client-suite-equal	src/client/client.c	c->suite != c->early_suite \|\|	0 \|\|	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-ee-alpn-offered	src/client/client.c	    if (!offered_alpn(c, ee.alpn, ee.alpn_len)) {	    if (0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-ee-unoffered	src/client/client.c	  if (ee.has_early_data \&\& c->early_status != GTLS_EARLY_PENDING) {	  if (0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-alpn-tickets	src/client/client.c	        c->alpn_selected_len != c->early_alpn_len \|\|\n        gsec_equal(c->alpn_selected, c->early_alpn, c->early_alpn_len) != GSEC_OK) {	        0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-diagnose-missing-end	src/client/stream.c	c->state == GTLS_STATE_S_WAIT_EOED \&\&\n        opens_under_handshake(c, header, body, blen)) {	c->state == GTLS_STATE_S_WAIT_EOED \&\& 0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-close-window	src/client/stream.c	  if (c->wr_epoch == GTLS_EPOCH_EARLY \&\& c->state != GTLS_STATE_CONNECTED) {	  if (0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-write-limit	src/client/stream.c	  if (len > c->early_max - c->early_used) {\n    return GTLS_ERR_LIMIT;\n  }\n  if (len == 0) {	  if (0) {\n    return GTLS_ERR_LIMIT;\n  }\n  if (len == 0) {	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-write-zero	src/client/stream.c	  if (len == 0) {\n    return GTLS_OK;\n  }\n  /* The ClientHello goes first, and the dummy record after it. */	  /* The ClientHello goes first, and the dummy record after it. */	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
+fuzz-early-pin	src/client/client.c	      result = gtls_stream_pin_early(c);	      result = GTLS_OK;	testFuzzseeds	FuzzSeeds.EverySeedRunsCleanThroughItsHarness
 PLANTS
 }
 
