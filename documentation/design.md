@@ -531,9 +531,12 @@ that struct too. A retried key share wipes the first. `gtls_conn_secret` refuses
 after failure. The comparison of `Finished` is `gsec_equal`; `check-ct` runs
 the code from the key to that call under Valgrind with the key marked
 undefined and requires it silent, and requires a planted branch to be reported.
-`tools/check-secret.py` rejects `memcmp`, `strcmp`, `printf` and the output calls
-(`puts`, `fputs`, `write`) under `src/`, `include/` and `examples/` (a file under
-`examples/` may waive a name once, with a reason).
+`tools/check-secret.py` rejects `memcmp` (and `__builtin_memcmp`), `bcmp`,
+`strcmp`, `strcasecmp`, `printf` and the output calls (`puts`, `fputs`, `write`)
+under `src/`, `include/` and `examples/`. A line under `examples/` may waive
+the names on it, with a reason, in a comment on that line or the line above;
+there is no file-wide waiver, and a waiver for `strcmp` does not cover
+`strcasecmp`.
 
 Ephemeral private keys are drawn by rejection sampling (zero and values at or
 above the curve order are refused, compared without a branch on the value).

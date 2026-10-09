@@ -89,14 +89,11 @@
 
 #define _POSIX_C_SOURCE 200809L
 
-/* check-secret: allow strcmp -- command-line words, never a secret */
-/* check-secret: allow memcmp -- a replay-table key (a hash of a ticket identity, public) and the echoed test text */
-/* check-secret: allow printf -- the example's report of what happened, never a key */
-
 #include <ghoti.io/tls/tls.h>
 
 #include <ghoti.io/security/random.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,6 +101,7 @@
 
 #ifdef _WIN32
 int main(void) {
+  /* check-secret: allow printf -- a fixed message, no value in it */
   fprintf(stderr, "echo: this example uses POSIX sockets\n");
   return 2;
 }
@@ -118,6 +116,39 @@ int main(void) {
 #define MAX_FILES 16
 #define MAX_IDS 4
 #define IO_TIMEOUT_MS 15000
+
+/* The only places this file compares text, or prints, outside the library's
+ * calls. Each is waived here, once, with its reason; every other site goes
+ * through one of these, so a compare of a secret added elsewhere in this file
+ * is a new hit rather than one more use of a file-wide waiver. */
+
+static int word_is(const char * a, const char * b) {
+  /* check-secret: allow strcmp -- command-line words and option names, never a secret */
+  return strcmp(a, b) == 0;
+}
+
+static int word_starts(const char * a, const char * prefix) {
+  /* check-secret: allow strcmp -- command-line words, never a secret */
+  return strncmp(a, prefix, strlen(prefix)) == 0;
+}
+
+static void say_err(const char * fmt, ...) {
+  va_list ap;
+
+  va_start(ap, fmt);
+  /* check-secret: allow printf -- the example's report of what happened, a fixed text or a library result string, never a key */
+  (void)vfprintf(stderr, fmt, ap);
+  va_end(ap);
+}
+
+static void say_out(const char * fmt, ...) {
+  va_list ap;
+
+  va_start(ap, fmt);
+  /* check-secret: allow printf -- the example's report of what was negotiated, never a key */
+  (void)vprintf(fmt, ap);
+  va_end(ap);
+}
 
 typedef struct Options {
   int server;
@@ -184,6 +215,7 @@ static int replay_decision(void * user, const unsigned char id[32], int64_t issu
     return 0;
   }
   for (i = 0; i < g_replay.count; i++) {
+    /* check-secret: allow memcmp -- a replay-table key (a hash of a ticket identity), public */
     if (memcmp(g_replay.ids[i], id, 32) == 0) {
       return 0;
     }
@@ -195,7 +227,7 @@ static int replay_decision(void * user, const unsigned char id[32], int64_t issu
 }
 
 static int fail(const char * what) {
-  fprintf(stderr, "failed\n%s\n", what);
+  say_err("failed\n%s\n", what);
   return 1;
 }
 
@@ -244,7 +276,7 @@ static int parse_list(const char * list, const char * const * names, const int *
   for (word = strtok_r(copy, ",", &save); word != NULL; word = strtok_r(NULL, ",", &save)) {
     size_t i;
 
-    for (i = 0; i < count && strcmp(names[i], word) != 0; i++) {
+    for (i = 0; i < count && !word_is(names[i], word); i++) {
     }
     if (i == count || *out_count >= max) {
       free(copy);
@@ -279,16 +311,16 @@ static int parse_options(int argc, char ** argv, Options * o) {
   if (argc < 2) {
     return -1;
   }
-  if (strcmp(argv[1], "server") == 0) {
+  if (word_is(argv[1], "server")) {
     o->server = 1;
-  } else if (strcmp(argv[1], "client") != 0) {
+  } else if (!word_is(argv[1], "client")) {
     return -1;
   }
   for (i = 2; i < argc; i++) {
     const char * a = argv[i];
     const char * v = i + 1 < argc ? argv[i + 1] : NULL;
 
-    if (strncmp(a, "--", 2) != 0) {
+    if (!word_starts(a, "--")) {
       if (o->server && positional == 0) {
         o->port = atoi(a);
       } else if (!o->server && positional == 0) {
@@ -301,31 +333,31 @@ static int parse_options(int argc, char ** argv, Options * o) {
       positional++;
       continue;
     }
-    if (strcmp(a, "--key-update") == 0) {
+    if (word_is(a, "--key-update")) {
       o->key_update = 1;
       continue;
     }
-    if (strcmp(a, "--compat") == 0) {
+    if (word_is(a, "--compat")) {
       o->compat = 1;
       continue;
     }
-    if (strcmp(a, "--no-echo") == 0) {
+    if (word_is(a, "--no-echo")) {
       o->no_echo = 1;
       continue;
     }
-    if (strcmp(a, "--rekey") == 0) {
+    if (word_is(a, "--rekey")) {
       o->rekey = 1;
       continue;
     }
-    if (strcmp(a, "--rename") == 0) {
+    if (word_is(a, "--rename")) {
       o->rename_key = 1;
       continue;
     }
-    if (strcmp(a, "--resume") == 0) {
+    if (word_is(a, "--resume")) {
       o->resume = 1;
       continue;
     }
-    if (strcmp(a, "--next-identity") == 0) {
+    if (word_is(a, "--next-identity")) {
       if (o->id_count >= MAX_IDS) {
         return -1;
       }
@@ -336,43 +368,43 @@ static int parse_options(int argc, char ** argv, Options * o) {
       return -1;
     }
     i++;
-    if (strcmp(a, "--chain") == 0 && o->id[o->id_count - 1].chain_count < MAX_FILES) {
+    if (word_is(a, "--chain") && o->id[o->id_count - 1].chain_count < MAX_FILES) {
       o->id[o->id_count - 1].chain[o->id[o->id_count - 1].chain_count++] = v;
-    } else if (strcmp(a, "--key") == 0) {
+    } else if (word_is(a, "--key")) {
       o->id[o->id_count - 1].key = v;
-    } else if (strcmp(a, "--name") == 0) {
+    } else if (word_is(a, "--name")) {
       o->id[o->id_count - 1].name = v;
-    } else if (strcmp(a, "--ca") == 0 && o->ca_count < MAX_FILES) {
+    } else if (word_is(a, "--ca") && o->ca_count < MAX_FILES) {
       o->ca[o->ca_count++] = v;
-    } else if (strcmp(a, "--server-name") == 0) {
+    } else if (word_is(a, "--server-name")) {
       o->server_name = v;
-    } else if (strcmp(a, "--alpn") == 0 && o->alpn_count < MAX_FILES) {
+    } else if (word_is(a, "--alpn") && o->alpn_count < MAX_FILES) {
       o->alpn[o->alpn_count++] = v;
-    } else if (strcmp(a, "--message") == 0) {
+    } else if (word_is(a, "--message")) {
       o->message = v;
-    } else if (strcmp(a, "--expect") == 0) {
+    } else if (word_is(a, "--expect")) {
       o->expect = v;
-    } else if (strcmp(a, "--time") == 0) {
+    } else if (word_is(a, "--time")) {
       o->now = (int64_t)atoll(v);
-    } else if (strcmp(a, "--tickets") == 0) {
+    } else if (word_is(a, "--tickets")) {
       o->tickets = (unsigned)atoi(v);
-    } else if (strcmp(a, "--ticket-lifetime") == 0) {
+    } else if (word_is(a, "--ticket-lifetime")) {
       o->ticket_lifetime = (unsigned)atoi(v);
-    } else if (strcmp(a, "--connections") == 0) {
+    } else if (word_is(a, "--connections")) {
       o->connections = (unsigned)atoi(v);
-    } else if (strcmp(a, "--gate") == 0) {
+    } else if (word_is(a, "--gate")) {
       o->gate = v;
-    } else if (strcmp(a, "--resumes") == 0) {
+    } else if (word_is(a, "--resumes")) {
       o->resumes = (unsigned)atoi(v);
-    } else if (strcmp(a, "--early") == 0) {
+    } else if (word_is(a, "--early")) {
       o->early = (uint32_t)atoi(v);
-    } else if (strcmp(a, "--early-text") == 0) {
+    } else if (word_is(a, "--early-text")) {
       o->early_text = v;
-    } else if (strcmp(a, "--replay") == 0) {
-      o->replay = strcmp(v, "accept") == 0 ? 0 : (strcmp(v, "reject") == 0 ? 1 : 2);
-    } else if (strcmp(a, "--advance") == 0) {
+    } else if (word_is(a, "--replay")) {
+      o->replay = word_is(v, "accept") ? 0 : (word_is(v, "reject") ? 1 : 2);
+    } else if (word_is(a, "--advance")) {
       o->advance = (int64_t)atoll(v);
-    } else if (strcmp(a, "--suites") == 0) {
+    } else if (word_is(a, "--suites")) {
       int tmp[3];
 
       if (parse_list(v, suite_names, suite_values, 3, tmp, &o->suite_count, 3) != 0) {
@@ -381,7 +413,7 @@ static int parse_options(int argc, char ** argv, Options * o) {
       for (size_t k = 0; k < o->suite_count; k++) {
         o->suites[k] = (GTLS_Suite)tmp[k];
       }
-    } else if (strcmp(a, "--groups") == 0) {
+    } else if (word_is(a, "--groups")) {
       int tmp[3];
 
       if (parse_list(v, group_names, group_values, 3, tmp, &o->group_count, 3) != 0) {
@@ -390,7 +422,7 @@ static int parse_options(int argc, char ** argv, Options * o) {
       for (size_t k = 0; k < o->group_count; k++) {
         o->groups[k] = (GTLS_Group)tmp[k];
       }
-    } else if (strcmp(a, "--sigalgs") == 0) {
+    } else if (word_is(a, "--sigalgs")) {
       int tmp[9];
 
       if (parse_list(v, sig_names, sig_values, 6, tmp, &o->sig_count, 9) != 0) {
@@ -503,7 +535,7 @@ static int flush_out(GTLS_Conn * conn, int fd) {
 }
 
 static void report_failure(const GTLS_Conn * conn) {
-  fprintf(stderr, "failed\n%s\nalert=%u peer_alert=%u\n",
+  say_err("failed\n%s\nalert=%u peer_alert=%u\n",
       gtls_result_string(gtls_conn_failure(conn)), gtls_conn_alert(conn),
       gtls_conn_peer_alert(conn));
 }
@@ -662,6 +694,7 @@ static const char * find_text(const char * data, size_t len, const char * text) 
   size_t i;
 
   for (i = 0; i + n <= len; i++) {
+    /* check-secret: allow memcmp -- the echoed test text against the text that was sent, public */
     if (memcmp(data + i, text, n) == 0) {
       return data + i;
     }
@@ -699,11 +732,11 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
 
   if (o->server ? gtls_conn_new_server(context, &conn) != GTLS_OK
                 : gtls_conn_new(context, o->server_name, strlen(o->server_name), &conn) != GTLS_OK) {
-    fprintf(stderr, "failed\ncould not make the connection\n");
+    say_err("failed\ncould not make the connection\n");
     return 1;
   }
   if (offer != NULL && gtls_conn_set_session(conn, offer, now) != GTLS_OK) {
-    fprintf(stderr, "failed\nthe session was refused\n");
+    say_err("failed\nthe session was refused\n");
     goto done;
   }
   if (gtls_conn_start(conn) != GTLS_OK) {
@@ -714,7 +747,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
 
     if (gtls_conn_write_early(conn, o->early_text, strlen(o->early_text), &w) != GTLS_OK ||
         w != strlen(o->early_text)) {
-      fprintf(stderr, "failed\nthe early data was refused locally\n");
+      say_err("failed\nthe early data was refused locally\n");
       goto done;
     }
   }
@@ -725,7 +758,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
     size_t off;
 
     if (flush_out(conn, fd) != 0 && !gtls_conn_is_failed(conn)) {
-      fprintf(stderr, "failed\nwrite error\n");
+      say_err("failed\nwrite error\n");
       goto done;
     }
     if (gtls_conn_is_failed(conn)) {
@@ -746,7 +779,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
         if (st == GTLS_EARLY_REJECTED && gtls_conn_early_resend(conn, back, sizeof back, &k) == GTLS_OK &&
             k != 0) {
           if (gtls_conn_write(conn, back, k, &w) != GTLS_OK || w != k) {
-            fprintf(stderr, "failed\nwrite refused\n");
+            say_err("failed\nwrite refused\n");
             goto done;
           }
           resent = k;
@@ -755,19 +788,19 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
 
       if (gtls_conn_write(conn, o->message, len, &w) != GTLS_OK || w != len ||
           gtls_conn_write(conn, "\n", 1, &w) != GTLS_OK) {
-        fprintf(stderr, "failed\nwrite refused\n");
+        say_err("failed\nwrite refused\n");
         goto done;
       }
       sent_message = 1;
       if (o->key_update && gtls_conn_key_update(conn, 1) != GTLS_OK) {
-        fprintf(stderr, "failed\nkey update refused\n");
+        say_err("failed\nkey update refused\n");
         goto done;
       }
       if (o->key_update) {
         /* data under the new key, to see the peer took it */
         if (gtls_conn_write(conn, o->message, len, &w) != GTLS_OK ||
             gtls_conn_write(conn, "\n", 1, &w) != GTLS_OK) {
-          fprintf(stderr, "failed\nwrite refused\n");
+          say_err("failed\nwrite refused\n");
           goto done;
         }
       }
@@ -777,7 +810,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
       size_t w = 0;
 
       if (gtls_conn_write(conn, echo, echo_len, &w) != GTLS_OK) {
-        fprintf(stderr, "failed\nwrite refused\n");
+        say_err("failed\nwrite refused\n");
         goto done;
       }
       memmove(echo, echo + w, echo_len - w);
@@ -802,7 +835,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
     p.events = POLLIN;
     p.revents = 0;
     if (poll(&p, 1, IO_TIMEOUT_MS) <= 0) {
-      fprintf(stderr, "failed\ntimed out\n");
+      say_err("failed\ntimed out\n");
       goto done;
     }
     n = recv(fd, buf, sizeof buf, 0);
@@ -812,7 +845,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
       if (r == GTLS_OK) {
         break;
       }
-      fprintf(stderr, "failed\n%s\n", gtls_result_string(r));
+      say_err("failed\n%s\n", gtls_result_string(r));
       goto done;
     }
     off = 0;
@@ -865,13 +898,13 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
 
     received[received_len] = 0;
     if (!o->no_echo && (received_len < want || find_text(received, received_len, o->expect) == NULL)) {
-      fprintf(stderr, "failed\nthe echo was not what was sent: got %zu bytes\n", received_len);
+      say_err("failed\nthe echo was not what was sent: got %zu bytes\n", received_len);
       goto done;
     }
   }
   if (keep != NULL && gtls_conn_session_count(conn) > 0 &&
       gtls_conn_session(conn, 0, keep) != GTLS_OK) {
-    fprintf(stderr, "failed\nthe session could not be kept\n");
+    say_err("failed\nthe session could not be kept\n");
     goto done;
   }
   {
@@ -883,15 +916,15 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
 
     (void)gtls_conn_alpn(conn, &alpn, &alpn_len);
     (void)gtls_conn_early_status(conn, &early_status);
-    printf("ok suite=%04x group=%04x alpn=%.*s retried=%d resumed=%d sessions=%zu offered=%d"
+    say_out("ok suite=%04x group=%04x alpn=%.*s retried=%d resumed=%d sessions=%zu offered=%d"
            " early=%d early_len=%zu replay=%u resent=%zu early_hex=",
         (unsigned)gtls_conn_suite(conn), (unsigned)gtls_conn_group(conn), (int)alpn_len,
         alpn != NULL ? (const char *)alpn : "", gtls_conn_retried(conn), gtls_conn_resumed(conn),
         gtls_conn_session_count(conn), offer != NULL, (int)early_status, early_len, g_replay.calls, resent);
     for (at = 0; at < early_len; at++) {
-      printf("%02x", early_got[at]);
+      say_out("%02x", early_got[at]);
     }
-    printf("\n");
+    say_out("\n");
     fflush(stdout);
   }
   status = 0;
@@ -911,7 +944,7 @@ int main(int argc, char ** argv) {
   unsigned n;
 
   if (parse_options(argc, argv, &o) != 0) {
-    fprintf(stderr, "usage: echo server [options] PORT | echo client [options] HOST PORT (see the file comment)\n");
+    say_err("usage: echo server [options] PORT | echo client [options] HOST PORT (see the file comment)\n");
     return 2;
   }
   if (load_material(&o, &m) != 0) {
@@ -926,7 +959,7 @@ int main(int argc, char ** argv) {
   if (o.server) {
     listener = listen_on(&o);
     if (listener < 0) {
-      fprintf(stderr, "failed\ncould not open the socket\n");
+      say_err("failed\ncould not open the socket\n");
       goto out;
     }
   }
@@ -941,7 +974,7 @@ int main(int argc, char ** argv) {
       gtls_context_free(context);
       context = NULL;
       if (build_context(&o, &m, &ticket_key, o.rekey, &context) != 0) {
-        fprintf(stderr, "failed\ncould not make the context\n");
+        say_err("failed\ncould not make the context\n");
         goto out;
       }
     }
@@ -957,7 +990,7 @@ int main(int argc, char ** argv) {
     }
     fd = o.server ? accept_on(listener) : connect_to(&o);
     if (fd < 0) {
-      fprintf(stderr, "failed\ncould not open the socket\n");
+      say_err("failed\ncould not open the socket\n");
       goto out;
     }
     result = run_connection(&o, context, fd, now, n > 0 ? session : NULL,
@@ -967,7 +1000,7 @@ int main(int argc, char ** argv) {
       goto out;
     }
     if (!o.server && o.resume && n == 0 && session == NULL) {
-      fprintf(stderr, "failed\nthe server sent no ticket\n");
+      say_err("failed\nthe server sent no ticket\n");
       goto out;
     }
   }

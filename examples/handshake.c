@@ -34,8 +34,6 @@
  *   usage: handshake [host]
  */
 
-/* check-secret: allow printf -- the example's report of what happened, never a key */
-
 #include <ghoti.io/tls/tls.h>
 
 #include <stdio.h>
@@ -70,6 +68,7 @@ int main(int argc, char ** argv) {
       GTLS_OK) {
     goto done;
   }
+  /* check-secret: allow printf -- the example's report of what it built or saw (a host name, a count, a result), never a key */
   printf("ClientHello for %s: %zu bytes, handshake message type %u\n", host,
       hello_len, hello[0]);
   (void)gtls_conn_consume_output(conn, GTLS_EPOCH_INITIAL, hello_len);
@@ -81,6 +80,7 @@ int main(int argc, char ** argv) {
     static const unsigned char junk[4] = {20, 0, 0, 0};
     GTLS_Result r = gtls_conn_feed(conn, GTLS_EPOCH_INITIAL, junk, sizeof junk, 0);
 
+    /* check-secret: allow printf -- the example's report of what it built or saw (a host name, a count, a result), never a key */
     printf("a Finished before ServerHello: %s, alert %u\n", gtls_result_string(r),
         gtls_conn_alert(conn));
   }
