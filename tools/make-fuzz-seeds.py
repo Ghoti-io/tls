@@ -253,6 +253,13 @@ def main():
         (10, "build-certificate", msgs[1][4:]),
         (11, "build-certificate-verify", msgs[2][4:]),
         (12, "build-server-hello", sh[4:]),
+        (1, "encrypted-extensions-early-data", bytes.fromhex("0004002a0000")),
+        (1, "encrypted-extensions-early-data-body", bytes.fromhex("0005002a000100")),
+        (1, "encrypted-extensions-early-data-and-alpn", struct.pack(">H", 15 + 4) + bytes.fromhex("0010000b0009") + b"\x08http/1.1" + bytes.fromhex("002a0000")),
+        (8, "end-of-early-data", b""),
+        (8, "end-of-early-data-body", b"\x00"),
+        (13 | 32, "build-encrypted-extensions-early-data", b"h2"),
+        (13 | 48, "build-encrypted-extensions-early-data-acked", b""),
     ]
     for opt, name, body in named:
         seeds["msg"][name] = bytes([opt]) + body
@@ -633,6 +640,14 @@ def main():
     rs["clean-aes256-p384"] = bytes([0x09])
     rs["clean-chacha-p256"] = bytes([0x06])
     rs["clean-retry"] = bytes([0x1f])
+    # The server's replay decision is the parity of the input's size: these have an even
+    # size (a stray byte past the flips) and early data is accepted; the clean ones above
+    # have an odd size and the server refuses it.
+    rs["clean-early-accepted"] = bytes([0x0f, 0])
+    rs["clean-early-accepted-aes128"] = bytes([0x00, 0])
+    rs["clean-early-accepted-chacha-p256"] = bytes([0x06, 0])
+    rs["clean-early-accepted-bytewise"] = bytes([0x2f, 0])
+    rs["clean-early-accepted-threes"] = bytes([0x4f, 0])
     rs["clean-bytewise"] = bytes([0x2f])
     rs["clean-threes"] = bytes([0x4f])
     rs["flip-hello-random"] = bytes([0x0f]) + flip(0, 20, 1)
@@ -647,6 +662,18 @@ def main():
     rs["flip-retry-second-hello"] = bytes([0x1f]) + flip(0, 700, 1)
     rs["flip-retry-second-binder"] = bytes([0x1f]) + flip(0, 1000, 1)
     rs["flip-two"] = bytes([0x0f]) + flip(0, 300, 1) + flip(1, 200, 2)
+    # The early data: the client resumes and sends 200 bytes behind its hello (about 510
+    # bytes), then EndOfEarlyData (26) and its Finished. A byte changed in the early
+    # record's header, body or tag, in EndOfEarlyData or in the Finished behind it.
+    rs["flip-early-header"] = bytes([0x0f]) + flip(0, 511, 1)
+    rs["flip-early-body"] = bytes([0x0f]) + flip(0, 600, 1)
+    rs["flip-early-tag"] = bytes([0x0f]) + flip(0, 728, 1)
+    rs["flip-end-of-early-data"] = bytes([0x0f]) + flip(0, 740, 1)
+    rs["flip-end-of-early-data-tag"] = bytes([0x0f]) + flip(0, 755, 1)
+    rs["flip-finished-after-the-end"] = bytes([0x0f]) + flip(0, 770, 1)
+    rs["flip-early-in-chunks"] = bytes([0x4f]) + flip(0, 600, 1)
+    rs["flip-early-after-retry"] = bytes([0x1f]) + flip(0, 560, 1)
+    rs["flip-server-end-answer"] = bytes([0x0f]) + flip(1, 100, 1)
     # The suite of the first record the server sends (a ServerHello that selects the
     # PSK, or the retry) made the one whose hash is not the PSK's: 0x1301 to 0x1302.
     rs["flip-server-hello-suite-hash"] = bytes([0x0f]) + flip(1, 45, 0x03)

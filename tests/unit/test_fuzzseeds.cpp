@@ -52,13 +52,13 @@ struct Harness {
 
 const Harness kHarnesses[] = {
     {"client", gtlsfuzz::client_one, 15},
-    {"msg", gtlsfuzz::msg_one, 17},
-    {"server", gtlsfuzz::server_one, 59},
+    {"msg", gtlsfuzz::msg_one, 24},
+    {"server", gtlsfuzz::server_one, 80},
     {"stream", gtlsfuzz::client_stream_one, 20},
     {"record", gtlsfuzz::record_one, 7},
     {"pump", gtlsfuzz::pump_one, 12},
-    {"resume", gtlsfuzz::resume_one, 21},
-    {"session", gtlsfuzz::session_one, 32},
+    {"resume", gtlsfuzz::resume_one, 30},
+    {"session", gtlsfuzz::session_one, 34},
 };
 
 }  // namespace

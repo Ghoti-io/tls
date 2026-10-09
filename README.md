@@ -7,15 +7,22 @@ in a Unix second when a certificate has to be checked. It has two interfaces
 over one connection type: **the record layer over a byte stream** (what TLS
 over TCP needs: HTTP/2, `wss`), and **handshake messages by epoch with the
 traffic secrets** (what QUIC needs). It is built on `certificate` (chains,
-names, signatures) and `security` (the primitives). Client authentication,
-TLS 1.2 and early data are later pieces; see [Status](#status). **Session
+names, signatures) and `security` (the primitives). Client authentication and
+TLS 1.2 are later pieces; see [Status](#status). **Session
 tickets and resumption are built, in both roles, and stateless**: a server seals
 the state of a session into the ticket under a key the caller supplies and
 keeps nothing, a client keeps each ticket as a `GTLS_Session` the caller can
 serialise and hand to a later connection, and a ticket that does not qualify is
 a full handshake, not an error ([`session.h`](include/ghoti.io/tls/session.h),
-[design](documentation/design.md#tickets-and-resumption)). A server that is
-offered early data does not accept it: it skips the early records.
+[design](documentation/design.md#tickets-and-resumption)). **Early data
+(0-RTT) is built in both roles and is off until a caller turns it on**: a server
+accepts it only when the context also supplies the replay decision (a callback
+given a stable name for the ticket; the library keeps no state, so the store is
+the caller's), delivers it through a read of its own so that replayable bytes are
+told from the rest, and a client sends it before the server's answer and gets it
+back to send again if the server refuses
+([design](documentation/design.md#early-data)). A server that does not accept an
+offer skips the early records.
 
 ## Example
 
@@ -177,9 +184,15 @@ both roles for every suite and group, a HelloRetryRequest and ALPN, with the
 cases that must fall back to a full handshake, and with two more fuzzers (a
 resuming pair with mutated bytes, and the session blob and ticket).
 
+**Built (2026-10-08, later):** early data in both roles, checked against RFC 8448's
+0-RTT trace byte for byte (the early secret, key, IV and the sealed records) and
+against OpenSSL in both roles, accepted and refused (a callback that says no, a
+replay, another ALPN protocol, a retry, a ticket that did not resume), with the
+pump fuzzer sending early data in both directions.
+
 **Not built, in the order the plan takes them** (`planning/tls.md`): the `http`
 adapter; mutual authentication and revocation in the handshake; TLS 1.2;
-early data (and its replay protection); QUIC hardening and DTLS.
+QUIC hardening and DTLS.
 Nothing here has run on macOS, and Windows only under wine
 (`suite/tools/xwin/tls.sh`; `TODO(windows)` in the Makefile). A server never asks for
 a client certificate, and a client that is asked (`CertificateRequest`) is

@@ -475,6 +475,9 @@ inline int msg_one(const uint8_t * data, size_t size) {
       if (gtls_msg_parse_key_update(body, len, &req) == GTLS_OK) {
         if (len != 1 || req > 1) die("a KeyUpdate that is not one");
       }
+      if ((gtls_msg_parse_end_of_early_data(body, len) == GTLS_OK) != (len == 0)) {
+        die("an EndOfEarlyData that has a body, or one that does not parse");
+      }
       break;
     }
     default: {
@@ -513,13 +516,15 @@ inline int msg_one(const uint8_t * data, size_t size) {
           GTLS_EeParams p;
           std::memset(&p, 0, sizeof p);
           p.ack_server_name = (opt & 16u) != 0;
+          p.early_data = (opt & 32u) != 0;
           p.alpn = n > 0 ? body : nullptr;
           p.alpn_len = n < 255 ? n : 255;
           r = gtls_msg_build_encrypted_extensions(&p, &b);
           if (r == GTLS_OK) {
             GTLS_EncryptedExtensions ee;
             if (gtls_msg_parse_encrypted_extensions(b.data + 4, b.len - 4, &lim, &ee) == GTLS_OK) {
-              if (ee.has_alpn != (p.alpn_len != 0) || ee.has_server_name != p.ack_server_name) {
+              if (ee.has_alpn != (p.alpn_len != 0) || ee.has_server_name != p.ack_server_name ||
+                  ee.has_early_data != p.early_data) {
                 die("built EncryptedExtensions do not parse back to themselves");
               }
             }
@@ -1095,8 +1100,10 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
   scfg.ticket_keys = &ticket_key;      /* every pump server issues tickets; resume mode uses one */
   scfg.ticket_key_count = 1;
   /* Early data on both sides: the tickets carry an allowance, and a resuming
-   * client sends some. The server's replay decision is always yes. */
+   * client sends some. The server's replay decision is the input's size: even
+   * says yes, odd says no. */
   FuzzReplay replay;
+  replay.verdict = (size & 1u) == 0 ? 1 : 0;
   scfg.max_early_data = 512;
   scfg.anti_replay = FuzzReplay::fn;
   scfg.anti_replay_user = &replay;
@@ -1244,13 +1251,16 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
       GTLS_EarlyStatus ss = GTLS_EARLY_NONE;
       (void)gtls_conn_early_status(c, &cs);
       (void)gtls_conn_early_status(s, &ss);
-      if ((opt & 0x10u) != 0) {
+      const bool retried_hello = (opt & 0x10u) != 0;
+      if (retried_hello || replay.verdict != 1) {
+        /* Refused (after a HelloRetryRequest, or by the server's decision): handed back, none delivered,
+         * and the decision asked once, or not at all after a retry. */
         unsigned char back[256];
         size_t n = 0;
         if (cs != GTLS_EARLY_REJECTED || ss != GTLS_EARLY_REJECTED || !got_early.empty() ||
             gtls_conn_early_resend(c, back, sizeof back, &n) != GTLS_OK || n != early_bytes.size() ||
-            std::memcmp(back, early_bytes.data(), n) != 0) {
-          die("early data after a HelloRetryRequest was not refused and handed back");
+            std::memcmp(back, early_bytes.data(), n) != 0 || replay.calls != (retried_hello ? 0 : 1)) {
+          die("early data that was refused was not handed back and left undelivered");
         }
       } else if (cs != GTLS_EARLY_ACCEPTED || ss != GTLS_EARLY_ACCEPTED || got_early != early_bytes ||
                  replay.calls != 1) {

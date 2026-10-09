@@ -236,6 +236,71 @@ session-name-fold-a-low	src/session/session.c	if (x >= 'A' \&\& x <= 'Z') {	if (
 session-name-fold-a-high	src/session/session.c	if (x >= 'A' \&\& x <= 'Z') {	if (x >= 'A' \&\& x <= '[') {	testResume
 session-name-fold-b-low	src/session/session.c	if (y >= 'A' \&\& y <= 'Z') {	if (y >= '@' \&\& y <= 'Z') {	testResume
 session-name-fold-b-high	src/session/session.c	if (y >= 'A' \&\& y <= 'Z') {	if (y >= 'A' \&\& y <= '[') {	testResume
+early-label	src/schedule/schedule.c	"c e traffic"	"c e traffiq"	testEarly	EarlyKat.*
+early-traffic-stage	src/schedule/schedule.c	if (s == NULL \|\| s->stage != 1 \|\| th_client_hello == NULL) {	if (s == NULL \|\| th_client_hello == NULL) {	testEarly	EarlyKat.*
+early-msg-builder-psk	src/msg/msg.c	(p->early_data \&\& p->psk == NULL) \|\|	0 \|\|	testEarly	EarlyKat.*
+early-msg-hello-ext	src/msg/msg.c	  if (p->early_data) {\n    ext_begin(out, GTLS_EXT_EARLY_DATA, \&at);\n    gtls_buf_end(out, at, 2);\n  }\n  finish_hello(out, ext_at, p->psk);	  finish_hello(out, ext_at, p->psk);	testEarly	EarlyKat.*
+early-msg-retry-drop	src/msg/msg.c	    if (e->type == GTLS_EXT_EARLY_DATA) {\n      continue; /* the second hello offers none (section 4.2.10) */\n    }\n		testEarly	EarlyKat.*
+early-msg-ee-empty	src/msg/msg.c	    if (e->len != 0) {\n      return GTLS_ERR_CORRUPT;\n    }\n    ee.has_early_data = 1;	    ee.has_early_data = 1;	testEarly	EarlyKat.*
+early-msg-ee-build	src/msg/msg.c	  if (p->early_data) {\n    ext_begin(out, GTLS_EXT_EARLY_DATA, \&at);\n    gtls_buf_end(out, at, 2);\n  }\n  gtls_buf_end(out, ext_at, 2);\n  return finish_message(out, start);\n}\n\nGTLS_Result gtls_msg_build_certificate(	  gtls_buf_end(out, ext_at, 2);\n  return finish_message(out, start);\n}\n\nGTLS_Result gtls_msg_build_certificate(	testEarly	EarlyKat.*
+early-msg-eoed-body	src/msg/msg.c	  (void)body;\n  return len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;	  (void)body;\n  (void)len;\n  return GTLS_OK;	testEarly	EarlyKat.*
+ticket-v2-written	src/session/ticket.c	  plain[n++] = (unsigned char)(p->max_early_data != 0 ? GTLS_TICKET_STATE_VERSION_EARLY\n                                                     : GTLS_TICKET_STATE_VERSION);	  plain[n++] = (unsigned char)GTLS_TICKET_STATE_VERSION;	testTicket	Ticket.*
+ticket-v2-allowance-read	src/session/ticket.c	    t.max_early_data = get32(plain + at);\n    at += 4;	    at += 4;	testTicket	Ticket.*
+ticket-v2-room	src/session/ticket.c	    if (n - at < 4u + 1u) {\n      goto done;\n    }\n		testTicket	Ticket.AVersionTwoStateWithOnlyAFewBytes*	valgrind
+context-early-pair	src/client/context.c	(config->max_early_data != 0) != (config->anti_replay != NULL))) {	0)) {	testEarly	EarlyContext.*
+context-early-limit	src/client/context.c	if (config->max_early_data > c->limits.max_early_data_bytes \|\|	if (config->max_early_data > c->limits.max_early_data_bytes + 1u \|\|	testEarly	EarlyContext.*
+context-client-replay	src/client/context.c	if (config->role == GTLS_ROLE_CLIENT \&\& config->anti_replay != NULL) {	if (0) {	testEarly	EarlyContext.*
+early-accept-offered	src/server/server.c	  if (!o->early_data \|\| !r->active \|\| c->retried \|\| x->max_early_data == 0 \|\|	  if (!r->active \|\| c->retried \|\| x->max_early_data == 0 \|\|	testEarly	EarlyRejected.*
+early-accept-allowance	src/server/server.c	      x->anti_replay == NULL \|\| r->plain.max_early_data == 0 \|\|	      x->anti_replay == NULL \|\|	testEarly	EarlyRejected.*
+early-accept-alpn-len	src/server/server.c	      r->plain.alpn_len != c->alpn_selected_len \|\|\n      gsec_equal(	      gsec_equal(	testEarly	EarlyRejected.*
+early-accept-alpn-bytes	src/server/server.c	      gsec_equal(r->plain.alpn, c->alpn_selected, c->alpn_selected_len) != GSEC_OK) {	      0) {	testEarly	EarlyRejected.*
+early-accept-verdict	src/server/server.c	  return verdict == 1;	  return verdict != 0;	testEarly	EarlyRejected.*
+early-accept-id	src/server/server.c	  if (gsec_sha256(en->identity, en->identity_len, id) != GSEC_OK) {	  if (gsec_sha256(en->identity, en->identity_len - 1u, id) != GSEC_OK) {	testEarly	Early.*
+early-accept-age	src/server/server.c	      en->age - r->plain.age_add);	      en->age);	testEarly	Early.*
+early-accept-issued	src/server/server.c	  verdict = x->anti_replay(x->anti_replay_user, id, r->plain.issued,	  verdict = x->anti_replay(x->anti_replay_user, id, 0,	testEarly	Early.*
+early-accept-cap	src/server/server.c	    uint32_t cap = r->plain.max_early_data < c->context->max_early_data\n        ? r->plain.max_early_data : c->context->max_early_data;	    uint32_t cap = r->plain.max_early_data;	testEarly	EarlyLimits.*
+early-accept-skip-off	src/server/server.c	    c->early_skip = 0; /* the records that follow are opened, not skipped */	    (void)0;	testEarly	EarlyEnd.*
+early-server-status	src/server/server.c	    c->early_status = o.early_data ? GTLS_EARLY_REJECTED : GTLS_EARLY_NONE;	    c->early_status = GTLS_EARLY_NONE;	testEarly	EarlyRejected.*
+early-server-reserve	src/server/server.c	    result = gtls_buf_reserve(\&c->early_in, cap); /* once, so nothing is left behind by a growth */\n    if (result != GTLS_OK) {\n      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n    }\n		testWipe	WipeEarly.*
+early-server-ee	src/server/server.c	  ee.early_data = early;	  ee.early_data = 0;	testEarly	Early.*
+early-server-secret	src/server/server.c	  if (result == GTLS_OK \&\& early) {\n    result = gtls_schedule_early_traffic(\&c->sec.schedule, k->th_ch);\n  }\n		testEarly	Early.*
+early-server-transcript	src/server/server.c	    result = gtls_transcript_snapshot(\&c->sec.transcript, hash, k->th_ch);	    result = GTLS_OK;	testEarly	Early.*
+early-server-state	src/server/server.c	  c->state = early ? GTLS_STATE_S_WAIT_EOED : GTLS_STATE_S_WAIT_FIN;	  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;	testEarly	EarlyEnd.*
+early-eoed-state	src/server/server.c	  c->state = GTLS_STATE_S_WAIT_FIN;\n  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	testEarly	EarlyEnd.*
+early-eoed-transcript	src/server/server.c	  result = gtls_transcript_update(\&c->sec.transcript, msg, msg_len);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  c->state = GTLS_STATE_S_WAIT_FIN;	  result = GTLS_OK;\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  c->state = GTLS_STATE_S_WAIT_FIN;	testEarly	Early.*
+early-eoed-parse	src/server/server.c	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  (void)result;	testEarly	EarlyEnd.*
+early-eoed-type	src/server/server.c	    case GTLS_STATE_S_WAIT_EOED:\n      if (type != GTLS_HS_END_OF_EARLY_DATA) {\n        return gtls_conn_unexpected(c);\n      }\n	    case GTLS_STATE_S_WAIT_EOED:\n	testEarly	EarlyEnd.*
+early-ccs-eoed	src/client/stream.c	c->state == GTLS_STATE_S_WAIT_FIN \|\|\n        c->state == GTLS_STATE_S_WAIT_EOED;	c->state == GTLS_STATE_S_WAIT_FIN;	testEarly	Early.*
+early-ccs-after-hello	src/client/stream.c	  if (c->role == GTLS_ROLE_CLIENT \&\& c->early_status != GTLS_EARLY_NONE \&\&\n      c->context->middlebox_compat \&\& c->hello_flushed) {	  if (0) {	testEarly	Early.*
+early-cost	src/client/stream.c	  size_t cost = n != 0 ? n : 1u;	  size_t cost = n;	testEarly	EarlyLimits.*
+early-allowance-edge	src/client/stream.c	  if (cost > c->early_max - c->early_used) {	  if (cost >= c->early_max - c->early_used) {	testEarly	EarlyLimits.*
+early-partial-message	src/client/stream.c	  if (c->in.len != 0) {\n    return gtls_conn_unexpected(c);\n  }\n  if (cost > c->early_max - c->early_used) {	  if (cost > c->early_max - c->early_used) {	testEarly	EarlyEnd.*
+early-diagnose-missing-end	src/client/stream.c	c->state == GTLS_STATE_S_WAIT_EOED \&\&\n        opens_under_handshake(c, header, body, blen)) {	c->state == GTLS_STATE_S_WAIT_EOED \&\& 0) {	testEarly	EarlyEnd.*
+early-secret-direction	src/client/client.c	    if (!c->sec.schedule.has_e \|\| (direction == GTLS_DIR_WRITE) != (c->role == GTLS_ROLE_CLIENT)) {	    if (!c->sec.schedule.has_e) {	testEarly	EarlyEnd.*
+early-secret-exists	src/client/client.c	    if (!c->sec.schedule.has_e \|\| (direction == GTLS_DIR_WRITE) != (c->role == GTLS_ROLE_CLIENT)) {	    if ((direction == GTLS_DIR_WRITE) != (c->role == GTLS_ROLE_CLIENT)) {	testEarly	EarlyEnd.*
+early-offer-context	src/client/client.c	  p_early = c->offer != NULL \&\& c->offer->max_early_data != 0 \&\&\n      c->context->max_early_data != 0;	  p_early = c->offer != NULL \&\& c->offer->max_early_data != 0;	testEarly	EarlyRejected.*
+early-offer-allowance	src/client/client.c	  p_early = c->offer != NULL \&\& c->offer->max_early_data != 0 \&\&\n      c->context->max_early_data != 0;	  p_early = c->offer != NULL \&\& c->context->max_early_data != 0;	testEarly	EarlyContext.*:EarlyRejected.*
+early-client-cap	src/client/client.c	  c->early_max = o->max_early_data < c->context->max_early_data\n      ? o->max_early_data : c->context->max_early_data;	  c->early_max = o->max_early_data;	testEarly	EarlyClient.*
+early-client-reserve	src/client/client.c	  result = gtls_buf_reserve(\&c->early_sent, c->early_max);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n		testWipe	WipeEarly.*
+early-client-th	src/client/client.c	  result = gtls_transcript_snapshot(\&c->sec.transcript, hash, th);\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	  memset(th, 0, sizeof th);\n  result = GTLS_OK;\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	testEarly	Early.*
+early-client-hrr	src/client/client.c	  if (c->early_status == GTLS_EARLY_PENDING) {\n    /* The second ClientHello offers none	  if (0) {\n    /* The second ClientHello offers none	testEarly	EarlyClient.*
+early-client-no-psk	src/client/client.c	  } else if (c->early_status == GTLS_EARLY_PENDING) {\n    reject_early(c);	  } else if (0) {\n    reject_early(c);	testEarly	EarlyClient.*
+early-client-unoffered	src/client/client.c	  if (ee.has_early_data \&\& c->early_status != GTLS_EARLY_PENDING) {	  if (0) {	testEarly	EarlyClientChecks.*
+early-client-accepts-only-if-told	src/client/client.c	    if (!ee.has_early_data) {\n      reject_early(c);	    if (0) {\n      reject_early(c);	testEarly	EarlyRejected.*
+early-client-alpn	src/client/client.c	        c->alpn_selected_len != c->early_alpn_len \|\|\n        gsec_equal(c->alpn_selected, c->early_alpn, c->early_alpn_len) != GSEC_OK) {	        0) {	testEarly	EarlyClientChecks.*
+early-client-eoed-queue	src/client/client.c	      result = gtls_conn_queue(c, GTLS_EPOCH_EARLY, eoed.data, eoed.len);	      result = GTLS_OK;	testEarly	Early.*
+early-client-eoed-transcript	src/client/client.c	      result = gtls_transcript_update(\&c->sec.transcript, eoed.data, eoed.len);	      result = GTLS_OK;	testEarly	Early.*
+early-client-resnapshot	src/client/client.c	    if (result == GTLS_OK) {\n      result = gtls_transcript_snapshot(\&c->sec.transcript, hash, th);\n    }\n  }\n  /* The client's Finished is over the transcript through the server's. */	  }\n  /* The client's Finished is over the transcript through the server's. */	testEarly	Early.*
+early-client-suite	src/client/stream.c	      ? (uint32_t)c->early_suite : (uint32_t)c->suite;	      ? (uint32_t)c->suite : (uint32_t)c->suite;	testEarly	Early.*
+early-issue-allowance	src/server/server.c	      p.max_early_data = x->max_early_data;	      p.max_early_data = 0;	testEarly	Early.*
+early-issue-extension	src/server/server.c	      t.early_data = p.max_early_data != 0;	      t.early_data = 0;	testEarly	Early.*
+early-fail-wipe-server	src/client/client.c	    if (c->early_in.data != NULL) {\n      (void)gsec_wipe(c->early_in.data, c->early_in.cap);\n    }\n		testWipe	WipeEarly.*
+early-fail-wipe-client	src/client/client.c	    if (c->early_sent.data != NULL) {\n      (void)gsec_wipe(c->early_sent.data, c->early_sent.cap);\n    }\n		testEarly	EarlyEnd.*
+early-free-wipe	src/client/stream.c	  wipe_buf(\&c->early_in);\n  wipe_buf(\&c->early_sent);\n		testWipe	WipeEarly.*
+early-read-role	src/client/stream.c	  if (c->role != GTLS_ROLE_SERVER \|\| stream_ready(c) != GTLS_OK) {	  if (stream_ready(c) != GTLS_OK) {	testEarly	EarlyClient.*
+early-resend-status	src/client/stream.c	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_REJECTED) {	  if (c->role != GTLS_ROLE_CLIENT) {	testEarly	EarlyClient.*
+early-write-limit	src/client/stream.c	  if (len > c->early_max - c->early_used) {	  if (len > c->early_max - c->early_used + 1u) {	testEarly	EarlyClient.*
+early-write-state	src/client/stream.c	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_PENDING \|\|\n      c->state != GTLS_STATE_WAIT_SH) {	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_PENDING) {	testEarly	EarlyClient.*
 PLANTS
 }
 

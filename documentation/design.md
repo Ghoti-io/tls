@@ -32,7 +32,7 @@ accepts.
 
 | Document | What | Deviation |
 | --- | --- | --- |
-| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | resumption with `psk_dhe_ke` from a ticket this server sealed (stateless, no server-side cache), no `psk_ke` alone, no external PSK; early data offered to a server is not accepted (its records are skipped) and none is sent; no client certificate and no CertificateRequest, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
+| RFC 8446 | TLS 1.3, both roles, server authentication, (EC)DHE key exchange, the record layer (section 5), KeyUpdate (4.6.3), alerts (6) | resumption with `psk_dhe_ke` from a ticket this server sealed (stateless, no server-side cache), no `psk_ke` alone, no external PSK; early data (0-RTT, section 2.3 and 4.2.10) in both roles, off unless the context sets an allowance and, for a server, the replay decision, and an offer a server does not accept is skipped; no client certificate and no CertificateRequest, no post-handshake authentication, no record padding sent (accepted and capped), no cookie in a HelloRetryRequest |
 | RFC 6066 | `server_name`; an IP literal is never sent; a server chooses its identity by it and acknowledges it | no other extension of that RFC |
 | RFC 7301 | ALPN, offered and read back; a server picks the first of its list that the client offered | no overlap with both lists present is fatal (`no_application_protocol`), as the RFC says |
 | RFC 7685 | padding a ClientHello of 256 to 511 bytes to 512 | |
@@ -67,13 +67,16 @@ NEW -> WAIT_SH -> WAIT_EE -> WAIT_CERT -> WAIT_CV -> WAIT_FIN -> CONNECTED
                                                        any state --> FAILED
 server:
 NEW -> S_WAIT_CH -> S_WAIT_FIN -> CONNECTED
-           |             ^
+           |         ^     ^
+           |         |     +---EndOfEarlyData---- S_WAIT_EOED (early data accepted)
            +--HelloRetryRequest--> S_WAIT_CH2 --second ClientHello
 ```
 
 The server builds its whole flight (ServerHello, EncryptedExtensions,
 Certificate, CertificateVerify, Finished) in answer to one ClientHello, so it
-has only three waiting states.
+has only three waiting states, and a fourth when it has accepted early data:
+after its flight it waits in `S_WAIT_EOED`, at the early epoch, for the early
+records and `EndOfEarlyData`, and only then for the client's Finished.
 
 Each waiting state accepts exactly one message type; anything else is
 `GTLS_ERR_PROTOCOL` with `unexpected_message`, except a `CertificateRequest`
@@ -132,15 +135,15 @@ offers 1.3 (`protocol_version`); a cookie it never issued; a
 missing `supported_groups`, `signature_algorithms` or `key_share`
 (`missing_extension`); nothing in common (`handshake_failure`).
 
-**A `pre_shared_key` offer is judged, and `early_data` is not accepted** (RFC
-8446 sections 4.2.9 to 4.2.11). A `pre_shared_key` must be the last extension
+**A `pre_shared_key` offer is judged, and `early_data` is accepted only on
+the conditions of [Early data](#early-data)** (RFC 8446 sections 4.2.9 to 4.2.11). A `pre_shared_key` must be the last extension
 (`illegal_parameter`), `psk_key_exchange_modes` must be there
 (`missing_extension`), the identities and the binders must parse, be as many
 as each other (`illegal_parameter`), and fit `GTLS_Limits::max_tickets` and
 `max_ticket_bytes` (`GTLS_ERR_LIMIT`, `decode_error`). What follows is
 [Tickets](#tickets-and-resumption). `early_data` must have an empty body
-(`decode_error`) and is rejected by not
-echoing it in EncryptedExtensions. The client then sends records protected by
+(`decode_error`) and is rejected, unless every condition of that section holds,
+by not echoing it in EncryptedExtensions. The client then sends records protected by
 a key this server never had, and section 4.2.10 has the server skip them, so
 the skip window opens only when `early_data` comes with a `pre_shared_key`
 (early data is encrypted under a key derived from a PSK; without one the
@@ -162,7 +165,8 @@ open** (RFC 8446 section 4.2.10): a Finished record that fails to open looks
 exactly like an early record, so it is discarded and the handshake stalls
 instead of failing at once. It stays discarded until the cap is reached
 (`GTLS_ERR_LIMIT`) or a record that opens arrives. The cap is what bounds it.
-Accepting early data, which has a replay problem of its own, is the next step.
+A server that accepted early data has no such window: a record that does not
+open is a `bad_record_mac`.
 
 The server writes application data only once the client's Finished has
 verified, and reads and writes under the application keys from the moment its
@@ -274,6 +278,88 @@ block, wiped on failure and on free; a session is wiped when freed; a failed
 connection frees its sessions and the offer; the ticket's plaintext, the PSK
 on the server's stack and the binder keys are wiped on every path.
 
+## Early data
+
+RFC 8446 sections 2.3, 4.2.10 and 8; `record.h` and `context.h` are the
+interface. Early data is application data sent with the first flight of a
+resumed connection, under a key from the PSK alone, so anyone who recorded the
+connection can send it again. **The library keeps nothing across connections,
+so it cannot know whether a ticket was shown before: the caller decides.**
+
+**Turning it on.** Off by default, in both roles. A server sets
+`GTLS_ContextConfig::max_early_data` (the allowance its tickets carry, at most
+`GTLS_Limits::max_early_data_bytes`) and `anti_replay`, a callback; either alone
+is `GTLS_ERR_LIMIT` when the context is made. A client sets `max_early_data` (the
+most it will send) and offers early data when a session it resumes permits it;
+a client context refuses the callback. A ticket carries the allowance inside the
+sealed state: version 2 of the state, with four bytes after the lifetime; a ticket
+whose allowance is 0 is sealed as version 1, as it always was, and both open.
+Tickets a server sends carry `early_data` with `max_early_data_size`.
+
+**The server accepts** only when all of these hold, and otherwise rejects (the
+handshake goes on, the early records are skipped up to `max_early_skip_bytes`,
+as before): the ClientHello offered `early_data`; the PSK was accepted and its
+binder verified; the context allows it; no HelloRetryRequest was sent (an
+`early_data` in a second hello is `illegal_parameter`, and the client drops it
+from its own); the ticket carries an allowance; its suite is the one selected;
+**the ALPN protocol selected is the ticket's** (both none counts; a ticket with
+no protocol and a server that now selects one does not), section 4.2.10; the age
+is inside the window (settled while the ticket was opened); **and the callback
+says 1**. The callback is last, so it is asked only about a ticket nothing else
+rules out, once, and only after the binder has proved the client holds the PSK
+(an attacker who has seen a ticket's bytes cannot make the server record it).
+It gets `SHA-256(identity)`, a stable 32-byte name for the ticket to key its
+store by, the second the ticket was sealed and the age the client reports in
+milliseconds. Anything but 1 is a rejection. The store is the caller's: this
+library's `examples/echo` keeps an in-memory list for the interop cases.
+
+**The keys.** `client_early_traffic_secret` is derived from the early secret and
+the transcript hash through the whole ClientHello, binders included (it is the
+only secret taken before the ServerHello); it is the client's, so only a
+client's write and a server's read have it, and `gtls_conn_secret` with
+`GTLS_EPOCH_EARLY` returns it (it exists from the ClientHello being built, or
+accepted, until a rejection wipes it). The early records are protected with the
+ticket's suite, with the same nonce rule as every other record. The client's
+`EndOfEarlyData` is sealed under the early key too, queued at the early epoch
+(a message-interface caller carries it there), before the Finished, and it is
+part of what the Finished covers; the application secrets are over the
+transcript through the server's Finished without it.
+
+**What the server does with the records.** In `S_WAIT_EOED` it opens records under
+the early key. Application data goes to a buffer of its own, read with
+`gtls_conn_read_early`; **`gtls_conn_read` never returns it**, so a caller can
+treat replayable bytes differently. The bytes are counted against the ticket's
+allowance (or the context's, if that is smaller), an empty record counts one, and
+one more than the allowance is `GTLS_ERR_LIMIT` with `unexpected_message`.
+`EndOfEarlyData` moves the server to the handshake keys; nothing opens under the
+early key after it (`bad_record_mac`), a Finished with no `EndOfEarlyData` before it
+is `unexpected_message` (the server tries the handshake key on a record that
+does not open, to tell this from damage), an `EndOfEarlyData` with a body is
+`decode_error` and one sent to a server that did not accept is
+`unexpected_message`. At the message interface the same are enforced by epoch.
+QUIC forbids `EndOfEarlyData` (RFC 9001 section 8.3); using early data under QUIC
+is not what this is.
+
+**The client.** After `gtls_conn_start` and before the server's first message is
+fed, `gtls_conn_write_early` seals records under the early key behind the
+ClientHello (and behind the dummy `change_cipher_spec` in compatibility mode,
+where appendix D.4 puts it). Past the allowance it takes nothing and returns
+`GTLS_ERR_LIMIT`, without failing the connection. The client learns the outcome
+from the server: a HelloRetryRequest, a ServerHello without the PSK, or an
+EncryptedExtensions without `early_data` is a rejection, reported by
+`gtls_conn_early_status` (which returns `GTLS_ERR_EARLY_REJECTED`) the moment it
+is known, and the early key is wiped; `gtls_conn_early_resend` then hands back the
+bytes sent, which the library kept for that, for the caller to send as ordinary
+data. An `early_data` that comes back where none was offered, after a retry, after
+a ServerHello that took no PSK, with another suite or with another ALPN
+protocol than the ticket's is the server's fault (`unsupported_extension` or
+`illegal_parameter`). An acceptance makes the client send `EndOfEarlyData`.
+
+**Wiping.** The early secret is in the connection's secret block. The buffers of
+early bytes, which are plaintext, are given all their room at once so that no
+growth leaves a copy in a block that was freed, and are wiped when the connection
+fails and when it is freed.
+
 ## The record layer
 
 One record is a five-byte header (type, a legacy version, length) and a body.
@@ -361,6 +447,12 @@ header as additional data, and the outer type says application data
 | (client) a ServerHello that selects a PSK never offered, an index out of range, or a suite of another hash | `GTLS_ERR_PROTOCOL` | `illegal_parameter` |
 | (server) more identities, or a longer one, than the limits | `GTLS_ERR_LIMIT` | `decode_error` |
 | (server) more early-data bytes skipped than the limit | `GTLS_ERR_LIMIT` | `unexpected_message` |
+| (server) more early data accepted than the allowance, an empty record counting one | `GTLS_ERR_LIMIT` | `unexpected_message` |
+| (server) a record that does not open while early data is accepted | `GTLS_ERR_MISMATCH` | `bad_record_mac` |
+| (server) the Finished (or anything under the handshake key) where `EndOfEarlyData` is due; any other message type there; application data in the middle of a handshake message; `EndOfEarlyData` when early data was not accepted | `GTLS_ERR_PROTOCOL` | `unexpected_message` |
+| (server) an `EndOfEarlyData` with a body | `GTLS_ERR_CORRUPT` | `decode_error` |
+| (client) `early_data` where none is offered, after a retry, or after a ServerHello that took no PSK | `GTLS_ERR_PROTOCOL` | `unsupported_extension` |
+| (client) `early_data` accepted with another suite or ALPN protocol than the ticket's | `GTLS_ERR_PROTOCOL` | `illegal_parameter` |
 | (server) required extension missing | `GTLS_ERR_PROTOCOL` | `missing_extension` |
 | (server) no suite, group or signature scheme in common | `GTLS_ERR_NO_COMMON` | `handshake_failure` |
 | (server) both ALPN lists and no overlap | `GTLS_ERR_ALPN` | `no_application_protocol` |
@@ -441,6 +533,17 @@ its application data and its `close_notify` at the sequence numbers the trace
 used) are the trace's byte for byte. The client is fed the trace's server
 records and produces the trace's ClientHello record, its Finished record, its
 data and its alert.
+
+**RFC 8448's 0-RTT trace** (section 4, the resumed handshake with early data) is
+read by the same extractor into `resumed.vec`. The early secret, the transcript
+hash it is derived over (which has to be the whole ClientHello, binders
+included, and the test says that hash is not the one over the hello cut before
+them), `client_early_traffic_secret`, its key and IV, the sealed early record
+and the sealed `EndOfEarlyData` (the second record under that key) are the
+trace's, byte for byte, and the server opens them with the keys it derives. A
+label of another name, a secret over another range of the transcript, or a
+sequence number that does not start at 0 changes the bytes and fails the same
+tests.
 
 Negative handshakes use a simulated server (`tests/sim.h`) that builds real
 chains in memory and signs with Ed25519. It derives its schedule with this
@@ -561,12 +664,12 @@ covers here. The tag comparison is `security`'s, with its own gate there.
 ## Not here
 
 Client authentication and `CertificateRequest` (the server never sends one);
-TLS 1.2; early data (an offer is not accepted and its records are skipped; a
-ticket never permits it; `max_early_data` is kept in a session for when it
-does); `psk_ke` without ECDHE; external PSKs; a server-side ticket or session
+TLS 1.2; `psk_ke` without ECDHE; external PSKs; a server-side ticket or session
 cache and revocation of tickets (the way to refuse one is to retire its key);
-replay protection (a ticket may be used again until it expires, as RFC 8446
-section 8 says of a server with no cache, which is why early data is not
-here); DTLS; revocation in the handshake; the `http` adapter.
+a replay store for early data (the callback is the seam; the store is the
+caller's, and a ticket not used for early data may be presented again until it
+expires, as RFC 8446 section 8 says of a server with no cache); early data under
+QUIC beyond exposing the secret; DTLS; revocation in the handshake; the `http`
+adapter.
 `GTLS_ContextConfig` already has room for TLS 1.2, an external PSK and a client
 certificate.

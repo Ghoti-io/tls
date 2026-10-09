@@ -68,6 +68,19 @@
  *                    first was sent (client)
  *   --gate FILE      with --resume, wait for FILE to exist before the second
  *                    connection (client)
+ *   --resumes K      with --resume, connect K more times (default 1), each
+ *                    offering the first session again (client)
+ *   --early N        early data (0-RTT): a server allows N bytes in its tickets
+ *                    and takes the replay decision from --replay; a client
+ *                    offers early data when the session permits it
+ *   --replay MODE    a server's decision about early data: accept, reject, or
+ *                    once (accept a ticket the first time it is seen and never
+ *                    again: a store in memory, a caller's job)   (server)
+ *   --no-echo        do not wait for the echo: send the line and close, for a
+ *                    peer that does not send one back (client)
+ *   --early-text T   the bytes a client sends as early data on a resumed
+ *                    connection; if the server refuses them it sends them
+ *                    again as ordinary data (client)
  *
  * On success it prints one line, `ok`, then what was negotiated, and exits 0
  * (one line for each connection, when there are several). On failure it
@@ -137,7 +150,45 @@ typedef struct Options {
   int64_t advance;
   int resume;
   const char * gate;
+  unsigned resumes;
+  uint32_t early;
+  const char * early_text;
+  int replay;   /* 0 accept, 1 reject, 2 once */
+  int no_echo;
 } Options;
+
+/* A server's replay store, for --replay once. The library keeps none: this is
+ * what a caller supplies. */
+static struct {
+  unsigned char ids[64][32];
+  size_t count;
+  int mode;
+  unsigned calls;
+} g_replay;
+
+static int replay_decision(void * user, const unsigned char id[32], int64_t issued, uint32_t age_ms) {
+  size_t i;
+
+  (void)user;
+  (void)issued;
+  (void)age_ms;
+  g_replay.calls++;
+  if (g_replay.mode == 0) {
+    return 1;
+  }
+  if (g_replay.mode == 1) {
+    return 0;
+  }
+  for (i = 0; i < g_replay.count; i++) {
+    if (memcmp(g_replay.ids[i], id, 32) == 0) {
+      return 0;
+    }
+  }
+  if (g_replay.count < 64) {
+    memcpy(g_replay.ids[g_replay.count++], id, 32);
+  }
+  return 1;
+}
 
 static int fail(const char * what) {
   fprintf(stderr, "failed\n%s\n", what);
@@ -219,6 +270,8 @@ static int parse_options(int argc, char ** argv, Options * o) {
   o->message = "hello";
   o->now = (int64_t)time(NULL);
   o->connections = 1;
+  o->resumes = 1;
+  o->replay = 2;
   if (argc < 2) {
     return -1;
   }
@@ -250,6 +303,10 @@ static int parse_options(int argc, char ** argv, Options * o) {
     }
     if (strcmp(a, "--compat") == 0) {
       o->compat = 1;
+      continue;
+    }
+    if (strcmp(a, "--no-echo") == 0) {
+      o->no_echo = 1;
       continue;
     }
     if (strcmp(a, "--rekey") == 0) {
@@ -301,6 +358,14 @@ static int parse_options(int argc, char ** argv, Options * o) {
       o->connections = (unsigned)atoi(v);
     } else if (strcmp(a, "--gate") == 0) {
       o->gate = v;
+    } else if (strcmp(a, "--resumes") == 0) {
+      o->resumes = (unsigned)atoi(v);
+    } else if (strcmp(a, "--early") == 0) {
+      o->early = (uint32_t)atoi(v);
+    } else if (strcmp(a, "--early-text") == 0) {
+      o->early_text = v;
+    } else if (strcmp(a, "--replay") == 0) {
+      o->replay = strcmp(v, "accept") == 0 ? 0 : (strcmp(v, "reject") == 0 ? 1 : 2);
     } else if (strcmp(a, "--advance") == 0) {
       o->advance = (int64_t)atoll(v);
     } else if (strcmp(a, "--suites") == 0) {
@@ -550,6 +615,11 @@ static int build_context(const Options * o, const Material * m, GTLS_TicketKey *
   config.sig_algs = o->sig_count != 0 ? o->sigs : NULL;
   config.sig_alg_count = o->sig_count;
   config.middlebox_compat = o->compat;
+  config.max_early_data = o->early;
+  if (o->server && o->early != 0) {
+    g_replay.mode = o->replay;
+    config.anti_replay = replay_decision;
+  }
   if (o->server) {
     size_t k;
 
@@ -582,6 +652,26 @@ static int build_context(const Options * o, const Material * m, GTLS_TicketKey *
   return gtls_context_new(NULL, &config, context) == GTLS_OK ? 0 : -1;
 }
 
+/** Where @p text occurs in @p data, or NULL. */
+static const char * find_text(const char * data, size_t len, const char * text) {
+  size_t n = strlen(text);
+  size_t i;
+
+  for (i = 0; i + n <= len; i++) {
+    if (memcmp(data + i, text, n) == 0) {
+      return data + i;
+    }
+  }
+  return NULL;
+}
+
+/** The expected echo has come, and the newline after it (data the client sent again may precede it). */
+static int echo_arrived(const char * data, size_t len, const char * expect) {
+  const char * at = find_text(data, len, expect);
+
+  return at != NULL && (size_t)(at - data) + strlen(expect) < len;
+}
+
 /**
  * One connection, from the handshake to the close. A client sends its line and
  * waits for the echo; a server echoes until the peer closes. A client that is
@@ -597,6 +687,9 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
   size_t sent_message = 0;
   char received[4096];
   size_t received_len = 0;
+  unsigned char early_got[4096];
+  size_t early_len = 0;
+  size_t resent = 0;
   int status = 1;
   int closed = 0;
 
@@ -611,6 +704,15 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
   }
   if (gtls_conn_start(conn) != GTLS_OK) {
     goto done;
+  }
+  if (!o->server && offer != NULL && o->early_text != NULL) {
+    size_t w = 0;
+
+    if (gtls_conn_write_early(conn, o->early_text, strlen(o->early_text), &w) != GTLS_OK ||
+        w != strlen(o->early_text)) {
+      fprintf(stderr, "failed\nthe early data was refused locally\n");
+      goto done;
+    }
   }
 
   for (;;) {
@@ -629,6 +731,23 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
     if (!o->server && gtls_conn_is_connected(conn) && sent_message == 0) {
       size_t w = 0;
       size_t len = strlen(o->message);
+
+      /* Early data the server refused is sent again, as ordinary data, ahead of the line. */
+      if (offer != NULL && o->early_text != NULL) {
+        GTLS_EarlyStatus st = GTLS_EARLY_NONE;
+        unsigned char back[4096];
+        size_t k = 0;
+
+        (void)gtls_conn_early_status(conn, &st);
+        if (st == GTLS_EARLY_REJECTED && gtls_conn_early_resend(conn, back, sizeof back, &k) == GTLS_OK &&
+            k != 0) {
+          if (gtls_conn_write(conn, back, k, &w) != GTLS_OK || w != k) {
+            fprintf(stderr, "failed\nwrite refused\n");
+            goto done;
+          }
+          resent = k;
+        }
+      }
 
       if (gtls_conn_write(conn, o->message, len, &w) != GTLS_OK || w != len ||
           gtls_conn_write(conn, "\n", 1, &w) != GTLS_OK) {
@@ -667,8 +786,9 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
       (void)flush_out(conn, fd);
       break;
     }
-    if (!o->server && received_len >= strlen(o->expect) + (sent_message ? 1u : 0u) &&
-        sent_message && !closed && (keep == NULL || gtls_conn_session_count(conn) > 0)) {
+    if (!o->server && sent_message && !closed &&
+        (o->no_echo || echo_arrived(received, received_len, o->expect)) &&
+        (keep == NULL || gtls_conn_session_count(conn) > 0)) {
       (void)gtls_conn_close(conn);
       closed = 1;
       (void)flush_out(conn, fd);
@@ -697,6 +817,17 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
       GTLS_Result r = gtls_conn_stream_feed(conn, buf + off, (size_t)n - off, now, &used);
 
       off += used;
+      if (o->server) {
+        for (;;) {
+          size_t k = 0;
+
+          if (gtls_conn_read_early(conn, early_got + early_len, sizeof early_got - early_len, &k) != GTLS_OK ||
+              k == 0) {
+            break;
+          }
+          early_len += k;
+        }
+      }
       for (;;) {
         size_t k = 0;
 
@@ -729,7 +860,7 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
     size_t want = strlen(o->expect);
 
     received[received_len] = 0;
-    if (received_len < want || memcmp(received, o->expect, want) != 0) {
+    if (!o->no_echo && (received_len < want || find_text(received, received_len, o->expect) == NULL)) {
       fprintf(stderr, "failed\nthe echo was not what was sent: got %zu bytes\n", received_len);
       goto done;
     }
@@ -743,11 +874,20 @@ static int run_connection(const Options * o, GTLS_Context * context, int fd, int
     const unsigned char * alpn = NULL;
     size_t alpn_len = 0;
 
+    GTLS_EarlyStatus early_status = GTLS_EARLY_NONE;
+    size_t at;
+
     (void)gtls_conn_alpn(conn, &alpn, &alpn_len);
-    printf("ok suite=%04x group=%04x alpn=%.*s retried=%d resumed=%d sessions=%zu offered=%d\n",
+    (void)gtls_conn_early_status(conn, &early_status);
+    printf("ok suite=%04x group=%04x alpn=%.*s retried=%d resumed=%d sessions=%zu offered=%d"
+           " early=%d early_len=%zu replay=%u resent=%zu early_hex=",
         (unsigned)gtls_conn_suite(conn), (unsigned)gtls_conn_group(conn), (int)alpn_len,
         alpn != NULL ? (const char *)alpn : "", gtls_conn_retried(conn), gtls_conn_resumed(conn),
-        gtls_conn_session_count(conn), offer != NULL);
+        gtls_conn_session_count(conn), offer != NULL, (int)early_status, early_len, g_replay.calls, resent);
+    for (at = 0; at < early_len; at++) {
+      printf("%02x", early_got[at]);
+    }
+    printf("\n");
     fflush(stdout);
   }
   status = 0;
@@ -786,7 +926,7 @@ int main(int argc, char ** argv) {
       goto out;
     }
   }
-  for (n = 0; n < (o.server ? o.connections : (o.resume ? 2u : 1u)); n++) {
+  for (n = 0; n < (o.server ? o.connections : (o.resume ? 1u + o.resumes : 1u)); n++) {
     int64_t now = o.now + (n > 0 ? o.advance : 0);
     int fd;
     int result;

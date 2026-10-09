@@ -569,11 +569,13 @@ TEST(WipeEarly, NeitherTheEarlySecretNorTheEarlyBytesReachAFreedBlock) {
       ASSERT_EQ(p2.build(), GTLS_OK);
       const Bytes c_e(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32);
       size_t n = 0;
+      /* Watching from the start: a buffer that grows frees the block it leaves while the run goes on. */
+      watch.secrets = {c_e, w.data, Bytes(w.data.begin(), w.data.begin() + 64)};
+      watch.install(alloc);
       ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data(), 150, &n), GTLS_OK);
       ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data() + 150, 150, &n), GTLS_OK);
       p2.run();
       ASSERT_TRUE(p2.connected());
-      watch.secrets = {c_e, w.data, Bytes(w.data.begin(), w.data.begin() + 64)};
       if (verdict == 1) {
         EXPECT_TRUE(contains(reinterpret_cast<const unsigned char *>(p2.s.conn), sizeof(GTLS_Conn),
             Bytes(p2.s.conn->sec.schedule.c_e, p2.s.conn->sec.schedule.c_e + 32)))
@@ -588,7 +590,6 @@ TEST(WipeEarly, NeitherTheEarlySecretNorTheEarlyBytesReachAFreedBlock) {
         EXPECT_EQ(Bytes(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32), Bytes(32, 0))
             << "but not the key";
       }
-      watch.install(alloc);
     }
     EXPECT_EQ(watch.found, 0) << "verdict " << verdict;
     EXPECT_EQ(alloc.live, 0);
@@ -608,18 +609,27 @@ TEST(WipeEarly, AConnectionThatFailsInTheEarlyPhaseKeepsNothing) {
     ASSERT_EQ(p2.build(), GTLS_OK);
     const Bytes c_e(p2.c.conn->sec.schedule.c_e, p2.c.conn->sec.schedule.c_e + 32);
     size_t n = 0;
-    ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data(), 300, &n), GTLS_OK);
+    ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data(), 200, &n), GTLS_OK);
+    ASSERT_EQ(gtls_conn_write_early(p2.c.conn, w.data.data() + 200, 100, &n), GTLS_OK);
     Bytes out = stream_out(p2.c.conn);
     ASSERT_GT(out.size(), 300u);
     size_t used = 0;
-    /* The hello and the early records go in; the last record is damaged. */
-    out[out.size() - 3] ^= 1;
+    /* The hello and the first early record go in, and are held; the last record is damaged. */
+    const size_t hello_len = 5 + ((static_cast<size_t>(out[3]) << 8) | out[4]);
+    const size_t first_len = 5 + ((static_cast<size_t>(out[hello_len + 3]) << 8) | out[hello_len + 4]);
     p2.auto_read = false;
-    EXPECT_EQ(gtls_conn_stream_feed(p2.s.conn, out.data(), out.size(), kNow, &used), GTLS_ERR_MISMATCH);
+    ASSERT_EQ(gtls_conn_stream_feed(p2.s.conn, out.data(), hello_len + first_len, kNow, &used), GTLS_OK);
+    ASSERT_EQ(p2.s.conn->early_in.len, 200u);
+    ASSERT_TRUE(contains(p2.s.conn->early_in.data, p2.s.conn->early_in.len, Bytes(w.data.begin(), w.data.begin() + 64)))
+        << "so there is something to wipe";
+    out[out.size() - 3] ^= 1;
+    EXPECT_EQ(gtls_conn_stream_feed(p2.s.conn, out.data() + hello_len + first_len, out.size() - hello_len - first_len,
+                  kNow, &used),
+        GTLS_ERR_MISMATCH);
     EXPECT_TRUE(gtls_conn_secrets_are_wiped(p2.s.conn));
     EXPECT_EQ(p2.s.conn->early_in.len, 0u);
     EXPECT_FALSE(contains(p2.s.conn->early_in.data, p2.s.conn->early_in.cap, Bytes(w.data.begin(), w.data.begin() + 64)))
-        << "what the server had read is wiped at the failure";
+        << "what the server had read (the first record, 200 bytes) is wiped at the failure";
     EXPECT_FALSE(contains(reinterpret_cast<const unsigned char *>(p2.s.conn), sizeof(GTLS_Conn), c_e));
     watch.secrets = {c_e, Bytes(w.data.begin(), w.data.begin() + 64)};
     watch.install(alloc);

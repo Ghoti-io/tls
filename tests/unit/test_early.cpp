@@ -938,6 +938,12 @@ TEST(EarlyClient, NoSessionNoEarlyData) {
   EXPECT_EQ(gtls_conn_write_early(e.p.c.conn, "x", 1, &w), GTLS_ERR_INVALID);
   EXPECT_EQ(w, 0u);
   EXPECT_EQ(gtls_conn_write_early(e.p.s.conn, "x", 1, &w), GTLS_ERR_INVALID) << "a server writes none";
+  unsigned char b[4];
+  size_t got = 5;
+  EXPECT_EQ(gtls_conn_read_early(e.p.c.conn, b, sizeof b, &got), GTLS_ERR_INVALID) << "a client reads none";
+  EXPECT_EQ(got, 0u);
+  EXPECT_EQ(gtls_conn_early_resend(e.p.s.conn, b, sizeof b, &got), GTLS_ERR_INVALID) << "a server has nothing to give back";
+  EXPECT_EQ(gtls_conn_early_resend(e.p.c.conn, b, sizeof b, &got), GTLS_ERR_INVALID) << "nor a client whose offer was not refused";
   e.p.run();
   ASSERT_TRUE(e.p.connected());
   EXPECT_EQ(status_of(e.p.c.conn), GTLS_EARLY_NONE);
@@ -1485,6 +1491,163 @@ TEST(EarlyClientChecks, AnAcceptanceTheClientDidNotAskForOrCannotBelieveIsRefuse
     EXPECT_EQ(gtls_conn_alert(e.p.c.conn), c.alert);
     EXPECT_TRUE(gtls_conn_secrets_are_wiped(e.p.c.conn));
   }
+}
+
+TEST(EarlyRejected, ATicketWithoutAnAllowanceIsRefusedEvenWhenTheClientOffers) {
+  EEnv a;
+  a.p.scfg.max_early_data = 0;
+  a.p.scfg.anti_replay = nullptr;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  ASSERT_EQ(h.s->max_early_data, 0u);
+  h.s->max_early_data = 1000;   /* a client that claims more than the ticket gave */
+  Refused r(h.s, nullptr);
+  expect_rejected(r, 0, true);
+}
+
+TEST(EarlyRejected, AProtocolThatOnlyBeginsLikeTheTicketsIsNotTheTickets) {
+  EEnv a;
+  a.p.calpn = {"h2", "h"};
+  a.p.salpn = {"h2"};
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  ASSERT_EQ(h.s->alpn_len, 2u);
+  Refused r(h.s, [](EEnv & e) {
+    e.p.calpn = {"h2", "h"};
+    e.p.salpn = {"h", "h2"};   /* the server prefers the shorter one, whose bytes are the first of the other's */
+  });
+  expect_rejected(r, 0, true);
+  Refused same_length(h.s, [](EEnv & e) {
+    e.p.calpn = {"h2", "h3"};
+    e.p.salpn = {"h3", "h2"};   /* as long as the ticket's, and not the same */
+  });
+  expect_rejected(same_length, 0, true);
+}
+
+TEST(EarlyClient, TheOfferEndsAtTheMessageThatEndsItNotLater) {
+  EEnv a;
+  static const GTLS_Group p256[] = {GTLS_GROUP_SECP256R1};
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Bytes out;
+  size_t used = 0;
+  size_t w = 0;
+
+  /* A HelloRetryRequest. */
+  {
+    EEnv b;
+    b.p.scfg.groups = p256;
+    b.p.scfg.group_count = 1;
+    ASSERT_NO_FATAL_FAILURE(start_early(b.p, h.s, pattern(30, 1)));
+    ASSERT_EQ(status_of(b.p.c.conn), GTLS_EARLY_PENDING);
+    b.p.carry(b.p.c, b.p.s, 0);
+    b.p.carry(b.p.s, b.p.c, 0);   /* the retry, and nothing else yet */
+    EXPECT_EQ(status_of(b.p.c.conn), GTLS_EARLY_REJECTED);
+    Bytes sec(48);
+    size_t n = 0;
+    EXPECT_EQ(gtls_conn_secret(b.p.c.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, sec.data(), sec.size(), &n),
+        GTLS_ERR_INVALID) << "the key is gone with the offer";
+    EXPECT_EQ(gtls_conn_write_early(b.p.c.conn, "x", 1, &w), GTLS_ERR_INVALID);
+    EXPECT_EQ(b.p.c.conn->wr_epoch, GTLS_EPOCH_INITIAL);
+  }
+  /* A ServerHello that does select it, and nothing after it yet: the offer is open and the write is not. */
+  {
+    EEnv b;
+    ASSERT_NO_FATAL_FAILURE(start_early(b.p, h.s, pattern(30, 1)));
+    out = stream_out(b.p.c.conn);
+    ASSERT_EQ(gtls_conn_stream_consume(b.p.c.conn, out.size()), GTLS_OK);
+    ASSERT_EQ(gtls_conn_stream_feed(b.p.s.conn, out.data(), out.size(), b.p.now, &used), GTLS_OK);
+    const std::vector<Bytes> flight = records_of(stream_out(b.p.s.conn));
+    ASSERT_GE(flight.size(), 2u);
+    ASSERT_EQ(gtls_conn_stream_feed(b.p.c.conn, flight[0].data(), flight[0].size(), b.p.now, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_state(b.p.c.conn), GTLS_STATE_WAIT_EE);
+    EXPECT_EQ(status_of(b.p.c.conn), GTLS_EARLY_PENDING) << "the answer is in EncryptedExtensions";
+    EXPECT_EQ(gtls_conn_write_early(b.p.c.conn, "x", 1, &w), GTLS_ERR_INVALID) << "but the server has begun to answer";
+    EXPECT_EQ(w, 0u);
+  }
+  /* A ServerHello that does not select the PSK. */
+  {
+    EEnv b;
+    b.p.keys = {ekey(2)};
+    ASSERT_NO_FATAL_FAILURE(start_early(b.p, h.s, pattern(30, 1)));
+    out = stream_out(b.p.c.conn);
+    ASSERT_EQ(gtls_conn_stream_consume(b.p.c.conn, out.size()), GTLS_OK);
+    ASSERT_EQ(gtls_conn_stream_feed(b.p.s.conn, out.data(), out.size(), b.p.now, &used), GTLS_OK);
+    const std::vector<Bytes> flight = records_of(stream_out(b.p.s.conn));
+    ASSERT_GE(flight.size(), 2u);
+    ASSERT_EQ(gtls_conn_stream_feed(b.p.c.conn, flight[0].data(), flight[0].size(), b.p.now, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_state(b.p.c.conn), GTLS_STATE_WAIT_EE);
+    EXPECT_EQ(status_of(b.p.c.conn), GTLS_EARLY_REJECTED) << "at the ServerHello, before EncryptedExtensions";
+  }
+}
+
+TEST(Early, TheDummyRecordFollowsTheHelloAheadOfTheEarlyRecords) {
+  EEnv a;
+  a.p.ccfg.middlebox_compat = 1;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  ASSERT_NO_FATAL_FAILURE(again_early(a.p, h.s, pattern(30, 1)));
+  const std::vector<Bytes> recs = records_of(stream_out(a.p.c.conn));
+  ASSERT_EQ(recs.size(), 3u);
+  EXPECT_EQ(recs[0][0], 22) << "the ClientHello";
+  EXPECT_EQ(recs[1][0], 20) << "the dummy change_cipher_spec, right after it (appendix D.4)";
+  EXPECT_EQ(recs[2][0], 23) << "and then the early data";
+}
+
+TEST(EarlyEnd, AnotherMessageWhereEndOfEarlyDataIsDueIsUnexpected) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  MsgEnded n(h.s);
+  EXPECT_EQ(n.feed(GTLS_EPOCH_EARLY, Bytes{GTLS_HS_FINISHED, 0, 0, 0}), GTLS_ERR_PROTOCOL);
+  expect_failed_with(n.m.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+TEST(EarlyEnd, AnApplicationRecordInTheMiddleOfAHandshakeMessageIsUnexpected) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Staged st(h.s, pattern(10, 1));
+  ASSERT_EQ(st.recs.size(), 2u);
+  ASSERT_EQ(st.feed(st.recs[0]), GTLS_OK);
+  ASSERT_EQ(st.feed(st.recs[1]), GTLS_OK);
+  GTLS_RecordKeys k = st.e.p.c.conn->sec.wr;   /* the client's early keys, a record on */
+  GTLS_Buf b;
+  gtls_buf_init(&b, nullptr, 256);
+  const unsigned char half[2] = {5, 0};
+  ASSERT_EQ(gtls_record_seal(&k, GTLS_CT_HANDSHAKE, half, 2, 0, &b), GTLS_OK);
+  ASSERT_EQ(st.feed(Bytes(b.data, b.data + b.len)), GTLS_OK) << "half of an EndOfEarlyData";
+  gtls_buf_free(&b);
+  gtls_buf_init(&b, nullptr, 256);
+  ASSERT_EQ(gtls_record_seal(&k, GTLS_CT_APPLICATION_DATA, "more", 4, 0, &b), GTLS_OK);
+  EXPECT_EQ(st.feed(Bytes(b.data, b.data + b.len)), GTLS_ERR_PROTOCOL);
+  gtls_buf_free(&b);
+  expect_failed_with(st.e.p.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+TEST(EarlyEnd, AClientThatFailsHoldsNoneOfTheBytesItSent) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  const Bytes data = pattern(300, 7);
+  ASSERT_NO_FATAL_FAILURE(again_early(a.p, h.s, data));
+  ASSERT_EQ(a.p.c.conn->early_sent.len, 300u);
+  ASSERT_NE(std::search(a.p.c.conn->early_sent.data, a.p.c.conn->early_sent.data + a.p.c.conn->early_sent.cap,
+                data.begin(), data.begin() + 64),
+      a.p.c.conn->early_sent.data + a.p.c.conn->early_sent.cap)
+      << "so there is something to look for";
+  const Bytes junk(10, 0x42);
+  size_t used = 0;
+  EXPECT_NE(gtls_conn_stream_feed(a.p.c.conn, junk.data(), junk.size(), a.p.now, &used), GTLS_OK);
+  ASSERT_TRUE(gtls_conn_is_failed(a.p.c.conn));
+  EXPECT_EQ(a.p.c.conn->early_sent.len, 0u);
+  EXPECT_EQ(std::search(a.p.c.conn->early_sent.data, a.p.c.conn->early_sent.data + a.p.c.conn->early_sent.cap,
+                data.begin(), data.begin() + 64),
+      a.p.c.conn->early_sent.data + a.p.c.conn->early_sent.cap)
+      << "wiped at the failure, not only at the free";
+  unsigned char b[8];
+  size_t n = 1;
+  EXPECT_EQ(gtls_conn_early_resend(a.p.c.conn, b, sizeof b, &n), GTLS_ERR_FAILED);
 }
 
 int main(int argc, char ** argv) {

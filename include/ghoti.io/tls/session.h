@@ -72,7 +72,10 @@
  * an error, and fatal (RFC 8446 section 4.2.11.2): whoever sent it did not know
  * the PSK.
  *
- * Early data is not built; a ticket never permits it.
+ * Early data (0-RTT) rides on a ticket whose state carries an allowance:
+ * ::GTLS_ContextConfig::max_early_data, and for a server the replay decision
+ * that goes with it (::GTLS_AntiReplayFn), set it; ::GTLS_SessionInfo::max_early_data
+ * says what a session permits. See record.h for the calls.
  */
 
 #ifndef GHOTI_IO_GTLS_SESSION_H
@@ -145,7 +148,7 @@ typedef struct GTLS_SessionInfo {
   int64_t received;               ///< The Unix second the ticket arrived.
   uint32_t lifetime;              ///< Seconds the server said it is good for, at most seven days.
   int64_t expires;                ///< ::received plus ::lifetime, saturating at INT64_MAX (a parsed session never needs it to).
-  uint32_t max_early_data;        ///< What the server would accept as early data; this library does not send any.
+  uint32_t max_early_data;        ///< What the server would accept as early data, in bytes; 0 if the ticket permits none. A client sends it with ::gtls_conn_write_early.
 } GTLS_SessionInfo;
 
 /** @brief Wipe and free a session. NULL is allowed. */

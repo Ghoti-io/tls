@@ -30,7 +30,8 @@
  * (QUIC), and the record layer over a byte stream with key update,
  * close_notify and a truncation check for a caller that carries a stream.
  * Session tickets and PSK resumption are built, in both roles (session.h);
- * client authentication, TLS 1.2 and early data are later pieces.
+ * early data (0-RTT, with the replay decision left to the caller) is built in
+ * both roles (record.h); client authentication and TLS 1.2 are later pieces.
  * See documentation/design.md.
  */
 
