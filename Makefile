@@ -516,7 +516,7 @@ check-controls-anchors: ## Fail if a planted defect in tools/controls.sh no long
 check-controls: ## Plant each defect in a scratch copy and require its test to fail (slow; needs PREFIX)
 	@sh tools/controls.sh
 
-check-secret: ## Fail if src/ calls memcmp, a userspace generator, or printf
+check-secret: ## Fail if src/, include/ or examples/ call a variable-time compare, a userspace generator or an output function
 	@python3 tools/check-secret.py
 
 check-foundation: ## Fail if the registry, the manifest, or the oracle pins disagree

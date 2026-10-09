@@ -34,6 +34,8 @@
  *   usage: handshake [host]
  */
 
+/* check-secret: allow printf -- the example's report of what happened, never a key */
+
 #include <ghoti.io/tls/tls.h>
 
 #include <stdio.h>

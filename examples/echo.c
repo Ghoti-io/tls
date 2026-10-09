@@ -89,6 +89,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+/* check-secret: allow strcmp -- command-line words, never a secret */
+/* check-secret: allow memcmp -- a replay-table key (a hash of a ticket identity, public) and the echoed test text */
+/* check-secret: allow printf -- the example's report of what happened, never a key */
+
 #include <ghoti.io/tls/tls.h>
 
 #include <ghoti.io/security/random.h>
