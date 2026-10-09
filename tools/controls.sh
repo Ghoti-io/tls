@@ -9,21 +9,39 @@
 # under the terms of the GNU Lesser General Public License version 3 as
 # published by the Free Software Foundation.
 #
-# The checks listed in plants() below are each removed, one at a time, in a
-# scratch copy of the tree, and the test that is meant to catch the absence
-# must start failing. Those are the ones planted, not every check in the
-# library. A control that does not fail means the test accepts the
-# very thing the check was there to refuse.
+# The checks listed in plants() below are each removed, one at a time, and the
+# test that is meant to catch the absence must start failing. Those are the
+# ones planted, not every check in the library. A control that does not fail
+# means the test accepts the very thing the check was there to refuse.
 #
 #   PREFIX=/path/to/prefix tools/controls.sh [name...]
+#   tools/controls.sh --anchors
 #
-# The scratch copy is built against PREFIX (and PKG_CONFIG_PATH as the
-# environment has it). Each plant first runs the test unplanted, so that a
-# failure is the plant's and not the build's.
+# It is incremental, because a full copy-and-build per plant took minutes and
+# made the committed gate too slow to run:
+#
+#   1. The tree is copied once into a scratch directory and the test binaries
+#      the plants name are built once, against PREFIX.
+#   2. Each distinct test (binary, filter, memory checker) is run unplanted
+#      once. A failure there is the build's, and every plant that uses it is
+#      reported as nothing measured.
+#   3. A plant changes the one source file in the scratch copy, rebuilds the
+#      one object that changed and relinks the one test binary it runs, runs
+#      the test, and puts the file and its pristine object back. The next
+#      plant therefore starts from a state that was built from the real source.
+#
+# The result of each plant is one of: caught (the test fails with the check
+# removed), SURVIVED (it passes), or ERROR (the baseline fails, the text does
+# not apply exactly once, the planted copy does not build, or the test runs
+# for more than $CONTROLS_TIMEOUT seconds, 600 by default, which is counted as
+# caught: a planted loop is a failed test). The exit status is non-zero for
+# any SURVIVED or ERROR, and the last line says how many of each and how long
+# it took.
 
 set -u
 
 root=$(cd "$(dirname "$0")/.." && pwd)
+start=$(date +%s)
 
 # name, file, text removed, text put in its place, test binary; tab-separated
 # (a bar is part of the text a plant removes). Two optional fields follow: a
@@ -344,28 +362,50 @@ fuzz-early-pin	src/client/client.c	      result = gtls_stream_pin_early(c);	    
 PLANTS
 }
 
+bindir=build/linux/release/apps
+
 copy_tree() {
-  rm -rf "$scratch/tree"
+  rm -rf "$scratch/tree" "$scratch/src" "$scratch/obj"
   mkdir -p "$scratch/tree"
-  (cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 -I{} cp --parents {} "$scratch/tree/")
+  (cd "$root" && git ls-files -co --exclude-standard -z | xargs -0 -I{} cp -p --parents {} "$scratch/tree/")
 }
 
-# 0: built and passed; 1: built, and the test failed; 2: did not build. A plant
-# that does not compile has caught nothing (-Werror turns a parameter the plant
-# stopped using into one), and must not be counted as a test that failed.
+# 0: built and passed; 1: built, and the test failed; 2: did not build.
+build_test() {
+  (cd "$scratch/tree" && make "$bindir/$1" PREFIX="$PREFIX" -j2 >"$scratch/build.txt" 2>&1)
+}
+
 run_test() {
-  (cd "$scratch/tree" && make "build/linux/release/apps/$1" PREFIX="$PREFIX" -j2 >"$scratch/build.txt" 2>&1) || return 2
+  # $1 binary, $2 filter, $3 mode
   if [ "${3:-}" = valgrind ]; then
-    (cd "$scratch/tree" && LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
-        valgrind --error-exitcode=1 --track-origins=yes --suppressions=tests/valgrind.supp \
-        "build/linux/release/apps/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
+    (cd "$scratch/tree" && LD_LIBRARY_PATH="$bindir:$PREFIX/lib/ghoti.io" \
+        timeout "$limit" valgrind --error-exitcode=1 --track-origins=yes --suppressions=tests/valgrind.supp \
+        "$bindir/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
     return $?
   fi
-  (cd "$scratch/tree" && LD_LIBRARY_PATH="build/linux/release/apps:$PREFIX/lib/ghoti.io" \
-      "build/linux/release/apps/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
+  (cd "$scratch/tree" && LD_LIBRARY_PATH="$bindir:$PREFIX/lib/ghoti.io" \
+      timeout "$limit" "$bindir/$1" --gtest_brief=1 ${2:+--gtest_filter="$2"} >"$scratch/out.txt" 2>&1)
 }
 
-status=0
+# Apply a plant to the scratch copy: exactly one match, or an error.
+apply_plant() {
+  python3 - "$scratch/tree/$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1:4]
+old = old.replace("\\&", "&").replace("\\|", "|").replace("\\n", "\n")
+new = new.replace("\\&", "&").replace("\\|", "|").replace("\\n", "\n")
+s = open(path).read()
+if s.count(old) != 1:
+    sys.exit("expected exactly one match, found %d" % s.count(old))
+open(path, "w").write(s.replace(old, new))
+PY
+}
+
+# The object a source file builds into, in the release tree.
+object_of() {
+  echo "build/linux/release/objects/${1#src/}" | sed 's/\.c$/.o/'
+}
+
 if [ "${1:-}" = "--anchors" ]; then
   # Fast and needs no build: every plant's text is in the tree exactly once,
   # so a plant that stopped applying (the code moved) fails `make test` rather
@@ -394,44 +434,117 @@ sys.exit(bad)
 ' "$root"
   exit $?
 fi
+
 : "${PREFIX:?set PREFIX to the prefix holding cutil, security and certificate}"
+limit=${CONTROLS_TIMEOUT:-600}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/gtls-controls.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 want="$*"
 tab=$(printf '\t')
+
+# Which plants run, and which distinct tests they need.
 plants | while IFS="$tab" read -r name file from to test filter mode; do
   if [ -n "$want" ] && ! echo " $want " | grep -q " $name "; then
     continue
   fi
-  copy_tree
+  printf '%s\n' "$name$tab$file$tab$from$tab$to$tab$test$tab${filter:-}$tab${mode:-}"
+done >"$scratch/selected"
+count=$(grep -c . "$scratch/selected")
+if [ "$count" -eq 0 ]; then
+  echo "controls: no plant matches '$want'" >&2
+  exit 1
+fi
+
+copy_tree
+# One build of every test binary the selected plants run.
+cut -f5 "$scratch/selected" | sort -u >"$scratch/binaries"
+for b in $(cat "$scratch/binaries"); do
+  if ! build_test "$b"; then
+    echo "controls: the unplanted tree does not build $b, so nothing was measured" >&2
+    grep -m5 "error" "$scratch/build.txt" >&2
+    exit 1
+  fi
+done
+mkdir -p "$scratch/src" "$scratch/obj"
+(cd "$scratch/tree" && find build/linux/release/objects -name '*.o' ! -path '*/tests/*' -print0 \
+    | xargs -0 -I{} cp -p --parents {} "$scratch/obj/")
+
+# The unplanted run of each distinct test.
+cut -f5-7 "$scratch/selected" | sort -u >"$scratch/tests"
+: >"$scratch/bad-baselines"
+while IFS="$tab" read -r test filter mode; do
   if ! run_test "$test" "$filter" "$mode"; then
-    echo "controls: $name: $test fails (or does not build) BEFORE the plant, so nothing was measured" >&2
+    printf '%s\n' "$test$tab$filter$tab$mode" >>"$scratch/bad-baselines"
+    echo "controls: $test ${filter:+($filter) }${mode:+[$mode] }fails BEFORE any plant, so nothing was measured for it" >&2
     tail -5 "$scratch/out.txt" >&2
-    echo FAIL >"$scratch/status"
+  fi
+done <"$scratch/tests"
+
+caught=0
+survived=0
+errors=0
+while IFS="$tab" read -r name file from to test filter mode; do
+  if grep -qxF "$test$tab$filter$tab$mode" "$scratch/bad-baselines"; then
+    errors=$((errors + 1))
     continue
   fi
-  python3 - "$scratch/tree/$file" "$from" "$to" <<'PY' || { echo "controls: $name: the plant did not apply" >&2; echo FAIL >"$scratch/status"; continue; }
-import sys
-path, old, new = sys.argv[1:4]
-old = old.replace("\\&", "&").replace("\\|", "|").replace("\\n", "\n")
-new = new.replace("\\&", "&").replace("\\|", "|").replace("\\n", "\n")
-s = open(path).read()
-if s.count(old) != 1:
-    sys.exit("expected exactly one match, found %d" % s.count(old))
-open(path, "w").write(s.replace(old, new))
-PY
-  run_test "$test" "$filter" "$mode"
-  case $? in
-    0)
-      echo "controls: $name: $test still PASSES with the check removed" >&2
-      echo FAIL >"$scratch/status" ;;
-    2)
-      echo "controls: $name: the planted copy did not build, so nothing was measured" >&2
-      grep -m3 "error" "$scratch/build.txt" >&2
-      echo FAIL >"$scratch/status" ;;
-    *)
-      echo "controls: $name: $test fails with the check removed, and passes with it" ;;
-  esac
+  obj=$(object_of "$file")
+  if [ ! -f "$scratch/src/$file" ]; then
+    mkdir -p "$scratch/src/$(dirname "$file")"
+    cp -p "$scratch/tree/$file" "$scratch/src/$file"
+  fi
+  if ! apply_plant "$file" "$from" "$to"; then
+    echo "controls: $name: the plant did not apply" >&2
+    errors=$((errors + 1))
+    continue
+  fi
+  built=0
+  build_test "$test" && built=1
+  if [ "$built" -eq 1 ]; then
+    run_test "$test" "$filter" "$mode"
+    rc=$?
+  fi
+  # Put the source back, and the object it built from, newer than the archive
+  # so the next relink takes it.
+  cp -p "$scratch/src/$file" "$scratch/tree/$file"
+  cp -p "$scratch/obj/$obj" "$scratch/tree/$obj"
+  touch "$scratch/tree/$obj"
+  if [ "$built" -ne 1 ]; then
+    echo "controls: $name: the planted copy did not build, so nothing was measured" >&2
+    grep -m3 "error" "$scratch/build.txt" >&2
+    errors=$((errors + 1))
+  elif [ "$rc" -eq 0 ]; then
+    echo "controls: $name: $test still PASSES with the check removed" >&2
+    survived=$((survived + 1))
+  else
+    if [ "$rc" -eq 124 ]; then
+      echo "controls: $name: $test timed out with the check removed (counted as failing)"
+    else
+      echo "controls: $name: $test fails with the check removed, and passes with it"
+    fi
+    caught=$((caught + 1))
+  fi
+done <"$scratch/selected"
+
+# The tree is back to the real source: rebuild what the last plants touched
+# and run every distinct test once more. A restore that left a planted object
+# behind would have made every plant after it measure the wrong thing.
+for b in $(cat "$scratch/binaries"); do
+  if ! build_test "$b"; then
+    echo "controls: after the last plant the restored tree does not build $b" >&2
+    errors=$((errors + 1))
+  fi
 done
-[ -f "$scratch/status" ] && status=1
-exit $status
+while IFS="$tab" read -r test filter mode; do
+  if grep -qxF "$test$tab$filter$tab$mode" "$scratch/bad-baselines"; then
+    continue
+  fi
+  if ! run_test "$test" "$filter" "$mode"; then
+    echo "controls: $test ${filter:+($filter) }fails after the plants were put back, so the restore left one in" >&2
+    errors=$((errors + 1))
+  fi
+done <"$scratch/tests"
+
+end=$(date +%s)
+echo "controls: $count plants: $caught caught, $survived SURVIVED, $errors ERROR, in $((end - start)) s"
+[ "$survived" -eq 0 ] && [ "$errors" -eq 0 ]

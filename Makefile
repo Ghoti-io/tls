@@ -513,7 +513,7 @@ check-fuzz-ub: ## Fail unless the fuzz flags make undefined behaviour a failing 
 check-controls-anchors: ## Fail if a planted defect in tools/controls.sh no longer applies exactly once
 	@sh tools/controls.sh --anchors
 
-check-controls: ## Plant each defect in a scratch copy and require its test to fail (slow; needs PREFIX)
+check-controls: ## Plant every defect in tools/controls.sh in a scratch copy, incrementally, and require its test to fail (needs PREFIX; an hour or so)
 	@sh tools/controls.sh
 
 check-secret: ## Fail if src/, include/ or examples/ call a variable-time compare, a userspace generator or an output function
