@@ -413,25 +413,34 @@ TEST(EarlySkip, AnyFeedSizeGivesTheSameResult) {
   }
 }
 
-TEST(EarlySkip, TheCapIsInBytesHeadersIncludedAndExceedingItIsFatal) {
-  /* Cap 100: one record of 95 body bytes costs exactly 100. */
+TEST(EarlySkip, TheCapIsInPlaintextBytesAndExceedingItIsFatal) {
+  /* Cap 100: a record costs its body less the 17 bytes of inner type and tag,
+   * so a body of 117 costs exactly 100. */
   {
     Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
-    EXPECT_EQ(o.hello_then(early_record(95)), GTLS_OK) << "exactly the cap";
+    EXPECT_EQ(o.hello_then(early_record(117)), GTLS_OK) << "exactly the cap";
     o.p.run();
     EXPECT_TRUE(o.p.connected());
   }
   {
     Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
-    EXPECT_EQ(o.hello_then(early_record(96)), GTLS_ERR_LIMIT) << "one byte over";
+    EXPECT_EQ(o.hello_then(early_record(118)), GTLS_ERR_LIMIT) << "one byte over";
     EXPECT_EQ(gtls_conn_alert(o.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
     EXPECT_TRUE(gtls_conn_secrets_are_wiped(o.p.s.conn));
   }
   {
     Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 100; });
-    EXPECT_EQ(o.hello_then(cat(early_record(45), early_record(45))), GTLS_OK) << "two records, 100 in all";
-    EXPECT_EQ(stream(o.p.s.conn, early_record(1)), GTLS_ERR_LIMIT) << "and a third";
+    EXPECT_EQ(o.hello_then(cat(early_record(67), early_record(67))), GTLS_OK) << "two records, 100 in all";
+    EXPECT_EQ(stream(o.p.s.conn, early_record(18)), GTLS_ERR_LIMIT) << "and a third, of one byte";
     EXPECT_EQ(gtls_conn_alert(o.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  {
+    /* The header is not part of the cost, and a body too short to hold a
+     * plaintext (an empty record is 17 bytes) costs one. */
+    Offering o(true, true, [](Pair & p) { p.slimits.max_early_skip_bytes = 3; });
+    EXPECT_EQ(o.hello_then(cat(early_record(17), cat(early_record(1), early_record(17)))), GTLS_OK)
+        << "three records, one byte each";
+    EXPECT_EQ(stream(o.p.s.conn, early_record(17)), GTLS_ERR_LIMIT) << "the fourth";
   }
 }
 

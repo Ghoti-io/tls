@@ -210,7 +210,9 @@ GTLS_API unsigned gtls_conn_alert(const GTLS_Conn * conn);
  * The early secret (RFC 8446 section 7.1, client_early_traffic_secret) exists
  * for a client that has offered early data, from the moment its ClientHello is
  * built until the server's answer rejects it (then it is wiped), and for a
- * server that has accepted early data. It is the client's: only the client's
+ * server that has accepted early data. It is wiped when it has done its work:
+ * as the client queues EndOfEarlyData, and as the server reads it; after that
+ * it is ::GTLS_ERR_INVALID. It is the client's: only the client's
  * ::GTLS_DIR_WRITE and the server's ::GTLS_DIR_READ are it, and the other
  * direction is ::GTLS_ERR_INVALID.
  *

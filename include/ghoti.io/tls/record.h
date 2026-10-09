@@ -254,6 +254,14 @@ GTLS_API GTLS_Result gtls_conn_early_resend(GTLS_Conn * conn, void * out,
  *
  * The peer's own close_notify is still read. Writes after this are
  * ::GTLS_ERR_CLOSED. Calling it again is ::GTLS_OK.
+ *
+ * A client that has written early data and closes before the handshake is
+ * complete says nothing: the early key carries application data only (RFC 8446
+ * section 2.3). The connection ends there, locally, whatever was not yet taken
+ * from the output is dropped, and the call returns ::GTLS_ERR_CLOSED with the
+ * connection failed (::gtls_conn_failure says ::GTLS_ERR_CLOSED and
+ * ::gtls_conn_alert ::GTLS_ALERT_NONE). The peer sees the stream end, which
+ * its ::gtls_conn_stream_eof reports as ::GTLS_ERR_TRUNCATED.
  */
 GTLS_API GTLS_Result gtls_conn_close(GTLS_Conn * conn);
 

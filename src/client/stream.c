@@ -170,6 +170,13 @@ GTLS_Result gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned descr
   return gtls_record_seal(&c->sec.wr, GTLS_CT_ALERT, a, 2, 0, &c->wire);
 }
 
+GTLS_Result gtls_stream_pin_early(GTLS_Conn * c) {
+  if (c->wr_epoch == GTLS_EPOCH_EARLY) {
+    return GTLS_OK;
+  }
+  return install_keys(c, GTLS_EPOCH_EARLY, 1);
+}
+
 /** The dummy change_cipher_spec of RFC 8446 appendix D.4, once. */
 static GTLS_Result put_ccs(GTLS_Conn * c) {
   static const unsigned char one = 1;
@@ -226,13 +233,9 @@ GTLS_Result gtls_stream_flush(GTLS_Conn * c) {
     size_t n = q->len < GTLS_RECORD_PLAIN_MAX ? q->len : GTLS_RECORD_PLAIN_MAX;
 
     if (c->wr_epoch != GTLS_EPOCH_EARLY) {
-      if (c->wr_epoch > GTLS_EPOCH_EARLY) {
-        return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
-      }
-      result = install_keys(c, GTLS_EPOCH_EARLY, 1);
-      if (result != GTLS_OK) {
-        return result;
-      }
+      /* The client installed them as it queued EndOfEarlyData, while the secret
+       * they come from still existed (gtls_stream_pin_early). */
+      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
     }
     result = put_sealed(c, GTLS_CT_HANDSHAKE, q->data, n);
     if (result != GTLS_OK) {
@@ -372,17 +375,26 @@ static GTLS_Result open_failed(GTLS_Conn * c, GTLS_Result result) {
 /**
  * Discard one record of early data that was offered and not accepted. Only
  * the number of bytes is kept: they never reach the application, and the cap
- * is what keeps a peer from sending them for ever.
+ * is what keeps a peer from sending them for ever. The cap and the allowances
+ * are in plaintext bytes, so a record costs the plaintext it can hold (its body
+ * less the inner type and the tag, 17 bytes; an empty one costs one, as it does
+ * when it is accepted), and the budget is the larger of the limit and the
+ * context's own allowance: a client that stays within the allowance a server
+ * would have given is not failed for having been refused.
  */
 static GTLS_Result skip_early(GTLS_Conn * c, size_t body_len) {
-  size_t cost = GTLS_RECORD_HEADER + body_len;
+  size_t cost = body_len > GTLS_RECORD_TAG + 1u ? body_len - (GTLS_RECORD_TAG + 1u) : 1u;
+  size_t budget = c->limits.max_early_skip_bytes;
 
+  if (c->context->max_early_data > budget) {
+    budget = c->context->max_early_data;
+  }
   if (c->in.len != 0) {
     /* A handshake message is in pieces: only its next piece may follow
      * (RFC 8446 section 5.1), and early data is not that. */
     return gtls_conn_unexpected(c);
   }
-  if (cost > c->limits.max_early_skip_bytes - c->early_skipped) {
+  if (cost > budget - c->early_skipped) {
     return gtls_conn_fail(c, GTLS_ERR_LIMIT, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
   c->early_skipped += cost;
@@ -922,8 +934,13 @@ GTLS_Result gtls_conn_read_early(GTLS_Conn * c, void * out, size_t cap, size_t *
   }
   take = c->early_in.len < cap ? c->early_in.len : cap;
   if (take != 0) {
+    size_t keep = c->early_in.len - take;
+
     memcpy(out, c->early_in.data, take);
     gtls_buf_consume(&c->early_in, take);
+    /* What was handed over is not kept: after the move, its stale copy is the
+     * `take` bytes that begin where the rest now ends. */
+    (void)gsec_wipe(c->early_in.data + keep, take);
   }
   *n = take;
   return GTLS_OK;
@@ -955,9 +972,11 @@ GTLS_Result gtls_conn_early_resend(GTLS_Conn * c, void * out, size_t cap, size_t
   }
   take = c->early_sent.len < cap ? c->early_sent.len : cap;
   if (take != 0) {
+    size_t keep = c->early_sent.len - take;
+
     memcpy(out, c->early_sent.data, take);
-    (void)gsec_wipe(c->early_sent.data, take);
     gtls_buf_consume(&c->early_sent, take);
+    (void)gsec_wipe(c->early_sent.data + keep, take); /* the stale copy the move left */
   }
   *n = take;
   return GTLS_OK;
@@ -977,6 +996,23 @@ GTLS_Result gtls_conn_close(GTLS_Conn * c) {
   }
   if (c->local_closed) {
     return GTLS_OK;
+  }
+  if (c->wr_epoch == GTLS_EPOCH_EARLY && c->state != GTLS_STATE_CONNECTED) {
+    /* The early key carries application data only (RFC 8446 section 2.3), and
+     * the server reads nothing else under it: a close_notify sealed there is
+     * not one. The handshake is not complete, so there is no key to say it
+     * under either: this end is ended, locally, with what was not yet sent
+     * dropped, and the caller is told. The peer sees the stream end. */
+    size_t i;
+
+    wipe_buf(&c->wire);
+    c->wire.len = 0;
+    for (i = 0; i < GTLS_EPOCH_COUNT; i++) {
+      wipe_buf(&c->out[i]);
+      c->out[i].len = 0;
+    }
+    c->local_closed = 1;
+    return gtls_conn_fail(c, GTLS_ERR_CLOSED, GTLS_ALERT_NONE);
   }
   result = gtls_stream_flush(c);
   if (result != GTLS_OK) {

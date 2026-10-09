@@ -305,6 +305,12 @@ GTLS_Result gtls_conn_on_key_update(GTLS_Conn * c, const unsigned char * msg,
 void gtls_stream_free(GTLS_Conn * c);
 /** Turn queued handshake output into records. A failed connection sends nothing more. */
 GTLS_Result gtls_stream_flush(GTLS_Conn * c);
+/**
+ * Install the early write keys while the early secret still exists, for a
+ * client about to queue EndOfEarlyData (which is sealed under them, and the
+ * secret is wiped as it is queued). A no-op when they are installed.
+ */
+GTLS_Result gtls_stream_pin_early(GTLS_Conn * c);
 /** Seal and queue @p alert under the keys in use; for failure, best effort. */
 GTLS_Result gtls_stream_send_alert(GTLS_Conn * c, unsigned level, unsigned description);
 

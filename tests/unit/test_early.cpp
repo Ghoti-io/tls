@@ -485,6 +485,17 @@ std::vector<Bytes> records_of(const Bytes & wire) {
   return out;
 }
 
+/** Every byte of the region is zero. */
+bool zeros(const void * p, size_t n) {
+  const unsigned char * b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; i++) {
+    if (b[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 const GTLS_Suite kEarlySuites[] = {GTLS_SUITE_AES_128_GCM_SHA256, GTLS_SUITE_AES_256_GCM_SHA384,
     GTLS_SUITE_CHACHA20_POLY1305_SHA256};
 const GTLS_Group kEarlyGroups[] = {GTLS_GROUP_X25519, GTLS_GROUP_SECP256R1, GTLS_GROUP_SECP384R1};
@@ -1146,11 +1157,13 @@ struct Ended {
   EEnv e;
   std::vector<Bytes> first;   /* the ClientHello and the early records */
   std::vector<Bytes> fin;     /* EndOfEarlyData, then the Finished */
+  Bytes early_secret;         /* the client's, taken before it wipes it */
   explicit Ended(const GTLS_Session * session, const std::function<void(EEnv &)> & tweak = nullptr) {
     if (tweak) {
       tweak(e);
     }
     start_early(e.p, session, pattern(40, 8));
+    early_secret.assign(e.p.c.conn->sec.schedule.c_e, e.p.c.conn->sec.schedule.c_e + e.p.c.conn->sec.schedule.hlen);
     const Bytes out = stream_out(e.p.c.conn);
     first = records_of(out);
     EXPECT_EQ(gtls_conn_stream_consume(e.p.c.conn, out.size()), GTLS_OK);
@@ -1233,8 +1246,7 @@ TEST(EarlyEnd, AnEarlyRecordAfterEndOfEarlyDataIsRefused) {
   ASSERT_EQ(n.feed(n.fin[0]), GTLS_OK);
   /* The next record under the early key: the client's own, as if it kept using it. */
   GTLS_RecordKeys k;
-  ASSERT_EQ(gtls_record_keys_from_secret(&k, GTLS_SUITE_AES_128_GCM_SHA256,
-                n.e.p.c.conn->sec.schedule.c_e, 0),
+  ASSERT_EQ(gtls_record_keys_from_secret(&k, GTLS_SUITE_AES_128_GCM_SHA256, n.early_secret.data(), 0),
       GTLS_OK);
   k.seq = 2;   /* the data was record 0, EndOfEarlyData record 1 */
   GTLS_Buf b;
@@ -1324,6 +1336,7 @@ struct MsgEnded {
   Replay rp;
   MessagePair m;
   Bytes eoed, fin;
+  Bytes client_secret;   /* the client's early secret, taken before it wipes it */
   MsgEnded(const GTLS_Session * session, int verdict = 1) : m(*cred) {
     rp.verdict = verdict;
     m.keys = {ekey(1)};
@@ -1333,6 +1346,13 @@ struct MsgEnded {
     m.ccfg.max_early_data = 100;
     m.offer = session;
     EXPECT_EQ(m.build(), GTLS_OK);
+    {
+      Bytes sec(GTLS_HASH_MAX);
+      size_t n = 0;
+      if (gtls_conn_secret(m.c.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, sec.data(), sec.size(), &n) == GTLS_OK) {
+        client_secret.assign(sec.begin(), sec.begin() + static_cast<long>(n));
+      }
+    }
     Bytes hello = MessagePair::pending(m.c, GTLS_EPOCH_INITIAL);
     EXPECT_EQ(gtls_conn_feed(m.s.conn, GTLS_EPOCH_INITIAL, hello.data(), hello.size(), m.now), GTLS_OK);
     for (int e = 0; e < GTLS_EPOCH_COUNT; e++) {
@@ -1377,6 +1397,12 @@ TEST(EarlyEnd, InTheMessageInterfaceEndOfEarlyDataIsAnEarlyEpochMessageAndTheOrd
   }
   {
     MsgEnded n(h.s);
+    EXPECT_EQ(n.feed(GTLS_EPOCH_EARLY, n.eoed), GTLS_OK);
+    EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, n.eoed), GTLS_ERR_PROTOCOL) << "a second one, in the epoch the Finished is due in";
+    expect_failed_with(n.m.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+  }
+  {
+    MsgEnded n(h.s);
     EXPECT_EQ(n.feed(GTLS_EPOCH_HANDSHAKE, n.eoed), GTLS_ERR_PROTOCOL) << "in the wrong epoch";
     expect_failed_with(n.m.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
   }
@@ -1407,24 +1433,28 @@ TEST(EarlyEnd, TheEarlySecretIsExposedToTheMessageInterfaceInTheDirectionsThatEx
   Held h;
   ASSERT_NO_FATAL_FAILURE(prime(a, h));
   MsgEnded n(h.s);
-  Bytes cw(48), sr(48), none(48);
-  size_t cn = 0, sn = 0, x = 0;
+  Bytes sr(48), none(48);
+  size_t sn = 0, x = 0;
 
-  ASSERT_EQ(gtls_conn_secret(n.m.c.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, cw.data(), cw.size(), &cn), GTLS_OK);
+  ASSERT_EQ(n.client_secret.size(), 32u) << "the client had it from the moment its hello was built";
   ASSERT_EQ(gtls_conn_secret(n.m.s.conn, GTLS_EPOCH_EARLY, GTLS_DIR_READ, sr.data(), sr.size(), &sn), GTLS_OK);
-  ASSERT_EQ(cn, 32u);
   ASSERT_EQ(sn, 32u);
-  cw.resize(cn);
   sr.resize(sn);
-  EXPECT_EQ(cw, sr) << "one secret, the client's";
-  EXPECT_NE(cw, Bytes(32, 0));
-  EXPECT_EQ(Bytes(n.m.c.conn->sec.schedule.c_e, n.m.c.conn->sec.schedule.c_e + 32), cw);
+  EXPECT_EQ(n.client_secret, sr) << "one secret, the client's";
+  EXPECT_NE(sr, Bytes(32, 0));
+  EXPECT_EQ(gtls_conn_secret(n.m.c.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, none.data(), none.size(), &x),
+      GTLS_ERR_INVALID) << "and gone from it once it has queued EndOfEarlyData";
   EXPECT_EQ(gtls_conn_secret(n.m.c.conn, GTLS_EPOCH_EARLY, GTLS_DIR_READ, none.data(), none.size(), &x),
       GTLS_ERR_INVALID);
   EXPECT_EQ(gtls_conn_secret(n.m.s.conn, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, none.data(), none.size(), &x),
       GTLS_ERR_INVALID);
   EXPECT_EQ(gtls_conn_secret(n.m.s.conn, GTLS_EPOCH_EARLY, GTLS_DIR_READ, none.data(), 31, &x),
       GTLS_ERR_LIMIT);
+  ASSERT_EQ(n.feed(GTLS_EPOCH_EARLY, n.eoed), GTLS_OK);
+  EXPECT_EQ(gtls_conn_secret(n.m.s.conn, GTLS_EPOCH_EARLY, GTLS_DIR_READ, none.data(), none.size(), &x),
+      GTLS_ERR_INVALID) << "and from the server once it has read it";
+  EXPECT_TRUE(zeros(n.m.s.conn->sec.schedule.c_e, sizeof n.m.s.conn->sec.schedule.c_e));
+  EXPECT_TRUE(zeros(n.m.c.conn->sec.schedule.c_e, sizeof n.m.c.conn->sec.schedule.c_e));
 }
 
 TEST(EarlyEnd, NoEarlySecretWhereThereIsNoEarlyData) {
@@ -1549,6 +1579,9 @@ TEST(EarlyClient, TheOfferEndsAtTheMessageThatEndsItNotLater) {
         GTLS_ERR_INVALID) << "the key is gone with the offer";
     EXPECT_EQ(gtls_conn_write_early(b.p.c.conn, "x", 1, &w), GTLS_ERR_INVALID);
     EXPECT_EQ(b.p.c.conn->wr_epoch, GTLS_EPOCH_INITIAL);
+    EXPECT_TRUE(zeros(&b.p.c.conn->sec.wr, sizeof b.p.c.conn->sec.wr)) << "the keys that sealed it are wiped";
+    EXPECT_TRUE(zeros(b.p.c.conn->sec.wr_secret, sizeof b.p.c.conn->sec.wr_secret));
+    EXPECT_TRUE(zeros(b.p.c.conn->sec.schedule.c_e, sizeof b.p.c.conn->sec.schedule.c_e));
   }
   /* A ServerHello that does select it, and nothing after it yet: the offer is open and the write is not. */
   {
@@ -1578,6 +1611,8 @@ TEST(EarlyClient, TheOfferEndsAtTheMessageThatEndsItNotLater) {
     ASSERT_EQ(gtls_conn_stream_feed(b.p.c.conn, flight[0].data(), flight[0].size(), b.p.now, &used), GTLS_OK);
     EXPECT_EQ(gtls_conn_state(b.p.c.conn), GTLS_STATE_WAIT_EE);
     EXPECT_EQ(status_of(b.p.c.conn), GTLS_EARLY_REJECTED) << "at the ServerHello, before EncryptedExtensions";
+    EXPECT_TRUE(zeros(&b.p.c.conn->sec.wr, sizeof b.p.c.conn->sec.wr)) << "the keys that sealed it are wiped";
+    EXPECT_TRUE(zeros(b.p.c.conn->sec.wr_secret, sizeof b.p.c.conn->sec.wr_secret));
   }
 }
 
@@ -1648,6 +1683,596 @@ TEST(EarlyEnd, AClientThatFailsHoldsNoneOfTheBytesItSent) {
   unsigned char b[8];
   size_t n = 1;
   EXPECT_EQ(gtls_conn_early_resend(a.p.c.conn, b, sizeof b, &n), GTLS_ERR_FAILED);
+}
+
+/* ============================================== the review of early data, patched */
+
+namespace {
+
+uint16_t be16(const unsigned char * p) {
+  return static_cast<uint16_t>((p[0] << 8) | p[1]);
+}
+
+void put16(Bytes & b, size_t v) {
+  b.push_back(static_cast<unsigned char>(v >> 8));
+  b.push_back(static_cast<unsigned char>(v));
+}
+
+/**
+ * The client's ClientHello record with a second identity in its pre_shared_key,
+ * one that is no ticket, ahead of the real one or after it, and the real one's
+ * binder computed again over the hello as it now is. The server cannot tell it
+ * from a client that offered two.
+ */
+Bytes two_identity_hello(const Bytes & record, const GTLS_Session * s, bool valid_first) {
+  Bytes msg(record.begin() + 5, record.end());
+  GTLS_ClientHello h;
+  GTLS_Limits l = earlykat::limits();
+  EXPECT_EQ(gtls_msg_parse_client_hello(msg.data() + 4, msg.size() - 4, &l, &h), GTLS_OK);
+  const GTLS_Ext * e = gtls_msg_find_ext(h.exts, h.ext_count, GTLS_EXT_PRE_SHARED_KEY);
+  EXPECT_NE(e, nullptr);
+  const size_t body = static_cast<size_t>(e->data - msg.data());
+  const size_t ids_len = be16(e->data);
+  const size_t binders_at = body + 2 + ids_len;
+  EXPECT_EQ(be16(msg.data() + binders_at), 33u);
+
+  Bytes unknown;
+  put16(unknown, 8);
+  unknown.insert(unknown.end(), 8, 0x7e);
+  unknown.insert(unknown.end(), {1, 2, 3, 4});
+  const Bytes ids_old(msg.begin() + static_cast<long>(body) + 2, msg.begin() + static_cast<long>(binders_at));
+  Bytes ids = valid_first ? ids_old : unknown;
+  const Bytes & second = valid_first ? unknown : ids_old;
+  ids.insert(ids.end(), second.begin(), second.end());
+  const Bytes dummy(33, 0);   /* a binder's length byte, then 32 bytes that are wrong */
+  Bytes binders;
+  put16(binders, 66);
+  binders.insert(binders.end(), 66, 0);
+  binders[2] = binders[2 + 33] = 32;
+
+  Bytes out(msg.begin(), msg.begin() + static_cast<long>(body) - 2);   /* up to the extension's length */
+  const size_t ext_len = 2 + ids.size() + binders.size();
+  put16(out, ext_len);
+  put16(out, ids.size());
+  out.insert(out.end(), ids.begin(), ids.end());
+  const size_t cut = out.size();
+  out.insert(out.end(), binders.begin(), binders.end());
+  /* The block of extensions says how long it is, before the first one. */
+  size_t at = 4 + 2 + 32;
+  at += 1 + out[at];                               /* legacy_session_id */
+  at += 2 + be16(out.data() + at);                 /* cipher_suites */
+  at += 1 + out[at];                               /* compression methods */
+  const size_t block = be16(out.data() + at) + (out.size() - msg.size());
+  out[at] = static_cast<unsigned char>(block >> 8);
+  out[at + 1] = static_cast<unsigned char>(block);
+  const size_t len = out.size() - 4;
+  out[1] = static_cast<unsigned char>(len >> 16);
+  out[2] = static_cast<unsigned char>(len >> 8);
+  out[3] = static_cast<unsigned char>(len);
+
+  GTLS_Transcript t;
+  unsigned char th[GTLS_HASH_MAX];
+  unsigned char binder[GTLS_HASH_MAX];
+  const GTLS_Hash hash = gtls_suite_hash(s->suite);
+  EXPECT_EQ(gtls_transcript_init(&t), GTLS_OK);
+  EXPECT_EQ(gtls_transcript_select(&t, hash), GTLS_OK);
+  EXPECT_EQ(gtls_binder_transcript(&t, out.data(), cut, th), GTLS_OK);
+  EXPECT_EQ(gtls_binder_compute(hash, s->psk, s->psk_len, th, binder), GTLS_OK);
+  gtls_transcript_wipe(&t);
+  std::memcpy(out.data() + cut + 2 + 1 + (valid_first ? 0 : 33), binder, 32);
+
+  Bytes rec{22, 3, 1};
+  put16(rec, out.size());
+  rec.insert(rec.end(), out.begin(), out.end());
+  return rec;
+}
+
+}  // namespace
+
+TEST(EarlyRejected, OnlyTheFirstOfSeveralPsksMayCarryEarlyData) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (bool valid_first : {true, false}) {
+    SCOPED_TRACE(valid_first ? "[valid, unknown]" : "[unknown, valid]");
+    EEnv e;
+    ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, Bytes()));
+    const std::vector<Bytes> recs = records_of(stream_out(e.p.c.conn));
+    ASSERT_GE(recs.size(), 1u);
+    const Bytes hello = two_identity_hello(recs[0], h.s, valid_first);
+    size_t used = 0;
+    ASSERT_EQ(gtls_conn_stream_feed(e.p.s.conn, hello.data(), hello.size(), e.p.now, &used), GTLS_OK);
+    EXPECT_EQ(gtls_conn_resumed(e.p.s.conn), 1) << "the ticket is good wherever it stands";
+    if (valid_first) {
+      EXPECT_EQ(e.rp.calls, 1) << "the control: the same hello, the ticket first";
+      EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_ACCEPTED);
+      EXPECT_EQ(gtls_conn_state(e.p.s.conn), GTLS_STATE_S_WAIT_EOED);
+    } else {
+      EXPECT_EQ(e.rp.calls, 0) << "the callback is not even asked (section 4.2.10)";
+      EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_REJECTED);
+      EXPECT_EQ(gtls_conn_state(e.p.s.conn), GTLS_STATE_S_WAIT_FIN);
+    }
+  }
+}
+
+TEST(EarlyRejected, RecordsOfAnyLengthAreSkippedWithinTheAllowanceAThickerWireWouldHaveEnded) {
+  EEnv a(16384);
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (size_t piece : {static_cast<size_t>(1), static_cast<size_t>(80), static_cast<size_t>(200),
+           static_cast<size_t>(16384)}) {
+    SCOPED_TRACE(piece);
+    EEnv e(16384);
+    e.rp.verdict = 0;
+    e.p.climits.max_output_bytes = 1u << 22;
+    e.p.offer = h.s;
+    ASSERT_EQ(e.p.build(), GTLS_OK);
+    const Bytes data = pattern(16384, 4);
+    for (size_t at = 0; at < data.size(); at += piece) {
+      size_t n = std::min(piece, data.size() - at);
+      size_t w = 0;
+      ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, data.data() + at, n, &w), GTLS_OK);
+      ASSERT_EQ(w, n);
+    }
+    e.p.run();
+    ASSERT_TRUE(e.p.connected()) << result_name(gtls_conn_failure(e.p.s.conn)) << " / "
+                                 << result_name(gtls_conn_failure(e.p.c.conn));
+    EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_REJECTED);
+    EXPECT_EQ(resend(e.p.c.conn), data);
+  }
+}
+
+TEST(EarlyRejected, TheSkipBudgetIsTheLargerOfTheLimitAndTheContextsAllowanceAndOneOverEndsIt) {
+  EEnv a(4096);
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  struct Case {
+    uint32_t limit, allowance, budget;
+  };
+  for (const Case & c : {Case{100, 60, 100}, Case{50, 120, 120}}) {
+    for (uint32_t total : {c.budget, c.budget + 1}) {
+      SCOPED_TRACE(::testing::Message() << "limit " << c.limit << ", allowance " << c.allowance
+                                        << ", sent " << total);
+      EEnv e(c.allowance);
+      e.rp.verdict = 0;
+      e.p.slimits.max_early_skip_bytes = c.limit;
+      e.p.ccfg.max_early_data = 4096;
+      e.p.offer = h.s;
+      ASSERT_EQ(e.p.build(), GTLS_OK);
+      for (uint32_t i = 0; i < total; i++) {
+        size_t w = 0;
+        const unsigned char b = static_cast<unsigned char>(i);
+        ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, &b, 1, &w), GTLS_OK);
+      }
+      e.p.run();
+      if (total == c.budget) {
+        ASSERT_TRUE(e.p.connected());
+        EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_REJECTED);
+      } else {
+        EXPECT_TRUE(gtls_conn_is_failed(e.p.s.conn));
+        EXPECT_EQ(gtls_conn_failure(e.p.s.conn), GTLS_ERR_LIMIT);
+        EXPECT_EQ(gtls_conn_alert(e.p.s.conn), GTLS_ALERT_UNEXPECTED_MESSAGE);
+      }
+    }
+  }
+}
+
+TEST(EarlyRejected, EmptyRecordsCostOneEachAgainstTheSkipBudget) {
+  EEnv a(4096);
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (int empties : {9, 10}) {
+    Staged st(h.s, Bytes(1, 'a'), 4, [](EEnv & e) {
+      e.rp.verdict = 0;
+      e.p.slimits.max_early_skip_bytes = 10;
+    });
+    ASSERT_EQ(st.recs.size(), 2u);
+    ASSERT_EQ(st.feed(st.recs[0]), GTLS_OK);
+    ASSERT_EQ(st.feed(st.recs[1]), GTLS_OK) << "one of ten";
+    GTLS_RecordKeys k = st.e.p.c.conn->sec.wr;
+    GTLS_Result last = GTLS_OK;
+    for (int i = 0; i < empties; i++) {
+      GTLS_Buf b;
+      gtls_buf_init(&b, nullptr, 256);
+      ASSERT_EQ(gtls_record_seal(&k, GTLS_CT_APPLICATION_DATA, "", 0, 0, &b), GTLS_OK);
+      last = st.feed(Bytes(b.data, b.data + b.len));
+      gtls_buf_free(&b);
+      if (last != GTLS_OK) {
+        break;
+      }
+    }
+    if (empties == 9) {
+      EXPECT_EQ(last, GTLS_OK) << "nine empties and one byte are ten";
+    } else {
+      EXPECT_EQ(last, GTLS_ERR_LIMIT) << "the tenth empty is the eleventh";
+      EXPECT_EQ(gtls_conn_alert(st.server()), GTLS_ALERT_UNEXPECTED_MESSAGE);
+    }
+  }
+}
+
+TEST(EarlyLimits, TheServerTakesTheTicketsSmallerAllowanceWhenItsOwnIsLarger) {
+  EEnv a(100);
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  /* The ticket says 100, issued when the server allowed 100; the server now allows 4096. */
+  for (size_t total : {static_cast<size_t>(100), static_cast<size_t>(101)}) {
+    EEnv e(4096);
+    e.p.offer = h.s;
+    ASSERT_EQ(e.p.build(), GTLS_OK);
+    e.p.c.conn->early_max = 1000;   /* a client that does not keep to it */
+    e.p.c.conn->early_sent.max = 1000;
+    const Bytes data = pattern(total, 2);
+    size_t w = 0;
+    ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, data.data(), data.size(), &w), GTLS_OK);
+    e.p.run();
+    SCOPED_TRACE(total);
+    if (total == 100) {
+      ASSERT_TRUE(e.p.connected());
+      EXPECT_EQ(read_early(e.p.s.conn), data);
+    } else {
+      EXPECT_EQ(gtls_conn_failure(e.p.s.conn), GTLS_ERR_LIMIT) << "the ticket's allowance, not the context's";
+    }
+  }
+}
+
+TEST(EarlyClientChecks, AServerThatAcceptsEarlyDataUnderAnotherSuiteOfTheSameHashIsRefused) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  ASSERT_EQ(h.s->suite, static_cast<uint32_t>(GTLS_SUITE_AES_128_GCM_SHA256));
+  /* The session says the early records are under ChaCha20 (the same hash, SHA-256, so the PSK is
+   * good for both); the server resumes the ticket's suite, AES-128, and says it accepts. */
+  h.s->suite = GTLS_SUITE_CHACHA20_POLY1305_SHA256;
+  EEnv e;
+  ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, Bytes()));
+  e.p.run();
+  EXPECT_EQ(e.rp.calls, 1) << "the server did accept";
+  EXPECT_TRUE(gtls_conn_is_failed(e.p.c.conn));
+  EXPECT_EQ(gtls_conn_failure(e.p.c.conn), GTLS_ERR_PROTOCOL);
+  EXPECT_EQ(gtls_conn_alert(e.p.c.conn), GTLS_ALERT_ILLEGAL_PARAMETER);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(e.p.c.conn));
+}
+
+TEST(EarlyClientChecks, AServerHelloThatSelectsThePskWithAnotherHashIsIllegalBeforeAnythingIsBuilt) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, pattern(10, 1)));
+  const Bytes out = stream_out(e.p.c.conn);
+  ASSERT_EQ(gtls_conn_stream_consume(e.p.c.conn, out.size()), GTLS_OK);
+  size_t used = 0;
+  ASSERT_EQ(gtls_conn_stream_feed(e.p.s.conn, out.data(), out.size(), e.p.now, &used), GTLS_OK);
+  const std::vector<Bytes> flight = records_of(stream_out(e.p.s.conn));
+  ASSERT_GE(flight.size(), 1u);
+  Bytes sh = flight[0];
+  ASSERT_EQ(sh[5], GTLS_HS_SERVER_HELLO);
+  const size_t suite_at = 5 + 4 + 2 + 32 + 1 + sh[5 + 4 + 2 + 32];
+  ASSERT_EQ(be16(sh.data() + suite_at), static_cast<unsigned>(GTLS_SUITE_AES_128_GCM_SHA256));
+  /* The control: as it stands it is accepted. */
+  {
+    EEnv c;
+    ASSERT_NO_FATAL_FAILURE(start_early(c.p, h.s, pattern(10, 1)));
+    (void)stream_out(c.p.c.conn);
+    EXPECT_EQ(gtls_conn_stream_feed(c.p.c.conn, sh.data(), sh.size(), c.p.now, &used), GTLS_OK);
+  }
+  sh[suite_at] = 0x13;
+  sh[suite_at + 1] = 0x02;   /* AES-256-GCM-SHA384, which the client offered; the PSK is for SHA-256 */
+  EXPECT_EQ(gtls_conn_stream_feed(e.p.c.conn, sh.data(), sh.size(), e.p.now, &used), GTLS_ERR_PROTOCOL);
+  EXPECT_EQ(gtls_conn_alert(e.p.c.conn), GTLS_ALERT_ILLEGAL_PARAMETER);
+  EXPECT_TRUE(gtls_conn_secrets_are_wiped(e.p.c.conn));
+}
+
+TEST(Early, ExactlyOneDummyRecordHoweverOftenTheEarlyWritesAndTheFlushesRepeat) {
+  EEnv a;
+  a.p.ccfg.middlebox_compat = 1;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  e.p.ccfg.middlebox_compat = 1;
+  ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, Bytes()));
+  Bytes all, sent;
+  size_t used = 0;
+  auto pump = [&]() {
+    for (int i = 0; i < 50; i++) {
+      const Bytes co = stream_out(e.p.c.conn);
+      if (!co.empty()) {
+        ASSERT_EQ(gtls_conn_stream_consume(e.p.c.conn, co.size()), GTLS_OK);
+        all.insert(all.end(), co.begin(), co.end());
+        ASSERT_EQ(gtls_conn_stream_feed(e.p.s.conn, co.data(), co.size(), e.p.now, &used), GTLS_OK);
+      }
+      const Bytes so = stream_out(e.p.s.conn);
+      if (!so.empty()) {
+        ASSERT_EQ(gtls_conn_stream_consume(e.p.s.conn, so.size()), GTLS_OK);
+        ASSERT_EQ(gtls_conn_stream_feed(e.p.c.conn, so.data(), so.size(), e.p.now, &used), GTLS_OK);
+      }
+      if (co.empty() && so.empty()) {
+        break;
+      }
+    }
+  };
+  for (unsigned i = 0; i < 5; i++) {
+    const Bytes piece = pattern(10 + i, i);
+    size_t w = 0;
+    ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, piece.data(), piece.size(), &w), GTLS_OK);
+    sent.insert(sent.end(), piece.begin(), piece.end());
+    size_t none = 0;
+    ASSERT_EQ(gtls_conn_write_early(e.p.c.conn, "", 0, &none), GTLS_OK);
+    const Bytes co = stream_out(e.p.c.conn);   /* flushes: the hello, the dummy record, the early records */
+    ASSERT_EQ(gtls_conn_stream_consume(e.p.c.conn, co.size()), GTLS_OK);
+    all.insert(all.end(), co.begin(), co.end());
+    ASSERT_EQ(gtls_conn_stream_feed(e.p.s.conn, co.data(), co.size(), e.p.now, &used), GTLS_OK);
+  }
+  pump();
+  ASSERT_TRUE(e.p.connected());
+  size_t ccs = 0;
+  for (const Bytes & r : records_of(all)) {
+    ccs += r[0] == GTLS_CT_CHANGE_CIPHER_SPEC ? 1u : 0u;
+  }
+  EXPECT_EQ(ccs, 1u) << "one dummy change_cipher_spec per connection";
+  EXPECT_EQ(read_early(e.p.s.conn), sent);
+}
+
+TEST(Early, AWriteOfNothingFlushesNoHelloAndInstallsNoKey) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  e.p.offer = h.s;
+  ASSERT_EQ(e.p.build(), GTLS_OK);
+  GTLS_Conn * c = e.p.c.conn;
+  size_t w = 7;
+  EXPECT_EQ(gtls_conn_write_early(c, "", 0, &w), GTLS_OK);
+  EXPECT_EQ(w, 0u);
+  w = 7;
+  EXPECT_EQ(gtls_conn_write_early(c, nullptr, 0, &w), GTLS_OK);
+  EXPECT_EQ(w, 0u);
+  EXPECT_EQ(c->wr_epoch, GTLS_EPOCH_INITIAL) << "no early key was installed";
+  EXPECT_EQ(c->wire.len, 0u) << "and nothing was sealed or flushed";
+  EXPECT_FALSE(c->hello_flushed) << "the ClientHello is still where it was";
+  /* And a write that follows still works, once. */
+  const Bytes data = pattern(20, 5);
+  ASSERT_EQ(gtls_conn_write_early(c, data.data(), data.size(), &w), GTLS_OK);
+  e.p.run();
+  ASSERT_TRUE(e.p.connected());
+  EXPECT_EQ(read_early(e.p.s.conn), data);
+}
+
+TEST(Early, AClientThatWroteNothingEndsItsEarlyDataAllTheSame) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, Bytes()));
+  e.p.run();
+  ASSERT_TRUE(e.p.connected());
+  EXPECT_EQ(status_of(e.p.c.conn), GTLS_EARLY_ACCEPTED);
+  EXPECT_EQ(status_of(e.p.s.conn), GTLS_EARLY_ACCEPTED);
+  EXPECT_TRUE(read_early(e.p.s.conn).empty());
+  EXPECT_EQ(e.rp.calls, 1);
+}
+
+TEST(EarlyEnd, EndOfEarlyDataAndFinishedInOneEarlyRecordAreUnexpectedOverAStreamToo) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Staged st(h.s, pattern(10, 1));
+  ASSERT_EQ(st.recs.size(), 2u);
+  ASSERT_EQ(st.feed(st.recs[0]), GTLS_OK);
+  ASSERT_EQ(st.feed(st.recs[1]), GTLS_OK);
+  GTLS_RecordKeys k = st.e.p.c.conn->sec.wr;   /* the client's early keys, a record on */
+  Bytes both{5, 0, 0, 0};                      /* EndOfEarlyData, */
+  both.insert(both.end(), {20, 0, 0, 32});     /* and the head of a Finished, in the same record */
+  both.insert(both.end(), 32, 0x11);
+  EXPECT_EQ(st.feed(seal(&k, GTLS_CT_HANDSHAKE, both)), GTLS_ERR_PROTOCOL);
+  expect_failed_with(st.e.p.s.conn, GTLS_ERR_PROTOCOL, GTLS_ALERT_UNEXPECTED_MESSAGE);
+}
+
+TEST(EarlyEnd, TheEarlySecretAndTheKeysAreWipedWhenTheyHaveDoneTheirWork) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Ended n(h.s);
+  GTLS_Conn * c = n.e.p.c.conn;
+  GTLS_Conn * s = n.e.p.s.conn;
+  Bytes sec(GTLS_HASH_MAX);
+  size_t len = 0;
+
+  /* The client has queued EndOfEarlyData and the Finished, and sent them. */
+  ASSERT_EQ(n.early_secret.size(), 32u);
+  EXPECT_NE(n.early_secret, Bytes(32, 0));
+  EXPECT_FALSE(c->sec.schedule.has_e);
+  EXPECT_TRUE(zeros(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e));
+  EXPECT_EQ(gtls_conn_secret(c, GTLS_EPOCH_EARLY, GTLS_DIR_WRITE, sec.data(), sec.size(), &len), GTLS_ERR_INVALID);
+  ASSERT_EQ(gtls_conn_debug_secret(c, GTLS_SECRET_CLIENT_EARLY, sec.data(), sec.size(), &len), GTLS_OK);
+  EXPECT_EQ(Bytes(sec.begin(), sec.begin() + static_cast<long>(len)), Bytes(len, 0));
+  EXPECT_NE(c->sec.wr_secret[0] | c->sec.wr_secret[1] | c->sec.wr_secret[2], 0) << "the keys in force are the handshake's";
+  EXPECT_EQ(c->wr_epoch, GTLS_EPOCH_APPLICATION);
+
+  /* The server has it until it reads EndOfEarlyData, and not after. */
+  ASSERT_EQ(gtls_conn_secret(s, GTLS_EPOCH_EARLY, GTLS_DIR_READ, sec.data(), sec.size(), &len), GTLS_OK);
+  EXPECT_EQ(Bytes(sec.begin(), sec.begin() + static_cast<long>(len)), n.early_secret);
+  EXPECT_NE(s->sec.schedule.c_e[0] | s->sec.schedule.c_e[1], 0);
+  ASSERT_EQ(n.feed(n.fin[0]), GTLS_OK);
+  EXPECT_EQ(gtls_conn_state(s), GTLS_STATE_S_WAIT_FIN);
+  EXPECT_FALSE(s->sec.schedule.has_e);
+  EXPECT_TRUE(zeros(s->sec.schedule.c_e, sizeof s->sec.schedule.c_e));
+  EXPECT_TRUE(zeros(&s->sec.rd, sizeof s->sec.rd)) << "the keys that opened the early records";
+  EXPECT_TRUE(zeros(s->sec.rd_secret, sizeof s->sec.rd_secret));
+  EXPECT_EQ(gtls_conn_secret(s, GTLS_EPOCH_EARLY, GTLS_DIR_READ, sec.data(), sec.size(), &len), GTLS_ERR_INVALID);
+  ASSERT_EQ(n.feed(n.fin[1]), GTLS_OK);
+  ASSERT_TRUE(gtls_conn_is_connected(s));
+  EXPECT_EQ(gtls_conn_secret(s, GTLS_EPOCH_EARLY, GTLS_DIR_READ, sec.data(), sec.size(), &len), GTLS_ERR_INVALID);
+  ASSERT_EQ(gtls_conn_debug_secret(s, GTLS_SECRET_CLIENT_EARLY, sec.data(), sec.size(), &len), GTLS_OK);
+  EXPECT_EQ(Bytes(sec.begin(), sec.begin() + static_cast<long>(len)), Bytes(len, 0));
+  EXPECT_EQ(read_early(s), pattern(40, 8));
+}
+
+TEST(EarlyRead, ThePlaintextHandedOverIsWipedFromTheBufferItCameFrom) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  {
+    EEnv e;
+    const Bytes data = pattern(300, 3);
+    ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, data));
+    e.p.run();
+    ASSERT_TRUE(e.p.connected());
+    GTLS_Conn * s = e.p.s.conn;
+    unsigned char buf[300];
+    size_t n = 0;
+    ASSERT_EQ(gtls_conn_read_early(s, buf, 100, &n), GTLS_OK);
+    ASSERT_EQ(n, 100u);
+    ASSERT_EQ(s->early_in.len, 200u);
+    EXPECT_TRUE(zeros(s->early_in.data + 200, 100)) << "the stale copy the move leaves";
+    EXPECT_EQ(Bytes(s->early_in.data, s->early_in.data + 200), Bytes(data.begin() + 100, data.end()));
+    ASSERT_EQ(gtls_conn_read_early(s, buf, sizeof buf, &n), GTLS_OK);
+    ASSERT_EQ(n, 200u);
+    EXPECT_EQ(s->early_in.len, 0u);
+    EXPECT_TRUE(zeros(s->early_in.data, 300)) << "and when nothing is left";
+  }
+  {
+    Refused r(h.s, [](EEnv & e) { e.rp.verdict = 0; });
+    ASSERT_TRUE(r.e.p.connected());
+    GTLS_Conn * c = r.e.p.c.conn;
+    unsigned char buf[300];
+    size_t n = 0;
+    ASSERT_EQ(c->early_sent.len, 200u);
+    ASSERT_EQ(gtls_conn_early_resend(c, buf, 50, &n), GTLS_OK);
+    ASSERT_EQ(n, 50u);
+    EXPECT_TRUE(zeros(c->early_sent.data + 150, 50));
+    ASSERT_EQ(gtls_conn_early_resend(c, buf, sizeof buf, &n), GTLS_OK);
+    ASSERT_EQ(n, 150u);
+    EXPECT_TRUE(zeros(c->early_sent.data, 200));
+  }
+}
+
+TEST(EarlyRead, NeitherReadWritesPastTheBufferItIsGiven) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  {
+    EEnv e;
+    ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, pattern(300, 3)));
+    e.p.run();
+    ASSERT_TRUE(e.p.connected());
+    for (size_t cap : {static_cast<size_t>(100), static_cast<size_t>(1), static_cast<size_t>(199)}) {
+      unsigned char buf[300 + 8];
+      std::memset(buf, 0xab, sizeof buf);
+      size_t n = 0;
+      ASSERT_EQ(gtls_conn_read_early(e.p.s.conn, buf, cap, &n), GTLS_OK);
+      EXPECT_EQ(n, cap);
+      for (size_t i = cap; i < sizeof buf; i++) {
+        ASSERT_EQ(buf[i], 0xab) << "byte " << i << " of a buffer of " << cap;
+      }
+    }
+  }
+  {
+    Refused r(h.s, [](EEnv & e) { e.rp.verdict = 0; });
+    ASSERT_TRUE(r.e.p.connected());
+    for (size_t cap : {static_cast<size_t>(50), static_cast<size_t>(1), static_cast<size_t>(99)}) {
+      unsigned char buf[200 + 8];
+      std::memset(buf, 0xab, sizeof buf);
+      size_t n = 0;
+      ASSERT_EQ(gtls_conn_early_resend(r.e.p.c.conn, buf, cap, &n), GTLS_OK);
+      EXPECT_EQ(n, cap);
+      for (size_t i = cap; i < sizeof buf; i++) {
+        ASSERT_EQ(buf[i], 0xab) << "byte " << i << " of a buffer of " << cap;
+      }
+    }
+  }
+}
+
+/* ------------------------------------------ closing in the early window */
+
+TEST(EarlyClose, ACloseBeforeTheHandshakeIsDoneSaysNothingUnderTheEarlyKey) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  for (int variant = 0; variant < 3; variant++) {
+    SCOPED_TRACE(variant == 0 ? "the hello and the data were sent"
+                              : variant == 1 ? "nothing was taken from the output"
+                                             : "the ServerHello has been read");
+    EEnv e;
+    const Bytes data = pattern(40, 8);
+    ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, data));
+    GTLS_Conn * c = e.p.c.conn;
+    GTLS_Conn * s = e.p.s.conn;
+    size_t used = 0;
+    ASSERT_EQ(c->wr_epoch, GTLS_EPOCH_EARLY);
+    if (variant != 1) {
+      const Bytes out = stream_out(c);
+      ASSERT_EQ(gtls_conn_stream_consume(c, out.size()), GTLS_OK);
+      ASSERT_EQ(gtls_conn_stream_feed(s, out.data(), out.size(), e.p.now, &used), GTLS_OK);
+    }
+    if (variant == 2) {
+      const std::vector<Bytes> flight = records_of(stream_out(s));
+      ASSERT_GE(flight.size(), 1u);
+      ASSERT_EQ(gtls_conn_stream_feed(c, flight[0].data(), flight[0].size(), e.p.now, &used), GTLS_OK);
+      ASSERT_EQ(gtls_conn_state(c), GTLS_STATE_WAIT_EE);
+    }
+    /* This end is ended, locally, and the caller is told. */
+    EXPECT_EQ(gtls_conn_close(c), GTLS_ERR_CLOSED);
+    EXPECT_TRUE(gtls_conn_is_failed(c));
+    EXPECT_EQ(gtls_conn_failure(c), GTLS_ERR_CLOSED);
+    EXPECT_EQ(gtls_conn_alert(c), GTLS_ALERT_NONE);
+    EXPECT_TRUE(gtls_conn_secrets_are_wiped(c));
+    EXPECT_TRUE(stream_out(c).empty()) << "no close_notify, under the early key or any other, and nothing unsent";
+    EXPECT_EQ(gtls_conn_close(c), GTLS_ERR_FAILED);
+    size_t w = 0;
+    EXPECT_EQ(gtls_conn_write_early(c, "x", 1, &w), GTLS_ERR_FAILED);
+    /* The server's view: what it was sent, and then the stream ends. */
+    if (variant != 1) {
+      EXPECT_EQ(gtls_conn_state(s), GTLS_STATE_S_WAIT_EOED);
+      EXPECT_EQ(read_early(s), data);
+      EXPECT_EQ(gtls_conn_stream_eof(s), GTLS_ERR_TRUNCATED) << "and it does not wait for ever";
+      EXPECT_TRUE(gtls_conn_is_failed(s));
+    }
+  }
+}
+
+TEST(EarlyClose, ACloseOnceTheHandshakeIsCompleteSpeaksUnderTheApplicationKeyEvenWithTheEndStillQueued) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  EEnv e;
+  ASSERT_NO_FATAL_FAILURE(start_early(e.p, h.s, pattern(40, 8)));
+  GTLS_Conn * c = e.p.c.conn;
+  GTLS_Conn * s = e.p.s.conn;
+  size_t used = 0;
+  const Bytes out = stream_out(c);
+  ASSERT_EQ(gtls_conn_stream_consume(c, out.size()), GTLS_OK);
+  ASSERT_EQ(gtls_conn_stream_feed(s, out.data(), out.size(), e.p.now, &used), GTLS_OK);
+  const Bytes flight = stream_out(s);
+  ASSERT_EQ(gtls_conn_stream_consume(s, flight.size()), GTLS_OK);
+  /* In pieces, so that the client's last message is the end of what it was fed. */
+  ASSERT_EQ(gtls_conn_stream_feed(c, flight.data(), flight.size(), e.p.now, &used), GTLS_OK);
+  ASSERT_TRUE(gtls_conn_is_connected(c));
+  EXPECT_EQ(gtls_conn_close(c), GTLS_OK) << "the client is connected, and the early window is over";
+  EXPECT_FALSE(gtls_conn_is_failed(c));
+  const Bytes rest = stream_out(c);
+  ASSERT_EQ(gtls_conn_stream_consume(c, rest.size()), GTLS_OK);
+  ASSERT_EQ(gtls_conn_stream_feed(s, rest.data(), rest.size(), e.p.now, &used), GTLS_OK);
+  EXPECT_TRUE(gtls_conn_is_connected(s));
+  EXPECT_TRUE(gtls_conn_peer_closed(s)) << "EndOfEarlyData, the Finished, then close_notify";
+  EXPECT_EQ(read_early(s), pattern(40, 8));
+}
+
+TEST(EarlyClose, AServerWaitingForEndOfEarlyDataClosesUnderItsApplicationKey) {
+  EEnv a;
+  Held h;
+  ASSERT_NO_FATAL_FAILURE(prime(a, h));
+  Ended n(h.s);
+  GTLS_Conn * s = n.e.p.s.conn;
+  GTLS_Conn * c = n.e.p.c.conn;
+  ASSERT_EQ(gtls_conn_state(s), GTLS_STATE_S_WAIT_EOED);
+  EXPECT_EQ(gtls_conn_close(s), GTLS_OK);
+  n.e.p.carry(n.e.p.s, n.e.p.c, 0);
+  EXPECT_TRUE(gtls_conn_peer_closed(c)) << "the client reads it under the server's application key";
+  EXPECT_FALSE(gtls_conn_is_failed(c));
+  EXPECT_EQ(n.feed(n.fin[0]), GTLS_OK) << "and the server still reads what the client sends";
+  EXPECT_EQ(n.feed(n.fin[1]), GTLS_OK);
+  EXPECT_TRUE(gtls_conn_is_connected(s));
 }
 
 int main(int argc, char ** argv) {

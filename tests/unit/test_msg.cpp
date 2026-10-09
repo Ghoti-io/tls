@@ -772,6 +772,11 @@ TEST(NewSessionTicket, EarlyDataExtensionCarriesTheMaximum) {
   EXPECT_EQ(t.max_early_data, 1024u);
   Bytes bad = ticket_body(0, 3, ext_block({ext(GTLS_EXT_EARLY_DATA, Bytes{0, 0, 4})}));
   EXPECT_EQ(gtls_msg_parse_new_session_ticket(bad.data(), bad.size(), &l, &t), GTLS_ERR_CORRUPT);
+  /* Nor is a byte after the four: the extension is exactly the size. */
+  Bytes more = ticket_body(0, 3, ext_block({ext(GTLS_EXT_EARLY_DATA, Bytes{0, 0, 4, 0, 0})}));
+  EXPECT_EQ(gtls_msg_parse_new_session_ticket(more.data(), more.size(), &l, &t), GTLS_ERR_CORRUPT);
+  Bytes empty = ticket_body(0, 3, ext_block({ext(GTLS_EXT_EARLY_DATA, Bytes{})}));
+  EXPECT_EQ(gtls_msg_parse_new_session_ticket(empty.data(), empty.size(), &l, &t), GTLS_ERR_CORRUPT);
 }
 
 TEST(NewSessionTicket, TheParserLeavesTheTicketCapToTheClientAndAnEmptyTicketIsRefused) {

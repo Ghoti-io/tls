@@ -1167,6 +1167,18 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
       }
     }
     gtls_buf_free(&eoed);
+    if (result == GTLS_OK && c->mode == GTLS_MODE_STREAM) {
+      /* The record that carries it is sealed later, under the early write keys:
+       * have them installed before the secret they come from is wiped. */
+      result = gtls_stream_pin_early(c);
+      if (result != GTLS_OK) {
+        (void)gsec_wipe(th, sizeof th);
+        return result; /* the installer has already failed the connection */
+      }
+    }
+    /* The early traffic secret has no further use, here or for the caller. */
+    (void)gsec_wipe(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e);
+    c->sec.schedule.has_e = 0;
     if (result == GTLS_OK) {
       result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
     }

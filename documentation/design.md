@@ -149,9 +149,12 @@ the skip window opens only when `early_data` comes with a `pre_shared_key`
 (early data is encrypted under a key derived from a PSK; without one the
 extension is checked and ignored, and a bad record stays a fatal
 `bad_record_mac`). While the window is open an `application_data` record that
-does not open is discarded, its bytes counted
-(`GTLS_Limits::max_early_skip_bytes`, default one maximal record; past it is
-`GTLS_ERR_LIMIT` and `unexpected_message`), and the first record that opens
+does not open is discarded, its plaintext counted: a record costs its body less
+the 17 bytes of inner type and tag (one, at least), which is what the allowances
+count, against the larger of `GTLS_Limits::max_early_skip_bytes` (default one
+maximal record) and the context's own `max_early_data`, so a client that stays within
+what the server would have allowed is not failed for having been refused (past
+the budget is `GTLS_ERR_LIMIT` and `unexpected_message`), and the first record that opens
 ends it. A record that does authenticate but is malformed (padding past the
 cap, no content type) is not early data and is fatal as ever, and nothing is
 skipped while a handshake message is in pieces (`unexpected_message`). The
@@ -301,7 +304,9 @@ handshake goes on, the early records are skipped up to `max_early_skip_bytes`,
 as before): the ClientHello offered `early_data`; the PSK was accepted and its
 binder verified; the context allows it; no HelloRetryRequest was sent (an
 `early_data` in a second hello is `illegal_parameter`, and the client drops it
-from its own); the ticket carries an allowance; its suite is the one selected;
+from its own); the ticket carries an allowance; **the PSK selected is the first
+one offered** (section 4.2.10: the client keyed its early records to its first
+identity); its suite is the one selected;
 **the ALPN protocol selected is the ticket's** (both none counts; a ticket with
 no protocol and a server that now selects one does not), section 4.2.10; the age
 is inside the window (settled while the ticket was opened); **and the callback
@@ -318,7 +323,9 @@ the transcript hash through the whole ClientHello, binders included (it is the
 only secret taken before the ServerHello); it is the client's, so only a
 client's write and a server's read have it, and `gtls_conn_secret` with
 `GTLS_EPOCH_EARLY` returns it (it exists from the ClientHello being built, or
-accepted, until a rejection wipes it). The early records are protected with the
+accepted, until a rejection wipes it, or until it has done its work: a client wipes it
+as it queues `EndOfEarlyData`, a server as it reads it, and the keys copied from it
+with it). The early records are protected with the
 ticket's suite, with the same nonce rule as every other record. The client's
 `EndOfEarlyData` is sealed under the early key too, queued at the early epoch
 (a message-interface caller carries it there), before the Finished, and it is
@@ -355,10 +362,20 @@ a ServerHello that took no PSK, with another suite or with another ALPN
 protocol than the ticket's is the server's fault (`unsupported_extension` or
 `illegal_parameter`). An acceptance makes the client send `EndOfEarlyData`.
 
+**Closing in the early window.** The early key carries application data only (section
+2.3), and the server reads nothing else under it. A client that has written early data
+and calls `gtls_conn_close` before the handshake is complete therefore says nothing:
+the connection ends locally, what was not yet taken from the output is dropped, and
+the call returns `GTLS_ERR_CLOSED` with the connection failed (no alert). The server
+sees the stream end. Once the client is connected the close is the ordinary one, under
+the application key, even if `EndOfEarlyData` and the Finished are still queued
+ahead of it.
+
 **Wiping.** The early secret is in the connection's secret block. The buffers of
 early bytes, which are plaintext, are given all their room at once so that no
 growth leaves a copy in a block that was freed, and are wiped when the connection
-fails and when it is freed.
+fails and when it is freed; what `gtls_conn_read_early` and `gtls_conn_early_resend`
+hand over is wiped from the buffer it came from, including the copy the move leaves.
 
 ## The record layer
 

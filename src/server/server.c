@@ -993,9 +993,9 @@ static GTLS_Result verify_binder(GTLS_Conn * c, const Offer * o, const Resume * 
  * Does this server accept the early data on offer? Yes only when the ClientHello
  * offered it, its PSK was accepted and the binder verified (the caller's
  * position), the context allows it, no HelloRetryRequest was sent, the ticket
- * carries an allowance, the suite is the ticket's, the ALPN protocol selected is
- * the ticket's (section 4.2.10), and last, the caller's callback says so. That
- * the ticket's age is inside the window was settled in try_resume. The callback
+ * carries an allowance, the PSK selected is the first one offered, the suite is
+ * the ticket's, the ALPN protocol selected is the ticket's (section 4.2.10), and
+ * last, the caller's callback says so. That the ticket's age is inside the window was settled in try_resume. The callback
  * is the last because it is the one with a side effect: it is called only for a
  * ticket nothing else rules out, and so only once for it.
  */
@@ -1005,8 +1005,10 @@ static int accept_early(const GTLS_Conn * c, const Offer * o, const Resume * r) 
   unsigned char id[GSEC_SHA256_DIGEST_LEN];
   int verdict;
 
-  if (!o->early_data || !r->active || c->retried || x->max_early_data == 0 ||
-      x->anti_replay == NULL || r->plain.max_early_data == 0 ||
+  /* Only the first identity may carry early data (section 4.2.10): the client
+   * keyed its early records to the first PSK it offered. */
+  if (!o->early_data || !r->active || r->index != 0 || c->retried ||
+      x->max_early_data == 0 || x->anti_replay == NULL || r->plain.max_early_data == 0 ||
       r->plain.suite != (uint32_t)c->suite ||
       r->plain.alpn_len != c->alpn_selected_len ||
       gsec_equal(r->plain.alpn, c->alpn_selected, c->alpn_selected_len) != GSEC_OK) {
@@ -1220,6 +1222,12 @@ static GTLS_Result on_end_of_early_data(GTLS_Conn * c, const unsigned char * msg
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
+  /* The early key has done its work: nothing is read under it again. */
+  (void)gsec_wipe(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e);
+  c->sec.schedule.has_e = 0;
+  (void)gsec_wipe(&c->sec.rd, sizeof c->sec.rd);
+  (void)gsec_wipe(c->sec.rd_secret, sizeof c->sec.rd_secret);
+  c->rd_epoch = GTLS_EPOCH_INITIAL;
   c->state = GTLS_STATE_S_WAIT_FIN;
   return GTLS_OK;
 }

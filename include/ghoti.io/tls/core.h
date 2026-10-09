@@ -194,11 +194,13 @@ typedef struct GTLS_Limits {
   /** Most KeyUpdate messages one connection accepts. Default 65536. */
   uint32_t max_key_updates;
   /**
-   * Most bytes (headers included) of a client's early-data records a server
-   * discards without reading them, after a ClientHello that offered
-   * `early_data` and does not accept it (RFC 8446 section 4.2.10). Past this
-   * the connection fails with ::GTLS_ERR_LIMIT. Default 16384 plus the record
-   * overhead (one maximal record: 16384 + 256 + 5 bytes).
+   * Most plaintext bytes of a client's early-data records a server discards
+   * without reading them, after a ClientHello that offered `early_data` and
+   * does not accept it (RFC 8446 section 4.2.10). A record costs its body less
+   * the 17 bytes of inner type and tag (one byte, at least), which is what the
+   * allowances count; the budget is this or the context's ::GTLS_ContextConfig::max_early_data,
+   * whichever is larger. Past it the connection fails with ::GTLS_ERR_LIMIT.
+   * Default 16384 plus the record overhead (16384 + 256 + 5).
    */
   uint32_t max_early_skip_bytes;
   /**
