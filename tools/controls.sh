@@ -411,6 +411,8 @@ wipe-ticket-open-plain	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w
 wipe-ticket-open-aad	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	testTicket
 wipe-ticket-open-decoded	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n	testTicket
 cert-oom-mapped	src/client/verify.c	    case GCERT_ERR_OOM:\n      return GTLS_ERR_OOM;	    case GCERT_ERR_OOM:\n      return GTLS_ERR_CERT_INVALID;	testAlloc	CertificateAllocation.*
+early-flush-keys-guard	src/client/stream.c	    if (c->wr_epoch != GTLS_EPOCH_EARLY) {\n      /* The client installed them	    if (0) {\n      /* The client installed them	testEarly	EarlyInternal.*
+early-accept-callback	src/server/server.c	r->index != 0 \|\| x->anti_replay == NULL \|\|	r->index != 0 \|\|	testEarly	EarlyRejected.*
 PLANTS
 }
 

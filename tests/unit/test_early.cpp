@@ -1627,6 +1627,25 @@ TEST(QuicNoEndOfEarlyData, TheStreamInterfaceIsNotAvailableToAConnectionWithoutI
   EXPECT_GT(MessagePair::pending(p.c, GTLS_EPOCH_INITIAL).size(), 0u);
 }
 
+TEST(EarlyInternal, HandshakeBytesQueuedAtTheEarlyEpochWithoutTheEarlyKeysAreAnInternalErrorNotASealing) {
+  /* The flush seals what is queued at the early epoch under the early write
+   * keys, which the client installs as it queues EndOfEarlyData. If it were
+   * ever asked to seal them with anything else it must stop: the bytes would go
+   * out under a key the peer is not reading. Nothing in the library queues them
+   * so, which is why the test queues them itself. */
+  std::unique_ptr<Cred> cred = ed_cred();
+  Pair p(*cred);
+  ASSERT_EQ(p.build(), GTLS_OK);
+  p.run();
+  ASSERT_TRUE(p.connected());
+  ASSERT_EQ(p.c.conn->wr_epoch, GTLS_EPOCH_APPLICATION);
+  ASSERT_EQ(gtls_buf_append(&p.c.conn->out[GTLS_EPOCH_EARLY], "\x05\x00\x00\x00", 4), GTLS_OK);
+  const unsigned char * out = nullptr;
+  size_t n = 0;
+  EXPECT_EQ(gtls_conn_stream_output(p.c.conn, &out, &n), GTLS_OK) << "the output call reports the buffer; the failure is the connection's";
+  expect_failed_with(p.c.conn, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);
+}
+
 TEST(EarlyEnd, TheEarlySecretIsExposedToTheMessageInterfaceInTheDirectionsThatExist) {
   EEnv a;
   Held h;
