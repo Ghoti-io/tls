@@ -40,7 +40,13 @@
 /** The additional data begins with this label, so a ticket cannot be passed for another use of the key. */
 static const char ticket_label[] = "ghoti.io tls ticket v1";
 
-#define AAD_MAX (sizeof ticket_label - 1u + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN)
+_Static_assert(sizeof ticket_label - 1u + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN <= GTLS_TICKET_AAD_MAX,
+    "the additional data fits its work area");
+/* A ticket that passes the length gate in gtls_ticket_open has a state of at
+ * least this many bytes: enough for the version, the suite and the PSK length,
+ * which the decoder reads before it checks anything else. */
+_Static_assert(GTLS_TICKET_MIN - GTLS_TICKET_KEY_NAME_LEN - GTLS_TICKET_NONCE_LEN - GTLS_TICKET_TAG_LEN >= 1u + 2u + 1u,
+    "the shortest state holds the fixed head");
 
 static size_t build_aad(unsigned char * aad, const unsigned char * name,
     const unsigned char * nonce) {
@@ -99,22 +105,22 @@ static uint32_t get32(const unsigned char * p) {
 
 GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
     int64_t now, const unsigned char * nonce, const GTLS_TicketPlain * p,
-    unsigned char * out, size_t cap, size_t * out_len) {
+    unsigned char * out, size_t cap, size_t * out_len, GTLS_TicketScratch * w) {
   const GTLS_TicketKey * key = gtls_ticket_sealing_key(keys, count, now);
-  unsigned char plain[GTLS_TICKET_PLAIN_MAX];
-  unsigned char aad[AAD_MAX];
+  unsigned char * plain;
   size_t n = 0;
   size_t total;
   size_t aad_len;
   GTLS_Result result;
 
   if (key == NULL || nonce == NULL || p == NULL || out == NULL || out_len == NULL ||
-      gtls_suite_hash(p->suite) == GTLS_HASH_NONE ||
+      w == NULL || gtls_suite_hash(p->suite) == GTLS_HASH_NONE ||
       p->psk_len != gtls_hash_len(gtls_suite_hash(p->suite)) ||
       p->alpn_len > sizeof p->alpn || p->sni_len > sizeof p->sni ||
       p->lifetime > GTLS_TICKET_LIFETIME_MAX) {
     return GTLS_ERR_INVALID;
   }
+  plain = w->plain;
   plain[n++] = (unsigned char)(p->max_early_data != 0 ? GTLS_TICKET_STATE_VERSION_EARLY
                                                      : GTLS_TICKET_STATE_VERSION);
   plain[n++] = (unsigned char)(p->suite >> 8);
@@ -141,31 +147,32 @@ GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
 
   total = GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN + n + GTLS_TICKET_TAG_LEN;
   if (cap < total) {
-    (void)gsec_wipe(plain, sizeof plain);
-    return GTLS_ERR_LIMIT;
+    result = GTLS_ERR_LIMIT;
+  } else {
+    memcpy(out, key->name, GTLS_TICKET_KEY_NAME_LEN);
+    memcpy(out + GTLS_TICKET_KEY_NAME_LEN, nonce, GTLS_TICKET_NONCE_LEN);
+    aad_len = build_aad(w->aad, key->name, nonce);
+    result = gtls_from_gsec(gsec_aes_gcm_encrypt(key->key, GTLS_TICKET_KEY_LEN, nonce,
+        GTLS_TICKET_NONCE_LEN, w->aad, aad_len, plain, n,
+        out + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN,
+        out + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN + n, GTLS_TICKET_TAG_LEN));
+    if (result == GTLS_OK) {
+      *out_len = total;
+    }
   }
-  memcpy(out, key->name, GTLS_TICKET_KEY_NAME_LEN);
-  memcpy(out + GTLS_TICKET_KEY_NAME_LEN, nonce, GTLS_TICKET_NONCE_LEN);
-  aad_len = build_aad(aad, key->name, nonce);
-  result = gtls_from_gsec(gsec_aes_gcm_encrypt(key->key, GTLS_TICKET_KEY_LEN, nonce,
-      GTLS_TICKET_NONCE_LEN, aad, aad_len, plain, n,
-      out + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN,
-      out + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN + n, GTLS_TICKET_TAG_LEN));
-  (void)gsec_wipe(plain, sizeof plain);
-  if (result != GTLS_OK) {
-    (void)gsec_wipe(out, total);
-    return result;
-  }
-  *out_len = total;
-  return GTLS_OK;
+  /* The one place the state in the clear and the additional data are wiped,
+   * on every path out. */
+  (void)gsec_wipe(w->plain, sizeof w->plain);
+  (void)gsec_wipe(w->aad, sizeof w->aad);
+  return result;
 }
 
 GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
-    int64_t now, const unsigned char * ticket, size_t len, GTLS_TicketPlain * out) {
+    int64_t now, const unsigned char * ticket, size_t len, GTLS_TicketPlain * out,
+    GTLS_TicketScratch * w) {
   const GTLS_TicketKey * key = NULL;
-  unsigned char plain[GTLS_TICKET_PLAIN_MAX];
-  unsigned char aad[AAD_MAX];
-  GTLS_TicketPlain t;
+  unsigned char * plain;
+  GTLS_TicketPlain * t;
   size_t i;
   size_t n;
   size_t at = 0;
@@ -174,7 +181,7 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
   GSEC_Result opened;
   GTLS_Result result = GTLS_ERR_MISMATCH;
 
-  if (ticket == NULL || out == NULL || len < GTLS_TICKET_MIN || len > GTLS_TICKET_MAX) {
+  if (ticket == NULL || out == NULL || w == NULL || len < GTLS_TICKET_MIN || len > GTLS_TICKET_MAX) {
     return GTLS_ERR_MISMATCH;
   }
   for (i = 0; keys != NULL && i < count; i++) {
@@ -187,67 +194,70 @@ GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
   if (key == NULL) {
     return GTLS_ERR_MISMATCH;
   }
+  plain = w->plain;
+  t = &w->decoded;
   n = len - GTLS_TICKET_KEY_NAME_LEN - GTLS_TICKET_NONCE_LEN - GTLS_TICKET_TAG_LEN;
   /* The name the ticket carries is authenticated, whichever key was found by it. */
-  aad_len = build_aad(aad, ticket, ticket + GTLS_TICKET_KEY_NAME_LEN);
+  aad_len = build_aad(w->aad, ticket, ticket + GTLS_TICKET_KEY_NAME_LEN);
   opened = gsec_aes_gcm_decrypt(key->key, GTLS_TICKET_KEY_LEN,
-      ticket + GTLS_TICKET_KEY_NAME_LEN, GTLS_TICKET_NONCE_LEN, aad, aad_len,
+      ticket + GTLS_TICKET_KEY_NAME_LEN, GTLS_TICKET_NONCE_LEN, w->aad, aad_len,
       ticket + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN, n, plain,
       ticket + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN + n, GTLS_TICKET_TAG_LEN);
   if (opened != GSEC_OK) {
-    (void)gsec_wipe(plain, sizeof plain);
-    return GTLS_ERR_MISMATCH;
+    goto done; /* the primitive wiped the plaintext of a tag that failed */
   }
   /* Decode strictly: the sealer wrote it, but a key shared with another
    * version of this code, or another program, would still have to be read
-   * with the bounds checked. */
-  memset(&t, 0, sizeof t);
-  if (n < 1u + 2u + 1u) {
-    goto done;
-  }
+   * with the bounds checked. The work area is longer than any state by more
+   * than the most a read can run on (a length byte of 255, twice), and is
+   * zero past what was decrypted, so a state that is cut short is read to the
+   * end of its fields and the cursor ends up past n. The exact-length test at
+   * the end then refuses it, as it refuses one with bytes after its last
+   * field: that one test is the whole check, and the cursor never has to be
+   * compared with n anywhere else (a guard before each read would be refused
+   * twice, and no test could tell the first from the second). */
+  memset(t, 0, sizeof *t);
   version = plain[at++];
   if (version != GTLS_TICKET_STATE_VERSION && version != GTLS_TICKET_STATE_VERSION_EARLY) {
     goto done;
   }
-  t.suite = ((uint32_t)plain[at] << 8) | plain[at + 1u];
+  t->suite = ((uint32_t)plain[at] << 8) | plain[at + 1u];
   at += 2;
-  t.psk_len = plain[at++];
-  if (gtls_suite_hash(t.suite) == GTLS_HASH_NONE ||
-      t.psk_len != gtls_hash_len(gtls_suite_hash(t.suite)) ||
-      n - at < t.psk_len + 4u + 8u + 4u + 1u) {
+  t->psk_len = plain[at++];
+  if (gtls_suite_hash(t->suite) == GTLS_HASH_NONE ||
+      t->psk_len != gtls_hash_len(gtls_suite_hash(t->suite))) {
     goto done;
   }
-  memcpy(t.psk, plain + at, t.psk_len);
-  at += t.psk_len;
-  t.age_add = get32(plain + at);
+  memcpy(t->psk, plain + at, t->psk_len);
+  at += t->psk_len;
+  t->age_add = get32(plain + at);
   at += 4;
-  t.issued = get64(plain + at);
+  t->issued = get64(plain + at);
   at += 8;
-  t.lifetime = get32(plain + at);
+  t->lifetime = get32(plain + at);
   at += 4;
   if (version == GTLS_TICKET_STATE_VERSION_EARLY) {
-    if (n - at < 4u + 1u) {
-      goto done;
-    }
-    t.max_early_data = get32(plain + at);
+    t->max_early_data = get32(plain + at);
     at += 4;
   }
-  t.alpn_len = plain[at++];
-  if (t.lifetime > GTLS_TICKET_LIFETIME_MAX || n - at < t.alpn_len + 1u) {
+  t->alpn_len = plain[at++];
+  if (t->lifetime > GTLS_TICKET_LIFETIME_MAX) {
     goto done;
   }
-  memcpy(t.alpn, plain + at, t.alpn_len);
-  at += t.alpn_len;
-  t.sni_len = plain[at++];
-  if (n - at != t.sni_len) {
+  memcpy(t->alpn, plain + at, t->alpn_len);
+  at += t->alpn_len;
+  t->sni_len = plain[at++];
+  if (n - at != t->sni_len) {
     goto done;
   }
-  memcpy(t.sni, plain + at, t.sni_len);
-  *out = t;
+  memcpy(t->sni, plain + at, t->sni_len);
+  *out = *t;
   result = GTLS_OK;
 done:
-  (void)gsec_wipe(plain, sizeof plain);
-  (void)gsec_wipe(&t, sizeof t);
+  /* The one place the work area is wiped, on every path out. */
+  (void)gsec_wipe(w->plain, sizeof w->plain);
+  (void)gsec_wipe(w->aad, sizeof w->aad);
+  (void)gsec_wipe(&w->decoded, sizeof w->decoded);
   return result;
 }
 

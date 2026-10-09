@@ -66,37 +66,39 @@ GTLS_Result gtls_record_keys_from_raw(GTLS_RecordKeys * k, uint32_t suite,
 
 GTLS_Result gtls_record_keys_from_secret(GTLS_RecordKeys * k, uint32_t suite,
     const void * traffic_secret, uint64_t limit) {
-  unsigned char key[GTLS_KEY_MAX];
-  unsigned char iv[GTLS_IV_LEN];
   GTLS_Result result;
 
   if (k == NULL || traffic_secret == NULL) {
     return GTLS_ERR_INVALID;
   }
-  result = gtls_traffic_keys(suite, traffic_secret, key, iv);
-  if (result == GTLS_OK) {
-    result = gtls_record_keys_from_raw(k, suite, key, iv, limit);
+  /* The key and IV are derived straight into the structure that keeps them:
+   * there is no temporary to wipe. */
+  memset(k, 0, sizeof *k);
+  result = gtls_traffic_keys(suite, traffic_secret, k->key, k->iv);
+  if (result != GTLS_OK) {
+    return result; /* k is zero, and gtls_traffic_keys wipes what it wrote */
   }
-  (void)gsec_wipe(key, sizeof key);
-  (void)gsec_wipe(iv, sizeof iv);
-  return result;
+  k->suite = suite;
+  k->seq = 0;
+  k->limit = resolve_limit(limit);
+  k->active = 1;
+  return GTLS_OK;
 }
 
 GTLS_Result gtls_record_next_secret(uint32_t suite, const void * secret,
-    void * out) {
+    void * out, unsigned char * tmp) {
   GTLS_Hash hash = gtls_suite_hash(suite);
-  unsigned char next[GTLS_HASH_MAX];
   GTLS_Result result;
 
-  if (hash == GTLS_HASH_NONE || secret == NULL || out == NULL) {
+  if (hash == GTLS_HASH_NONE || secret == NULL || out == NULL || tmp == NULL) {
     return GTLS_ERR_INVALID;
   }
   result = gtls_hkdf_expand_label(hash, secret, gtls_hash_len(hash),
-      "traffic upd", NULL, 0, next, gtls_hash_len(hash));
+      "traffic upd", NULL, 0, tmp, gtls_hash_len(hash));
   if (result == GTLS_OK) {
-    memcpy(out, next, gtls_hash_len(hash));
+    memcpy(out, tmp, gtls_hash_len(hash));
   }
-  (void)gsec_wipe(next, sizeof next);
+  (void)gsec_wipe(tmp, GTLS_HASH_MAX);
   return result;
 }
 
@@ -170,14 +172,11 @@ GTLS_Result gtls_record_plain(unsigned type, unsigned version, const void * pt,
 
 GTLS_Result gtls_record_seal(GTLS_RecordKeys * k, unsigned inner_type,
     const void * pt, size_t pt_len, size_t padding, GTLS_Buf * out) {
-  /* The inner plaintext, then the tag; the header is built beside them. */
-  unsigned char inner[GTLS_RECORD_PLAIN_MAX + 256u];
-  unsigned char nonce[GTLS_IV_LEN];
-  unsigned char header[GTLS_RECORD_HEADER];
-  unsigned char tag[GTLS_RECORD_TAG];
+  unsigned char * rec;
   size_t inner_len;
   size_t cipher_len;
-  size_t mark;
+  size_t total;
+  size_t want;
   GTLS_Result result;
 
   if (k == NULL || out == NULL || !k->active || (pt == NULL && pt_len != 0) ||
@@ -196,43 +195,54 @@ GTLS_Result gtls_record_seal(GTLS_RecordKeys * k, unsigned inner_type,
   }
   inner_len = pt_len + 1u + padding;
   cipher_len = inner_len + GTLS_RECORD_TAG;
-  if (GTLS_RECORD_HEADER + cipher_len > out->max - out->len) {
+  total = GTLS_RECORD_HEADER + cipher_len;
+  if (total > out->max - out->len) {
     return GTLS_ERR_LIMIT;
   }
-  if (pt_len != 0) {
-    memcpy(inner, pt, pt_len);
-  }
-  inner[pt_len] = (unsigned char)inner_type;
-  memset(inner + pt_len + 1u, 0, padding);
-  header[0] = GTLS_CT_APPLICATION_DATA;
-  header[1] = 0x03;
-  header[2] = 0x03;
-  header[3] = (unsigned char)(cipher_len >> 8);
-  header[4] = (unsigned char)cipher_len;
-  build_nonce(k, nonce);
-  result = aead_seal(k, nonce, header, inner, inner_len, inner, tag);
-  if (result == GTLS_OK) {
-    mark = out->len;
-    (void)gtls_buf_append(out, header, sizeof header);
-    (void)gtls_buf_append(out, inner, inner_len);
-    (void)gtls_buf_append(out, tag, sizeof tag);
-    if (out->err != GTLS_OK) {
-      result = out->err;
-      out->len = mark;
-      out->err = GTLS_OK;
-    } else {
-      k->seq++;
+  /* Room for the whole record at once, with the growth doubling: a buffer
+   * that grew a piece at a time would leave the plaintext in the blocks it
+   * left behind. */
+  want = out->len + total;
+  if (want > out->cap) {
+    size_t doubled = out->cap > out->max / 2u ? out->max : out->cap * 2u;
+
+    if (doubled > want) {
+      want = doubled;
+    }
+    result = gtls_buf_reserve(out, want);
+    if (result != GTLS_OK) {
+      out->err = GTLS_OK; /* the buffer is as it was */
+      return result;
     }
   }
-  (void)gsec_wipe(inner, inner_len);
-  (void)gsec_wipe(nonce, sizeof nonce);
+  rec = out->data + out->len;
+  rec[0] = GTLS_CT_APPLICATION_DATA;
+  rec[1] = 0x03;
+  rec[2] = 0x03;
+  rec[3] = (unsigned char)(cipher_len >> 8);
+  rec[4] = (unsigned char)cipher_len;
+  if (pt_len != 0) {
+    memcpy(rec + GTLS_RECORD_HEADER, pt, pt_len);
+  }
+  rec[GTLS_RECORD_HEADER + pt_len] = (unsigned char)inner_type;
+  memset(rec + GTLS_RECORD_HEADER + pt_len + 1u, 0, padding);
+  build_nonce(k, k->nonce);
+  result = aead_seal(k, k->nonce, rec, rec + GTLS_RECORD_HEADER, inner_len,
+      rec + GTLS_RECORD_HEADER, rec + GTLS_RECORD_HEADER + inner_len);
+  (void)gsec_wipe(k->nonce, sizeof k->nonce);
+  if (result == GTLS_OK) {
+    out->len += total;
+    k->seq++;
+  }
+  /* A sealing that failed (the cipher refuses only a key or nonce this code
+   * did not make) leaves its input in out's spare room, which is wiped with
+   * the buffer. */
   return result;
 }
 
 GTLS_Result gtls_record_open(GTLS_RecordKeys * k, const unsigned char * header,
     const unsigned char * ct, size_t ct_len, size_t max_padding,
     unsigned char * pt, size_t * pt_len, unsigned * inner_type) {
-  unsigned char nonce[GTLS_IV_LEN];
   size_t body;
   size_t i;
   size_t pad;
@@ -254,9 +264,9 @@ GTLS_Result gtls_record_open(GTLS_RecordKeys * k, const unsigned char * header,
     return GTLS_ERR_LIMIT;
   }
   body = ct_len - GTLS_RECORD_TAG;
-  build_nonce(k, nonce);
-  result = aead_open(k, nonce, header, ct, body, pt, ct + body);
-  (void)gsec_wipe(nonce, sizeof nonce);
+  build_nonce(k, k->nonce);
+  result = aead_open(k, k->nonce, header, ct, body, pt, ct + body);
+  (void)gsec_wipe(k->nonce, sizeof k->nonce);
   if (result != GTLS_OK) {
     (void)gsec_wipe(pt, body);
     return result;

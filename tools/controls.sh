@@ -51,7 +51,7 @@ start=$(date +%s)
 # memory checker sees.
 plants() {
   cat <<'PLANTS'
-finished	src/schedule/schedule.c	return same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same);	return GTLS_OK;	testNegative
+finished	src/schedule/schedule.c	        : (same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same));	        : GTLS_OK;	testNegative
 certificate-verify	src/client/client.c	if (verdict != GCERT_OK) {	if (verdict != GCERT_OK \&\& 0) {	testNegative
 downgrade	src/client/client.c	if (len >= 34u \&\& gtls_msg_downgrade_sentinel(body + 2) != 0) {	if (0) {	testNegative
 host	src/client/verify.c	return GTLS_ERR_CERT_HOST;	return GTLS_OK;	testNegative
@@ -81,7 +81,7 @@ key-update-limit	src/client/stream.c	if (c->sec.wr.seq + 1u >= c->sec.wr.limit) 
 bad-record-mac-alert	src/client/stream.c	return gtls_conn_fail(c, result, GTLS_ALERT_BAD_RECORD_MAC);	return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	testStream
 server-alpn-overlap	src/server/server.c	if (c->alpn_selected_len == 0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,	if (0) {\n      return gtls_conn_fail(c, GTLS_ERR_ALPN,	testServer
 server-sni-match	src/server/server.c	return plen == hlen \&\& names_equal(pat, host, plen);	return 1;	testServer
-server-client-finished	src/server/server.c	result = gtls_finished_check(hash, c->sec.schedule.c_hs, th, got, hlen);	result = GTLS_OK;	testServer
+server-client-finished	src/server/server.c	result = gtls_finished_check(hash, c->sec.schedule.c_hs, c->scratch.th, got, hlen,\n        \&c->scratch.mac);	result = GTLS_OK;	testServer
 server-second-retry	src/server/server.c	/* The retry would need another retry, which RFC 8446 does not allow. */\n      return gtls_conn_unexpected(c);	/* The retry would need another retry, which RFC 8446 does not allow. */\n      return gtls_conn_illegal(c);	testServer
 server-version	src/server/server.c	if (!tls13) {	if (0) {	testServer
 server-scheme-fits	src/server/server.c	gcert_key_scheme_fits((GCERT_SigScheme)s, id->key_kind)	(id->key_kind \|\| 1)	testServer
@@ -117,7 +117,7 @@ seal-padding-wrap	src/record/record.c	padding > GTLS_RECORD_PLAIN_MAX + 256u - G
 signer-length	src/server/server.c	if (result == GTLS_OK \&\& (*sig_len == 0 \|\| *sig_len > GCERT_SIG_MAX)) {	if (0) {	testEdges
 handshake-key-limit	src/client/stream.c	epoch == GTLS_EPOCH_APPLICATION ? c->limits.max_records_per_key : 0	c->limits.max_records_per_key	testEdges
 wire-room	src/client/client.c	2u * (size_t)c->limits.max_output_bytes + 4096u + GTLS_RECORD_HEADER +\n          GTLS_RECORD_CIPHER_MAX);	2u * (size_t)c->limits.max_output_bytes + 4096u);	testEdges
-oom-in-flight	src/server/server.c	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	    (void)gsec_wipe(k->ecdhe, sizeof k->ecdhe);\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
+oom-in-flight	src/server/server.c	  if (result != GTLS_OK) {\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  result = gtls_transcript_snapshot(\&c->sec.transcript, hash, k->th);\n  if (result == GTLS_OK) {\n    result = resumed	  if (result != GTLS_OK) {\n    return c->state == GTLS_STATE_FAILED ? result\n        : gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  result = gtls_transcript_snapshot(\&c->sec.transcript, hash, k->th);\n  if (result == GTLS_OK) {\n    result = resumed	testAlloc
 oom-in-record-buffer	src/client/stream.c	      *consumed = pos;\n      return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);	      *consumed = pos;\n      return gtls_conn_fail(c, GTLS_ERR_INTERNAL, GTLS_ALERT_INTERNAL_ERROR);	testAlloc
 psk-last	src/server/server.c	if (ch->exts[ch->ext_count - 1u].type != GTLS_EXT_PRE_SHARED_KEY) {	if (0) {	testPsk
 psk-modes-present	src/server/server.c	if (modes == NULL) {\n      return missing(c);	if (modes == NULL) {\n      return gtls_conn_illegal(c);	testPsk
@@ -149,29 +149,29 @@ early-data-needs-psk	src/server/server.c	    if (o.early_data \&\& o.psk) {	    
 early-limit-resolve	src/core/core.c	  GTLS_RESOLVE_ZERO(max_early_skip_bytes)\n	  (void)0;\n	testPsk
 early-skip-only-mismatch	src/client/stream.c	if (result == GTLS_ERR_MISMATCH \&\& c->early_skip	if (result != GTLS_OK \&\& c->early_skip	testPsk
 early-skip-header-type	src/client/stream.c	!(c->early_skip \&\& type == GTLS_CT_APPLICATION_DATA)	!c->early_skip	testPsk
-early-skip-seq-advance	src/client/stream.c	(void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	c->sec.rd.seq++;\n      (void)gsec_wipe(scratch, sizeof scratch);\n      return skip_early(c, blen);	testPsk
+early-skip-seq-advance	src/client/stream.c	      return skip_early(c, blen);\n    }\n    if (result == GTLS_ERR_MISMATCH \&\& c->state == GTLS_STATE_S_WAIT_EOED \&\&	      c->sec.rd.seq++;\n      return skip_early(c, blen);\n    }\n    if (result == GTLS_ERR_MISMATCH \&\& c->state == GTLS_STATE_S_WAIT_EOED \&\&	testPsk
 early-skip-pending-fragment	src/client/stream.c	and early data is not that. */\n    return gtls_conn_unexpected(c);	and early data is not that. */\n    (void)0;	testPsk
-binder-check	src/server/server.c	result = gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	result = GTLS_OK; (void)gtls_binder_check(hash, r->plain.psk, r->plain.psk_len, th, en->binder,	testResume
-binder-compare	src/schedule/schedule.c	return same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same);	return GTLS_OK;	testTicket
+binder-check	src/server/server.c	    result = gtls_binder_check(hash,	    result = GTLS_OK; (void)gtls_binder_check(hash,	testResume
+binder-compare	src/schedule/schedule.c	        : (same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same));	        : GTLS_OK;	testTicket
 binder-length	src/schedule/schedule.c	if (got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	if (0 \&\& got_len != hlen) {\n    return GTLS_ERR_MISMATCH;	testResume
-binder-transcript	src/server/server.c	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc, th);	result = gtls_binder_transcript(\&c->sec.transcript, msg, o->psk_trunc - 1u, th);	testResume
+binder-transcript	src/server/server.c	o->psk_trunc, c->scratch.th);	o->psk_trunc - 1u, c->scratch.th);	testResume
 ticket-key-name	src/session/ticket.c	gsec_equal(keys[i].name, ticket, GTLS_TICKET_KEY_NAME_LEN) == GSEC_OK) {	1) {	testTicket
 ticket-key-expiry	src/session/ticket.c	if (now < keys[i].not_after \&\&	if ((now < keys[i].not_after \|\| 1) \&\&	testTicket
 ticket-sealing-newest	src/session/ticket.c	(best == NULL \|\| keys[i].not_before > best->not_before)	(best == NULL)	testTicket
 ticket-sealing-window	src/session/ticket.c	if (keys[i].not_before <= now \&\& now < keys[i].not_after \&\&	if (now < keys[i].not_after \&\&	testTicket
 ticket-state-version	src/session/ticket.c	  if (version != GTLS_TICKET_STATE_VERSION \&\& version != GTLS_TICKET_STATE_VERSION_EARLY) {	  if (0) {	testTicket
-ticket-state-lifetime	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at < t.alpn_len + 1u) {	if (n - at < t.alpn_len + 1u) {	testTicket
-ticket-state-exact	src/session/ticket.c	if (n - at != t.sni_len) {	if (n - at < t.sni_len) {	testTicket
+ticket-state-lifetime	src/session/ticket.c	  if (t->lifetime > GTLS_TICKET_LIFETIME_MAX) {	  if (0) {	testTicket
+ticket-state-exact	src/session/ticket.c	if (n - at != t->sni_len) {	if (n - at < t->sni_len) {	testTicket
 ticket-fresh-lifetime	src/session/ticket.c	if (elapsed_s >= p->lifetime) {	if (0) {	testTicket
 ticket-fresh-window	src/session/ticket.c	return diff <= (int64_t)window_ms;	return diff <= (int64_t)window_ms \|\| 1;	testTicket
 ticket-fresh-age-add	src/session/ticket.c	client_ms = (int64_t)(uint32_t)(obfuscated_age - p->age_add);	client_ms = (int64_t)obfuscated_age;	testTicket
 ticket-fresh-future	src/session/ticket.c	if (elapsed_s > GTLS_TICKET_AGE_WINDOW_MAX) {	if (0) {	testTicket
 ticket-fresh-lifetime-max	src/session/ticket.c	if (p->lifetime > GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	if (0) {\n    return 0;	testTicket
-resume-sni	src/server/server.c	t.sni_len == o->host.len \&\& names_equal(t.sni, o->host.p, t.sni_len) \&\&	1 \&\&	testResume
-resume-alpn	src/server/server.c	(t.alpn_len == 0 \|\| offered_alpn(o, t.alpn, t.alpn_len));	1;	testResume
-resume-suite-context	src/server/server.c	offered_suite(o, t.suite) \&\& context_suite(x, t.suite) \&\&	offered_suite(o, t.suite) \&\& 1 \&\&	testResume
-resume-suite-offered	src/server/server.c	good = offered_suite(o, t.suite) \&\& context_suite(x, t.suite) \&\&	good = 1 \&\& context_suite(x, t.suite) \&\&	testResume
-resume-fresh	src/server/server.c	gtls_ticket_fresh(\&t, now, en->age, x->ticket_age_window * 1000u) \&\&	1 \&\&	testResume
+resume-sni	src/server/server.c	t->sni_len == o->host.len \&\& names_equal(t->sni, o->host.p, t->sni_len) \&\&	1 \&\&	testResume
+resume-alpn	src/server/server.c	(t->alpn_len == 0 \|\| offered_alpn(o, t->alpn, t->alpn_len));	1;	testResume
+resume-suite-context	src/server/server.c	offered_suite(o, t->suite) \&\& context_suite(x, t->suite) \&\&	offered_suite(o, t->suite) \&\& 1 \&\&	testResume
+resume-suite-offered	src/server/server.c	good = offered_suite(o, t->suite) \&\& context_suite(x, t->suite) \&\&	good = 1 \&\& context_suite(x, t->suite) \&\&	testResume
+resume-fresh	src/server/server.c	gtls_ticket_fresh(t, now, en->age, x->ticket_age_window * 1000u) \&\&	1 \&\&	testResume
 resume-dhe	src/server/server.c	if (!o->psk \|\| !o->psk_dhe \|\| x->ticket_key_count == 0) {	if (!o->psk \|\| x->ticket_key_count == 0) {	testResume
 resume-retry-suite	src/server/server.c	if (second \&\& r->active \&\& r->plain.suite != (uint32_t)c->suite) {	if (0) {	testResume
 resume-suite-choice	src/server/server.c	} else if (r->active) {\n    c->suite = (GTLS_Suite)r->plain.suite;	} else if (0) {\n    c->suite = (GTLS_Suite)r->plain.suite;	testResume
@@ -179,11 +179,11 @@ resume-needs-no-scheme	src/server/server.c	if (c->scheme == 0 \&\& !r->active) {
 resume-no-certificate	src/server/server.c	if (!resumed) {\n    result = send_authentication	if (1) {\n    result = send_authentication	testResume
 resume-selects-psk	src/server/server.c	sp.psk = resumed;	sp.psk = 0;	testResume
 resume-early-secret	src/server/server.c	result = resumed ? gtls_schedule_early_psk(	result = 0 ? gtls_schedule_early_psk(	testResume
-ticket-resumption-secret-server	src/server/server.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
+ticket-resumption-secret-server	src/server/server.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->scratch.th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
 ticket-nonce	src/server/server.c	unsigned char nonce = (unsigned char)i;	unsigned char nonce = 0;	testResume
 ticket-count	src/server/server.c	for (i = 0; i < x->ticket_count; i++) {	for (i = 0; i < x->ticket_count + 1u; i++) {	testResume
-ticket-lifetime-sent	src/server/server.c	t.lifetime = p.lifetime;	t.lifetime = 0;	testResume
-ticket-age-add-sent	src/server/server.c	t.age_add = p.age_add;	t.age_add = 0;	testResume
+ticket-lifetime-sent	src/server/server.c	t.lifetime = p->lifetime;	t.lifetime = 0;	testResume
+ticket-age-add-sent	src/server/server.c	t.age_add = p->age_add;	t.age_add = 0;	testResume
 client-binder	src/client/client.c	result = patch_binder(c, \&empty, \&c->hello);	result = GTLS_OK;	testResume
 client-binder-retry	src/client/client.c	result = patch_binder(c, \&c->sec.transcript, \&h2);	result = GTLS_OK;	testResume
 client-retry-hash	src/client/client.c	if (hash == gtls_suite_hash(c->offer->suite)) {	if (1) {	testResume
@@ -193,7 +193,7 @@ client-psk-hash	src/client/client.c	gtls_suite_hash(sh.suite) != offered_hash(c)
 client-skips-certificate	src/client/client.c	c->state = c->resumed ? GTLS_STATE_WAIT_FIN : GTLS_STATE_WAIT_CERT;	c->state = GTLS_STATE_WAIT_CERT;	testResume
 client-lifetime-zero	src/client/client.c	if (t.lifetime == 0) {	if (0) {	testResume
 client-lifetime-cap	src/client/client.c	s->lifetime = t->lifetime < GTLS_TICKET_LIFETIME_MAX ? t->lifetime : GTLS_TICKET_LIFETIME_MAX;	s->lifetime = t->lifetime;	testResume
-ticket-resumption-secret-client	src/client/client.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
+ticket-resumption-secret-client	src/client/client.c	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->scratch.th);	result = gtls_schedule_keep_resumption(\&c->sec.schedule, c->sec.schedule.c_hs);	testResume
 session-host-length	src/session/session.c	session->host_len != c->host_len \|\|	0 \|\|	testResume
 session-host-name	src/session/session.c	!names_match(session->host, c->host, c->host_len)) {	0) {	testResume
 session-suite-offered	src/session/session.c	if (!offered) {	if (!offered \&\& 0) {	testResume
@@ -232,9 +232,8 @@ server-binder-second-hello	src/server/server.c	if (r->active) {\n    result = ve
 ticket-open-len-min-edge	src/session/ticket.c	len < GTLS_TICKET_MIN \|\|	len <= GTLS_TICKET_MIN \|\|	testTicket
 ticket-open-len-max	src/session/ticket.c	len < GTLS_TICKET_MIN \|\| len > GTLS_TICKET_MAX) {	len < GTLS_TICKET_MIN) {	testTicket
 ticket-open-len-max-edge	src/session/ticket.c	len > GTLS_TICKET_MAX) {	len >= GTLS_TICKET_MAX) {	testTicket
-ticket-state-psk-room	src/session/ticket.c	n - at < t.psk_len + 4u + 8u + 4u + 1u	0	testTicket	Ticket.AnAuthenticStateThatEndsTooSoonOrClaimsTooMuchIsRefusedAtEveryLength	valgrind
-ticket-state-psk-len	src/session/ticket.c	t.psk_len != gtls_hash_len(gtls_suite_hash(t.suite)) \|\|	0 \|\|	testTicket
-ticket-state-lifetime-edge	src/session/ticket.c	if (t.lifetime > GTLS_TICKET_LIFETIME_MAX \|\| n - at	if (t.lifetime >= GTLS_TICKET_LIFETIME_MAX \|\| n - at	testTicket
+ticket-state-psk-len	src/session/ticket.c	t->psk_len != gtls_hash_len(gtls_suite_hash(t->suite))	0	testTicket
+ticket-state-lifetime-edge	src/session/ticket.c	if (t->lifetime > GTLS_TICKET_LIFETIME_MAX) {	if (t->lifetime >= GTLS_TICKET_LIFETIME_MAX) {	testTicket
 ticket-fresh-lifetime-edge	src/session/ticket.c	if (p->lifetime > GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	if (p->lifetime >= GTLS_TICKET_LIFETIME_MAX) {\n    return 0;	testTicket
 ticket-fresh-future-edge	src/session/ticket.c	if (elapsed_s > GTLS_TICKET_AGE_WINDOW_MAX) {	if (elapsed_s >= GTLS_TICKET_AGE_WINDOW_MAX) {	testTicket
 ticket-fresh-future-sign	src/session/ticket.c	server_ms = -(int64_t)(elapsed_s * 1000u);	server_ms = (int64_t)(elapsed_s * 1000u);	testTicket
@@ -263,13 +262,12 @@ early-msg-ee-empty	src/msg/msg.c	    if (e->len != 0) {\n      return GTLS_ERR_C
 early-msg-ee-build	src/msg/msg.c	  if (p->early_data) {\n    ext_begin(out, GTLS_EXT_EARLY_DATA, \&at);\n    gtls_buf_end(out, at, 2);\n  }\n  gtls_buf_end(out, ext_at, 2);\n  return finish_message(out, start);\n}\n\nGTLS_Result gtls_msg_build_certificate(	  gtls_buf_end(out, ext_at, 2);\n  return finish_message(out, start);\n}\n\nGTLS_Result gtls_msg_build_certificate(	testEarly	EarlyKat.*
 early-msg-eoed-body	src/msg/msg.c	  (void)body;\n  return len == 0 ? GTLS_OK : GTLS_ERR_CORRUPT;	  (void)body;\n  (void)len;\n  return GTLS_OK;	testEarly	EarlyKat.*
 ticket-v2-written	src/session/ticket.c	  plain[n++] = (unsigned char)(p->max_early_data != 0 ? GTLS_TICKET_STATE_VERSION_EARLY\n                                                     : GTLS_TICKET_STATE_VERSION);	  plain[n++] = (unsigned char)GTLS_TICKET_STATE_VERSION;	testTicket	Ticket.*
-ticket-v2-allowance-read	src/session/ticket.c	    t.max_early_data = get32(plain + at);\n    at += 4;	    at += 4;	testTicket	Ticket.*
-ticket-v2-room	src/session/ticket.c	    if (n - at < 4u + 1u) {\n      goto done;\n    }\n		testTicket	Ticket.AVersionTwoStateWithOnlyAFewBytes*	valgrind
+ticket-v2-allowance-read	src/session/ticket.c	    t->max_early_data = get32(plain + at);\n    at += 4;	    at += 4;	testTicket	Ticket.*
 context-early-pair	src/client/context.c	(config->max_early_data != 0) != (config->anti_replay != NULL))) {	0)) {	testEarly	EarlyContext.*
 context-early-limit	src/client/context.c	if (config->max_early_data > c->limits.max_early_data_bytes \|\|	if (config->max_early_data > c->limits.max_early_data_bytes + 1u \|\|	testEarly	EarlyContext.*
 context-client-replay	src/client/context.c	if (config->role == GTLS_ROLE_CLIENT \&\& config->anti_replay != NULL) {	if (0) {	testEarly	EarlyContext.*
-early-accept-offered	src/server/server.c	  if (!o->early_data \|\| !r->active \|\| r->index != 0 \|\| c->retried \|\|	  if (!r->active \|\| r->index != 0 \|\| c->retried \|\|	testEarly	EarlyRejected.*
-early-accept-allowance	src/server/server.c	x->anti_replay == NULL \|\| r->plain.max_early_data == 0 \|\|	x->anti_replay == NULL \|\|	testEarly	EarlyRejected.*
+early-accept-offered	src/server/server.c	  if (!o->early_data \|\| r->index != 0 \|\| x->anti_replay == NULL \|\|	  if (r->index != 0 \|\| x->anti_replay == NULL \|\|	testEarly	EarlyRejected.*
+early-accept-allowance	src/server/server.c	x->anti_replay == NULL \|\|\n      r->plain.max_early_data == 0 \|\|	x->anti_replay == NULL \|\|	testEarly	EarlyRejected.*
 early-accept-alpn-len	src/server/server.c	      r->plain.alpn_len != c->alpn_selected_len \|\|\n      gsec_equal(	      gsec_equal(	testEarly	EarlyRejected.*
 early-accept-alpn-bytes	src/server/server.c	      gsec_equal(r->plain.alpn, c->alpn_selected, c->alpn_selected_len) != GSEC_OK) {	      0) {	testEarly	EarlyRejected.*
 early-accept-verdict	src/server/server.c	  return verdict == 1;	  return verdict != 0;	testEarly	EarlyRejected.*
@@ -284,7 +282,7 @@ early-server-ee	src/server/server.c	  ee.early_data = early;	  ee.early_data = 0
 early-server-secret	src/server/server.c	  if (result == GTLS_OK \&\& early) {\n    result = gtls_schedule_early_traffic(\&c->sec.schedule, k->th_ch);\n  }\n		testEarly	Early.*
 early-server-transcript	src/server/server.c	    result = gtls_transcript_snapshot(\&c->sec.transcript, hash, k->th_ch);	    result = GTLS_OK;	testEarly	Early.*
 early-server-state	src/server/server.c	  c->state = early \&\& !c->context->omit_end_of_early_data ? GTLS_STATE_S_WAIT_EOED\n                                                           : GTLS_STATE_S_WAIT_FIN;	  (void)early;\n  c->state = GTLS_STATE_S_WAIT_FIN;	testEarly	EarlyEnd.*
-early-eoed-state	src/server/server.c	  c->state = GTLS_STATE_S_WAIT_FIN;\n  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished(	testEarly	EarlyEnd.*
+early-eoed-state	src/server/server.c	  c->state = GTLS_STATE_S_WAIT_FIN;\n  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished_inner(	  return GTLS_OK;\n}\n\nstatic GTLS_Result on_client_finished_inner(	testEarly	EarlyEnd.*
 early-eoed-transcript	src/server/server.c	  result = gtls_transcript_update(\&c->sec.transcript, msg, msg_len);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  /* The early key has done its work: nothing is read under it again. */	  result = GTLS_OK;\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  /* The early key has done its work: nothing is read under it again. */	testEarly	Early.*
 early-eoed-parse	src/server/server.c	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }	  GTLS_Result result = gtls_msg_parse_end_of_early_data(msg + 4, msg_len - 4u);\n\n  (void)result;	testEarly	EarlyEnd.*
 early-eoed-type	src/server/server.c	    case GTLS_STATE_S_WAIT_EOED:\n      if (type != GTLS_HS_END_OF_EARLY_DATA) {\n        return gtls_conn_unexpected(c);\n      }\n	    case GTLS_STATE_S_WAIT_EOED:\n	testEarly	EarlyEnd.*
@@ -300,7 +298,7 @@ early-offer-context	src/client/client.c	  p_early = c->offer != NULL \&\& c->off
 early-offer-allowance	src/client/client.c	  p_early = c->offer != NULL \&\& c->offer->max_early_data != 0 \&\&\n      c->context->max_early_data != 0;	  p_early = c->offer != NULL \&\& c->context->max_early_data != 0;	testEarly	EarlyContext.*:EarlyRejected.*
 early-client-cap	src/client/client.c	  c->early_max = o->max_early_data < c->context->max_early_data\n      ? o->max_early_data : c->context->max_early_data;	  c->early_max = o->max_early_data;	testEarly	EarlyClient.*
 early-client-reserve	src/client/client.c	  result = gtls_buf_reserve(\&c->early_sent, c->early_max);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n		testWipe	WipeEarly.*
-early-client-th	src/client/client.c	  result = gtls_transcript_snapshot(\&c->sec.transcript, hash, th);\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	  memset(th, 0, sizeof th);\n  result = GTLS_OK;\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	testEarly	Early.*
+early-client-th	src/client/client.c	  result = gtls_transcript_snapshot(\&c->sec.transcript, hash, c->scratch.th);\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	  memset(c->scratch.th, 0, sizeof c->scratch.th);\n  result = GTLS_OK;\n  if (result == GTLS_OK) {\n    result = gtls_schedule_early_psk(	testEarly	Early.*
 early-client-hrr	src/client/client.c	  if (c->early_status == GTLS_EARLY_PENDING) {\n    /* The second ClientHello offers none	  if (0) {\n    /* The second ClientHello offers none	testEarly	EarlyClient.*
 early-client-no-psk	src/client/client.c	  } else if (c->early_status == GTLS_EARLY_PENDING) {\n    reject_early(c);	  } else if (0) {\n    reject_early(c);	testEarly	EarlyClient.*
 early-client-unoffered	src/client/client.c	  if (ee.has_early_data \&\& c->early_status != GTLS_EARLY_PENDING) {	  if (0) {	testEarly	EarlyClientChecks.*
@@ -308,10 +306,10 @@ early-client-accepts-only-if-told	src/client/client.c	    if (!ee.has_early_data
 early-client-alpn	src/client/client.c	        c->alpn_selected_len != c->early_alpn_len \|\|\n        gsec_equal(c->alpn_selected, c->early_alpn, c->early_alpn_len) != GSEC_OK) {	        0) {	testEarly	EarlyClientChecks.*
 early-client-eoed-queue	src/client/client.c	      result = gtls_conn_queue(c, GTLS_EPOCH_EARLY, eoed.data, eoed.len);	      result = GTLS_OK;	testEarly	Early.*
 early-client-eoed-transcript	src/client/client.c	      result = gtls_transcript_update(\&c->sec.transcript, eoed.data, eoed.len);	      result = GTLS_OK;	testEarly	Early.*
-early-client-resnapshot	src/client/client.c	    if (result == GTLS_OK) {\n      result = gtls_transcript_snapshot(\&c->sec.transcript, hash, th);\n    }\n  }\n  /* The client's Finished is over the transcript through the server's. */	  }\n  /* The client's Finished is over the transcript through the server's. */	testEarly	Early.*
+early-client-resnapshot	src/client/client.c	    if (result == GTLS_OK) {\n      result = gtls_transcript_snapshot(\&c->sec.transcript, hash, c->scratch.th);\n    }\n  }\n  /* The client's Finished is over the transcript through the server's. */	    }\n  /* The client's Finished is over the transcript through the server's. */	testEarly	Early.*
 early-client-suite	src/client/stream.c	      ? (uint32_t)c->early_suite : (uint32_t)c->suite;	      ? (uint32_t)c->suite : (uint32_t)c->suite;	testEarly	Early.*
-early-issue-allowance	src/server/server.c	      p.max_early_data = x->max_early_data;	      p.max_early_data = 0;	testEarly	Early.*
-early-issue-extension	src/server/server.c	      t.early_data = p.max_early_data != 0;	      t.early_data = 0;	testEarly	Early.*
+early-issue-allowance	src/server/server.c	p->max_early_data = x->max_early_data;	p->max_early_data = 0;	testEarly	Early.*
+early-issue-extension	src/server/server.c	t.early_data = p->max_early_data != 0;	t.early_data = 0;	testEarly	Early.*
 early-fail-wipe-server	src/client/client.c	    if (c->early_in.data != NULL) {\n      (void)gsec_wipe(c->early_in.data, c->early_in.cap);\n    }\n		testWipe	WipeEarly.*
 early-fail-wipe-client	src/client/client.c	    if (c->early_sent.data != NULL) {\n      (void)gsec_wipe(c->early_sent.data, c->early_sent.cap);\n    }\n		testEarly	EarlyEnd.*
 early-free-wipe	src/client/stream.c	  wipe_buf(\&c->early_in);\n  wipe_buf(\&c->early_sent);\n		testWipe	WipeEarly.*
@@ -319,7 +317,7 @@ early-read-role	src/client/stream.c	  if (c->role != GTLS_ROLE_SERVER \|\| strea
 early-resend-status	src/client/stream.c	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_REJECTED) {	  if (c->role != GTLS_ROLE_CLIENT) {	testEarly	EarlyClient.*
 early-write-limit	src/client/stream.c	  if (len > c->early_max - c->early_used) {	  if (len > c->early_max - c->early_used + 1u) {	testEarly	EarlyClient.*
 early-write-state	src/client/stream.c	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_PENDING \|\|\n      c->state != GTLS_STATE_WAIT_SH) {	  if (c->role != GTLS_ROLE_CLIENT \|\| c->early_status != GTLS_EARLY_PENDING) {	testEarly	EarlyClient.*
-early-accept-first-psk	src/server/server.c	  if (!o->early_data \|\| !r->active \|\| r->index != 0 \|\| c->retried \|\|	  if (!o->early_data \|\| !r->active \|\| c->retried \|\|	testEarly	EarlyRejected.*
+early-accept-first-psk	src/server/server.c	  if (!o->early_data \|\| r->index != 0 \|\| x->anti_replay == NULL \|\|	  if (!o->early_data \|\| x->anti_replay == NULL \|\|	testEarly	EarlyRejected.*
 early-skip-cost	src/client/stream.c	size_t cost = body_len > GTLS_RECORD_TAG + 1u ? body_len - (GTLS_RECORD_TAG + 1u) : 1u;	size_t cost = GTLS_RECORD_HEADER + body_len;	testEarly	EarlyRejected.*
 early-skip-cost-tag	src/client/stream.c	size_t cost = body_len > GTLS_RECORD_TAG + 1u ? body_len - (GTLS_RECORD_TAG + 1u) : 1u;	size_t cost = body_len > GTLS_RECORD_TAG ? body_len - GTLS_RECORD_TAG : 1u;	testPsk	EarlySkip.*
 early-skip-cost-min	src/client/stream.c	body_len - (GTLS_RECORD_TAG + 1u) : 1u;	body_len - (GTLS_RECORD_TAG + 1u) : 0u;	testEarly	EarlyRejected.*
@@ -372,6 +370,47 @@ quic-secret-wipe	src/client/client.c	  if (c->context->omit_end_of_early_data \&
 quic-secret-wipe-early	src/client/client.c	      c->sec.schedule.stage >= 2) {\n    /* Nothing under QUIC	      c->sec.schedule.stage >= 1) {\n    /* Nothing under QUIC	testEarly	QuicNoEndOfEarlyData.*
 quic-no-stream	src/client/stream.c	c->mode == GTLS_MODE_MESSAGE || c->context->omit_end_of_early_data	c->mode == GTLS_MODE_MESSAGE	testEarly	QuicNoEndOfEarlyData.*
 quic-context-copy	src/client/context.c	  c->omit_end_of_early_data = config->omit_end_of_early_data != 0;	  c->omit_end_of_early_data = 0;	testEarly	QuicNoEndOfEarlyData.*
+wipe-client-binder-th	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.binder, sizeof c->scratch.binder);	  (void)gsec_wipe(c->scratch.binder, sizeof c->scratch.binder);	testResume
+wipe-client-binder	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.binder, sizeof c->scratch.binder);	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);	testResume
+wipe-client-early-th	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  c->early_suite	  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);\n  }\n  c->early_suite	testEarly
+wipe-client-hello-ecdhe	src/client/client.c	  (void)gsec_wipe(c->scratch.ecdhe, sizeof c->scratch.ecdhe);\n  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  return result;	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  return result;	testClient
+wipe-client-hello-th	src/client/client.c	  (void)gsec_wipe(c->scratch.ecdhe, sizeof c->scratch.ecdhe);\n  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  return result;	  (void)gsec_wipe(c->scratch.ecdhe, sizeof c->scratch.ecdhe);\n  return result;	testClient
+wipe-client-finished-th	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);\n  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);\n	  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);\n  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);\n	testClient
+wipe-client-finished-verify	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);\n  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);\n	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);\n	testClient
+wipe-client-finished-fin	src/client/client.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);\n  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);\n	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);\n	testClient
+wipe-server-opened-ticket	src/server/server.c	  /* The one place the opened ticket is wiped: a good one is copied into r first. */\n  (void)gsec_wipe(t, sizeof *t);	  /* (planted) */	testResume
+wipe-server-binder-th	src/server/server.c	  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, result == GTLS_ERR_MISMATCH	  if (result != GTLS_OK) {\n    return gtls_conn_fail(c, result, result == GTLS_ERR_MISMATCH	testResume
+wipe-server-flight-ecdhe	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.ecdhe, sizeof c->scratch.flight.ecdhe);\n	  /* planted: no wipe */\n	testServer
+wipe-server-flight-th	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.th, sizeof c->scratch.flight.th);\n	  /* planted: no wipe */\n	testServer
+wipe-server-flight-verify	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.verify, sizeof c->scratch.flight.verify);\n	  /* planted: no wipe */\n	testServer
+wipe-server-flight-content	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.content, sizeof c->scratch.flight.content);\n	  /* planted: no wipe */\n	testServer
+wipe-server-flight-sig	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.sig, sizeof c->scratch.flight.sig);\n	  /* planted: no wipe */\n	testServer
+wipe-server-flight-th-ch	src/server/server.c	  (void)gsec_wipe(c->scratch.flight.th_ch, sizeof c->scratch.flight.th_ch);\n	  /* planted: no wipe */\n	testEarly
+wipe-server-resume	src/server/server.c	  /* The one place what the tickets gave is wiped, on every path out. */\n  (void)gsec_wipe(r, sizeof *r);	  /* (planted) */	testResume
+wipe-server-finished-th	src/server/server.c	  /* The one place the hash is wiped, on every path out. */\n  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);\n	  /* (planted) */\n	testServer
+wipe-server-issue-state	src/server/server.c	    (void)gsec_wipe(p, sizeof *p);\n	  /* planted: no wipe */\n	testResume
+wipe-server-issue-ticket	src/server/server.c	    (void)gsec_wipe(c->scratch.ticket_wire, sizeof c->scratch.ticket_wire);\n	  /* planted: no wipe */\n	testResume
+wipe-server-issue-iv	src/server/server.c	    (void)gsec_wipe(c->scratch.iv, sizeof c->scratch.iv);\n	  /* planted: no wipe */\n	testResume
+wipe-server-issue-age	src/server/server.c	    (void)gsec_wipe(c->scratch.age, sizeof c->scratch.age);\n	  /* planted: no wipe */\n	testResume
+wipe-stream-record	src/client/stream.c	  if (c->rec_scratch != NULL) {\n    (void)gsec_wipe(c->rec_scratch, GTLS_RECORD_CIPHERTEXT_MAX);\n  }\n  return result;	  return result;	testStream
+wipe-stream-eoed-keys	src/client/stream.c	  (void)gsec_wipe(\&c->scratch.keys, sizeof c->scratch.keys);\n  (void)gsec_wipe(c->scratch.secret, sizeof c->scratch.secret);\n	  (void)gsec_wipe(c->scratch.secret, sizeof c->scratch.secret);\n	testEarly	EarlyEnd.*
+wipe-stream-eoed-secret	src/client/stream.c	  (void)gsec_wipe(\&c->scratch.keys, sizeof c->scratch.keys);\n  (void)gsec_wipe(c->scratch.secret, sizeof c->scratch.secret);\n	  (void)gsec_wipe(\&c->scratch.keys, sizeof c->scratch.keys);\n	testEarly	EarlyEnd.*
+wipe-record-next-tmp	src/record/record.c	  (void)gsec_wipe(tmp, GTLS_HASH_MAX);	  (void)tmp;	testRecord
+wipe-record-seal-nonce	src/record/record.c	  (void)gsec_wipe(k->nonce, sizeof k->nonce);\n  if (result == GTLS_OK) {	  if (result == GTLS_OK) {	testStream
+wipe-record-open-nonce	src/record/record.c	  (void)gsec_wipe(k->nonce, sizeof k->nonce);\n  if (result != GTLS_OK) {\n    (void)gsec_wipe(pt, body);	  if (result != GTLS_OK) {\n    (void)gsec_wipe(pt, body);	testStream
+wipe-schedule-derived-hs	src/schedule/schedule.c	  (void)gsec_wipe(s->derived, sizeof s->derived);\n  if (result != GTLS_OK) {\n    gtls_schedule_wipe(s);\n    return result;\n  }\n  s->stage = 2;	  if (result != GTLS_OK) {\n    gtls_schedule_wipe(s);\n    return result;\n  }\n  s->stage = 2;	testClient
+wipe-schedule-derived-master	src/schedule/schedule.c	  (void)gsec_wipe(s->derived, sizeof s->derived);\n  if (result != GTLS_OK) {\n    gtls_schedule_wipe(s);\n    return result;\n  }\n  s->stage = 3;	  if (result != GTLS_OK) {\n    gtls_schedule_wipe(s);\n    return result;\n  }\n  s->stage = 3;	testClient
+wipe-schedule-finished-key	src/schedule/schedule.c	  (void)gsec_wipe(m->fkey, sizeof m->fkey);\n  return result;	  return result;	testSchedule
+wipe-schedule-finished-want	src/schedule/schedule.c	GTLS_ERR_FINISHED : gtls_from_gsec(same));\n  }\n  (void)gsec_wipe(m->want, sizeof m->want);	GTLS_ERR_FINISHED : gtls_from_gsec(same));\n  }	testSchedule
+wipe-schedule-binder-want	src/schedule/schedule.c	GTLS_ERR_MISMATCH : gtls_from_gsec(same));\n  }\n  (void)gsec_wipe(m->want, sizeof m->want);	GTLS_ERR_MISMATCH : gtls_from_gsec(same));\n  }	testResume
+wipe-schedule-binder-early	src/schedule/schedule.c	  gtls_schedule_wipe(\&m->schedule);\n  (void)gsec_wipe(m->bkey, sizeof m->bkey);	  (void)gsec_wipe(m->bkey, sizeof m->bkey);	testResume
+wipe-schedule-binder-key	src/schedule/schedule.c	  gtls_schedule_wipe(\&m->schedule);\n  (void)gsec_wipe(m->bkey, sizeof m->bkey);	  gtls_schedule_wipe(\&m->schedule);	testResume
+wipe-ticket-seal-plain	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  return result;\n}\n\nGTLS_Result gtls_ticket_open(	  (void)gsec_wipe(w->aad, sizeof w->aad);\n  return result;\n}\n\nGTLS_Result gtls_ticket_open(	testTicket
+wipe-ticket-seal-aad	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  return result;\n}\n\nGTLS_Result gtls_ticket_open(	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  return result;\n}\n\nGTLS_Result gtls_ticket_open(	testTicket
+wipe-ticket-open-plain	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	testTicket
+wipe-ticket-open-aad	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	testTicket
+wipe-ticket-open-decoded	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n  (void)gsec_wipe(\&w->decoded, sizeof w->decoded);\n	  (void)gsec_wipe(w->plain, sizeof w->plain);\n  (void)gsec_wipe(w->aad, sizeof w->aad);\n	testTicket
+cert-oom-mapped	src/client/verify.c	    case GCERT_ERR_OOM:\n      return GTLS_ERR_OOM;	    case GCERT_ERR_OOM:\n      return GTLS_ERR_CERT_INVALID;	testAlloc	CertificateAllocation.*
 PLANTS
 }
 

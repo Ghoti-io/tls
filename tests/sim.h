@@ -205,8 +205,9 @@ struct Pki {
 
 struct Trust {
   GCERT_TrustStore * store = nullptr;
-  explicit Trust(const std::vector<Bytes> & anchors) {
-    EXPECT_EQ(gcert_trust_new(nullptr, nullptr, &store), GCERT_OK);
+  /** @p allocator is certificate's: what the chain check allocates, it allocates from this. */
+  explicit Trust(const std::vector<Bytes> & anchors, const GTLS_Allocator * allocator = nullptr) {
+    EXPECT_EQ(gcert_trust_new(allocator, nullptr, &store), GCERT_OK);
     for (const Bytes & a : anchors) {
       EXPECT_EQ(gcert_trust_add_der(store, a.data(), a.size()), GCERT_OK);
     }
@@ -551,7 +552,7 @@ class SimServer {
 
     Bytes fin(gtls_hash_len(hash));
     Bytes ft = th();
-    ASSERT_EQ(gtls_finished_verify_data(hash, sched.s_hs, ft.data(), fin.data()), GTLS_OK);
+    ASSERT_EQ(t_finished_verify_data(hash, sched.s_hs, ft.data(), fin.data()), GTLS_OK);
     if (o.bad_finished) fin[0] ^= 1;
     fin_msg = wrap(GTLS_HS_FINISHED, fin);
     if (o.mut_fin) o.mut_fin(fin_msg);
@@ -559,7 +560,7 @@ class SimServer {
     Bytes t2 = th();
     ASSERT_EQ(gtls_schedule_master(&sched, t2.data()), GTLS_OK);
     Bytes cfin(gtls_hash_len(hash));
-    ASSERT_EQ(gtls_finished_verify_data(hash, sched.c_hs, t2.data(), cfin.data()), GTLS_OK);
+    ASSERT_EQ(t_finished_verify_data(hash, sched.c_hs, t2.data(), cfin.data()), GTLS_OK);
     expected_client_finished = wrap(GTLS_HS_FINISHED, cfin);
     selected = true;
   }
@@ -628,11 +629,14 @@ struct World {
 
   GTLS_Result feed(GTLS_Epoch e, const Bytes & b, size_t chunk = 0) {
     if (chunk == 0 || b.empty()) {
-      return gtls_conn_feed(conn, e, b.data(), b.size(), now);
+      GTLS_Result r = gtls_conn_feed(conn, e, b.data(), b.size(), now);
+      EXPECT_SCRATCH_WIPED(conn);
+      return r;
     }
     for (size_t at = 0; at < b.size(); at += chunk) {
       size_t n = b.size() - at < chunk ? b.size() - at : chunk;
       GTLS_Result r = gtls_conn_feed(conn, e, b.data() + at, n, now);
+      EXPECT_SCRATCH_WIPED(conn);
       if (r != GTLS_OK) {
         return r;
       }

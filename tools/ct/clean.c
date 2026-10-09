@@ -43,6 +43,7 @@ int main(void) {
   unsigned char th[GTLS_HASH_MAX];
   unsigned char good[GTLS_HASH_MAX];
   unsigned char bad[GTLS_HASH_MAX];
+  GTLS_MacScratch m;
   GTLS_Result result;
   size_t hlen = 32;
   int pass;
@@ -52,24 +53,25 @@ int main(void) {
   }
   memset(key, 0xA5, sizeof key);
   memset(th, 0x5A, sizeof th);
+  memset(&m, 0, sizeof m);
   for (pass = 0; pass < 2; pass++) {
     GTLS_Hash hash = pass == 0 ? GTLS_HASH_SHA256 : GTLS_HASH_SHA384;
 
     hlen = gtls_hash_len(hash);
     memset(key, 0xA5, sizeof key);
-    if (gtls_finished_verify_data(hash, key, th, good) != GTLS_OK) {
+    if (gtls_finished_verify_data(hash, key, th, good, &m) != GTLS_OK) {
       return 3;
     }
     memcpy(bad, good, hlen);
     bad[hlen - 1u] ^= 1u;
 
     VALGRIND_MAKE_MEM_UNDEFINED(key, hlen);
-    result = gtls_finished_check(hash, key, th, good, hlen);
+    result = gtls_finished_check(hash, key, th, good, hlen, &m);
     if (result != GTLS_OK) {
       return 4;
     }
     VALGRIND_MAKE_MEM_UNDEFINED(key, hlen);
-    result = gtls_finished_check(hash, key, th, bad, hlen);
+    result = gtls_finished_check(hash, key, th, bad, hlen, &m);
     if (result != GTLS_ERR_FINISHED) {
       return 5;
     }
@@ -78,7 +80,7 @@ int main(void) {
     memcpy(bad, good, hlen);
     bad[0] ^= 1u;
     VALGRIND_MAKE_MEM_UNDEFINED(key, hlen);
-    result = gtls_finished_check(hash, key, th, bad, hlen);
+    result = gtls_finished_check(hash, key, th, bad, hlen, &m);
     if (result != GTLS_ERR_FINISHED) {
       return 6;
     }
@@ -88,23 +90,23 @@ int main(void) {
       unsigned char psk[GTLS_HASH_MAX];
 
       memset(psk, 0x3C, sizeof psk);
-      if (gtls_binder_compute(hash, psk, hlen, th, good) != GTLS_OK) {
+      if (gtls_binder_compute(hash, psk, hlen, th, good, &m) != GTLS_OK) {
         return 7;
       }
       VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
-      if (gtls_binder_check(hash, psk, hlen, th, good, hlen) != GTLS_OK) {
+      if (gtls_binder_check(hash, psk, hlen, th, good, hlen, &m) != GTLS_OK) {
         return 8;
       }
       memcpy(bad, good, hlen);
       bad[hlen - 1u] ^= 1u;
       VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
-      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen) != GTLS_ERR_MISMATCH) {
+      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen, &m) != GTLS_ERR_MISMATCH) {
         return 9;
       }
       memcpy(bad, good, hlen);
       bad[0] ^= 1u;
       VALGRIND_MAKE_MEM_UNDEFINED(psk, hlen);
-      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen) != GTLS_ERR_MISMATCH) {
+      if (gtls_binder_check(hash, psk, hlen, th, bad, hlen, &m) != GTLS_ERR_MISMATCH) {
         return 10;
       }
     }

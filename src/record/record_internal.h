@@ -71,6 +71,8 @@ typedef struct GTLS_RecordKeys {
   unsigned char iv[GTLS_IV_LEN];
   uint64_t seq;                    /* records protected under this key so far */
   uint64_t limit;                  /* a record with seq at or past this is refused */
+  /** Work area: the per-record nonce (the IV xor the counter). Zero between calls, which a test checks. */
+  unsigned char nonce[GTLS_IV_LEN];
 } GTLS_RecordKeys;
 
 /**
@@ -91,14 +93,19 @@ void gtls_record_keys_wipe(GTLS_RecordKeys * k);
 /**
  * The traffic secret that follows @p secret (section 7.2):
  * HKDF-Expand-Label(secret, "traffic upd", "", Hash.length). @p out is one
- * digest of the suite's hash and may be @p secret.
+ * digest of the suite's hash and may be @p secret. @p tmp is
+ * ::GTLS_HASH_MAX bytes of work area the caller owns, left zero.
  */
 GTLS_Result gtls_record_next_secret(uint32_t suite, const void * secret,
-    void * out);
+    void * out, unsigned char * tmp);
 
 /**
  * Append one protected record to @p out: the header, then the AEAD sealing
  * of `pt || inner_type || padding zeros`, with the header as additional data.
+ *
+ * The plaintext is copied into @p out and sealed there, in place: it is never
+ * anywhere else, so there is no second copy to wipe, and a failure wipes the
+ * space it used.
  *
  * @param padding Zero bytes to add inside the record. The connection always
  *   passes 0 (nothing here sends padding); the tests pass more.

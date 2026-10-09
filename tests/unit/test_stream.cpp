@@ -120,6 +120,7 @@ Bytes take(GTLS_Conn * c) {
 GTLS_Result give(GTLS_Conn * c, const Bytes & b, size_t * used = nullptr, int64_t now = kNow) {
   size_t u = 0;
   GTLS_Result r = gtls_conn_stream_feed(c, b.data(), b.size(), now, &u);
+  EXPECT_SCRATCH_WIPED(c);
   if (used != nullptr) {
     *used = u;
   }
@@ -1013,7 +1014,7 @@ TEST(KeyUpdate, TheKeyReallyChangesAndTheOldOneIsGone) {
   EXPECT_NE(old_key, new_key);
   EXPECT_NE(old_secret, new_secret);
   Bytes next(32);
-  ASSERT_EQ(gtls_record_next_secret(gtls_conn_suite(p.c.conn), old_secret.data(), next.data()), GTLS_OK);
+  ASSERT_EQ(t_record_next_secret(gtls_conn_suite(p.c.conn), old_secret.data(), next.data()), GTLS_OK);
   EXPECT_EQ(new_secret, next);
   EXPECT_EQ(Bytes(p.s.conn->sec.rd_secret, p.s.conn->sec.rd_secret + 32), next)
       << "the server's read side followed";

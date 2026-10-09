@@ -139,6 +139,61 @@ typedef struct GTLS_Secrets {
   unsigned char wr_secret[GTLS_HASH_MAX];
 } GTLS_Secrets;
 
+/** The bytes CertificateVerify signs fit this: 64 spaces, a context string, a zero byte and a hash. */
+#define GTLS_CV_CONTENT_MAX (64u + 34u + 1u + GTLS_HASH_MAX)
+
+/** What a good ticket gave a server: the state it held and which identity of the offer it was. */
+typedef struct GTLS_Resume {
+  int active;
+  size_t index;
+  GTLS_TicketPlain plain;
+} GTLS_Resume;
+
+/** Everything the server's flight derives that must not outlive it. */
+typedef struct GTLS_FlightScratch {
+  unsigned char ecdhe[GTLS_KX_MAX];
+  unsigned char th[GTLS_HASH_MAX];
+  unsigned char verify[GTLS_HASH_MAX];
+  unsigned char content[GTLS_CV_CONTENT_MAX];
+  unsigned char sig[GCERT_SIG_MAX];
+  unsigned char th_ch[GTLS_HASH_MAX];   /* the transcript through the ClientHello, for the early secret */
+} GTLS_FlightScratch;
+
+/**
+ * The temporaries that hold or derive a secret, kept in the connection instead
+ * of on the stack. A secret on the stack cannot be looked at once the function
+ * has returned (what a scan of the stack finds is mostly the callees' own
+ * copies), so a wipe of one could be removed and no test would notice. These
+ * can: every function that uses a member wipes it on every path out of it, and
+ * the tests ask ::gtls_conn_scratch_is_wiped after every call into a connection,
+ * a failing one included. ::gtls_conn_fail does not wipe them for the
+ * function: a wipe that only a failure's blanket would have made is not seen.
+ *
+ * What remains on the stack is public (hello parameters, key shares, a
+ * hash of nothing), a hash state over handshake bytes, or inside a primitive
+ * of `security`; design.md section "What is wiped, and what can be seen" lists them.
+ */
+typedef struct GTLS_Scratch {
+  unsigned char th[GTLS_HASH_MAX];            /* a transcript hash */
+  unsigned char binder[GTLS_HASH_MAX];        /* a binder this end computed */
+  unsigned char verify[GTLS_HASH_MAX];        /* a Finished this end computed */
+  unsigned char fin[4 + GTLS_HASH_MAX];       /* ... as the message */
+  unsigned char ecdhe[GTLS_KX_MAX];           /* the (EC)DHE shared secret */
+  unsigned char content[GTLS_CV_CONTENT_MAX]; /* what CertificateVerify covers */
+  unsigned char next[GTLS_HASH_MAX];          /* the traffic secret a key update is making */
+  unsigned char secret[GTLS_HASH_MAX];        /* a traffic secret copied to derive keys for one look */
+  GTLS_RecordKeys keys;                       /* ... and the keys they gave */
+  GTLS_MacScratch mac;                        /* finished and binder keys, the expected MAC */
+  GTLS_TicketScratch ticket;                  /* sealing and opening a ticket */
+  GTLS_Resume resume;                         /* server: what the offered tickets gave */
+  GTLS_TicketPlain opened;                    /* server: one ticket, opened */
+  GTLS_TicketPlain issue;                     /* server: the state of a ticket being issued */
+  unsigned char ticket_wire[GTLS_TICKET_MAX]; /* ... and the ticket made */
+  unsigned char iv[GTLS_TICKET_NONCE_LEN];    /* ... its nonce */
+  unsigned char age[4];                       /* ... its age_add, as drawn */
+  GTLS_FlightScratch flight;                  /* server: the flight */
+} GTLS_Scratch;
+
 typedef GTLS_Result (*GTLS_RandomFn)(void * user, void * out, size_t n);
 typedef GTLS_Result (*GTLS_ChainFn)(void * user, const GTLS_Conn * conn,
     const GTLS_CertificateMsg * certificate, int64_t unix_time);
@@ -193,6 +248,8 @@ struct GTLS_Conn {
   unsigned tickets;
 
   GTLS_Secrets sec;
+  GTLS_Scratch scratch;       /* see GTLS_Scratch; zero between calls */
+  unsigned char * rec_scratch; /* stream: a record's plaintext, GTLS_RECORD_CIPHERTEXT_MAX bytes, allocated when first needed and zero between records */
 
   unsigned char alpn_selected[255];
   size_t alpn_selected_len;
@@ -286,7 +343,6 @@ GTLS_Epoch gtls_conn_expected_epoch(GTLS_State state);
 /** 1 for a scheme TLS 1.3 allows in CertificateVerify, which has no PKCS#1 and no SHA-1. */
 int gtls_cv_scheme_ok(unsigned scheme);
 
-#define GTLS_CV_CONTENT_MAX (64u + 34u + 1u + GTLS_HASH_MAX)
 size_t gtls_cv_content(int server, const void * th, size_t hlen,
     unsigned char * out);
 
@@ -375,8 +431,15 @@ typedef enum GTLS_SecretId {
 GTLS_Result gtls_conn_debug_secret(const GTLS_Conn * conn, GTLS_SecretId id,
     void * out, size_t cap, size_t * len);
 
-/** 1 when every byte of the connection's secrets is zero. */
+/** 1 when every byte of the connection's secrets is zero, and of its scratch (see GTLS_Scratch). */
 int gtls_conn_secrets_are_wiped(const GTLS_Conn * conn);
+
+/**
+ * 1 when the connection's scratch is zero: what it is between any two calls
+ * into the connection, whether the first succeeded or not (it is not the
+ * secrets, which a live connection holds). The tests ask after every call.
+ */
+int gtls_conn_scratch_is_wiped(const GTLS_Conn * conn);
 
 /** The transcript hash so far, under the connection's hash. */
 GTLS_Result gtls_conn_debug_transcript(const GTLS_Conn * conn, void * out,

@@ -229,11 +229,13 @@ struct Pair {
    */
   size_t carry(Endpoint & from, Endpoint & to, size_t chunk) {
     Bytes out = stream_out(from.conn);
+    EXPECT_SCRATCH_WIPED(from.conn);
     size_t at = 0;
     while (at < out.size()) {
       size_t n = chunk == 0 ? out.size() - at : std::min(chunk, out.size() - at);
       size_t used = 0;
       GTLS_Result r = gtls_conn_stream_feed(to.conn, out.data() + at, n, now, &used);
+      EXPECT_SCRATCH_WIPED(to.conn);
       if (r != GTLS_OK && to.feed_result == GTLS_OK) {
         to.feed_result = r;
       }
@@ -329,6 +331,7 @@ struct MessagePair : Pair {
           for (size_t at = 0; at < b.size(); at += chunk == 0 ? b.size() : chunk) {
             size_t n = chunk == 0 ? b.size() : std::min(chunk, b.size() - at);
             GTLS_Result r = gtls_conn_feed(to.conn, static_cast<GTLS_Epoch>(e), b.data() + at, n, now);
+            EXPECT_SCRATCH_WIPED(to.conn);
             if (r != GTLS_OK && to.feed_result == GTLS_OK) {
               to.feed_result = r;
             }

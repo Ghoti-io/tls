@@ -137,7 +137,7 @@ TEST_P(ScheduleTrace, FinishedForBothSidesOverTheRfcsHashes) {
   /* verify_data for a known base key and a chosen hash: HMAC(finished_key, h)
    * with finished_key from the RFC's "expanded" value. */
   Bytes th(32, 0x42);
-  ASSERT_EQ(gtls_finished_verify_data(GTLS_HASH_SHA256,
+  ASSERT_EQ(gtlstest::t_finished_verify_data(GTLS_HASH_SHA256,
                 v["server.calculate-finished-tls13-finished.prk"].data(), th.data(),
                 out.data()),
       GTLS_OK);
@@ -147,7 +147,7 @@ TEST_P(ScheduleTrace, FinishedForBothSidesOverTheRfcsHashes) {
                 th.data(), 32, want.data()),
       GSEC_OK);
   EXPECT_EQ(out, want) << "finished_key is what the RFC prints";
-  ASSERT_EQ(gtls_finished_verify_data(GTLS_HASH_SHA256,
+  ASSERT_EQ(gtlstest::t_finished_verify_data(GTLS_HASH_SHA256,
                 v["client.calculate-finished-tls13-finished.prk"].data(), th.data(),
                 out.data()),
       GTLS_OK);
@@ -327,22 +327,22 @@ TEST(Finished, CheckAcceptsTheRightValueAndRefusesEveryOneByteChange) {
   const Bytes base = v["server.calculate-finished-tls13-finished.prk"];
   Bytes th(32, 0x11);
   Bytes good(32);
-  ASSERT_EQ(gtls_finished_verify_data(GTLS_HASH_SHA256, base.data(), th.data(), good.data()),
+  ASSERT_EQ(gtlstest::t_finished_verify_data(GTLS_HASH_SHA256, base.data(), th.data(), good.data()),
       GTLS_OK);
-  EXPECT_EQ(gtls_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 32),
+  EXPECT_EQ(gtlstest::t_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 32),
       GTLS_OK);
   for (size_t i = 0; i < 32; i++) {
     Bytes bad = good;
     bad[i] ^= 0x80;
-    EXPECT_EQ(gtls_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), bad.data(), 32),
+    EXPECT_EQ(gtlstest::t_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), bad.data(), 32),
         GTLS_ERR_FINISHED) << "byte " << i;
   }
-  EXPECT_EQ(gtls_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 31),
+  EXPECT_EQ(gtlstest::t_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 31),
       GTLS_ERR_FINISHED);
-  EXPECT_EQ(gtls_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 33),
+  EXPECT_EQ(gtlstest::t_finished_check(GTLS_HASH_SHA256, base.data(), th.data(), good.data(), 33),
       GTLS_ERR_FINISHED);
   Bytes other(32, 0x12);
-  EXPECT_EQ(gtls_finished_check(GTLS_HASH_SHA256, base.data(), other.data(), good.data(), 32),
+  EXPECT_EQ(gtlstest::t_finished_check(GTLS_HASH_SHA256, base.data(), other.data(), good.data(), 32),
       GTLS_ERR_FINISHED) << "the transcript hash is part of the MAC";
 }
 

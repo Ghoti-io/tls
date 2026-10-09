@@ -358,8 +358,7 @@ GTLS_Result gtls_schedule_early_traffic(GTLS_Schedule * s,
 
 GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
     size_t ecdhe_len, const void * th_server_hello) {
-  unsigned char derived[GTLS_HASH_MAX];
-  unsigned char empty[GTLS_HASH_MAX];
+  unsigned char empty[GTLS_HASH_MAX]; /* the hash of nothing: public */
   GTLS_Result result;
 
   if (s == NULL || s->stage != 1 || ecdhe == NULL || ecdhe_len == 0 ||
@@ -369,10 +368,10 @@ GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
   result = empty_hash(s->hash, empty);
   if (result == GTLS_OK) {
     result = gtls_derive_secret(s->hash, s->early, s->hlen, "derived", empty,
-        derived);
+        s->derived);
   }
   if (result == GTLS_OK) {
-    result = gtls_from_gsec(gsec_hkdf_extract(hkdf_id(s->hash), derived,
+    result = gtls_from_gsec(gsec_hkdf_extract(hkdf_id(s->hash), s->derived,
         s->hlen, ecdhe, ecdhe_len, s->handshake));
   }
   if (result == GTLS_OK) {
@@ -383,7 +382,7 @@ GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
     result = gtls_derive_secret(s->hash, s->handshake, s->hlen, "s hs traffic",
         th_server_hello, s->s_hs);
   }
-  (void)gsec_wipe(derived, sizeof derived);
+  (void)gsec_wipe(s->derived, sizeof s->derived);
   if (result != GTLS_OK) {
     gtls_schedule_wipe(s);
     return result;
@@ -394,9 +393,8 @@ GTLS_Result gtls_schedule_handshake(GTLS_Schedule * s, const void * ecdhe,
 
 GTLS_Result gtls_schedule_master(GTLS_Schedule * s,
     const void * th_server_finished) {
-  unsigned char derived[GTLS_HASH_MAX];
-  unsigned char empty[GTLS_HASH_MAX];
-  unsigned char zeros[GTLS_HASH_MAX];
+  unsigned char empty[GTLS_HASH_MAX]; /* the hash of nothing: public */
+  unsigned char zeros[GTLS_HASH_MAX]; /* the IKM of the Master Secret: all zero by definition */
   GTLS_Result result;
 
   if (s == NULL || s->stage != 2 || th_server_finished == NULL) {
@@ -406,10 +404,10 @@ GTLS_Result gtls_schedule_master(GTLS_Schedule * s,
   result = empty_hash(s->hash, empty);
   if (result == GTLS_OK) {
     result = gtls_derive_secret(s->hash, s->handshake, s->hlen, "derived",
-        empty, derived);
+        empty, s->derived);
   }
   if (result == GTLS_OK) {
-    result = gtls_from_gsec(gsec_hkdf_extract(hkdf_id(s->hash), derived,
+    result = gtls_from_gsec(gsec_hkdf_extract(hkdf_id(s->hash), s->derived,
         s->hlen, zeros, s->hlen, s->master));
   }
   if (result == GTLS_OK) {
@@ -420,7 +418,7 @@ GTLS_Result gtls_schedule_master(GTLS_Schedule * s,
     result = gtls_derive_secret(s->hash, s->master, s->hlen, "s ap traffic",
         th_server_finished, s->s_ap);
   }
-  (void)gsec_wipe(derived, sizeof derived);
+  (void)gsec_wipe(s->derived, sizeof s->derived);
   if (result != GTLS_OK) {
     gtls_schedule_wipe(s);
     return result;
@@ -485,54 +483,49 @@ GTLS_Result gtls_schedule_binder_key(const GTLS_Schedule * s, void * out) {
 }
 
 GTLS_Result gtls_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len,
-    const void * th, void * out) {
-  GTLS_Schedule s;
-  unsigned char key[GTLS_HASH_MAX];
+    const void * th, void * out, GTLS_MacScratch * m) {
   GTLS_Result result;
 
-  if (th == NULL || out == NULL) {
+  if (th == NULL || out == NULL || m == NULL) {
     return GTLS_ERR_INVALID;
   }
-  result = gtls_schedule_early_psk(&s, hash, psk, psk_len);
+  result = gtls_schedule_early_psk(&m->schedule, hash, psk, psk_len);
   if (result != GTLS_OK) {
     return result;
   }
-  result = gtls_schedule_binder_key(&s, key);
+  result = gtls_schedule_binder_key(&m->schedule, m->bkey);
   if (result == GTLS_OK) {
-    result = gtls_finished_verify_data(hash, key, th, out);
+    result = gtls_finished_verify_data(hash, m->bkey, th, out, m);
   }
-  gtls_schedule_wipe(&s);
-  (void)gsec_wipe(key, sizeof key);
+  gtls_schedule_wipe(&m->schedule);
+  (void)gsec_wipe(m->bkey, sizeof m->bkey);
   return result;
 }
 
 GTLS_Result gtls_binder_check(GTLS_Hash hash, const void * psk, size_t psk_len,
-    const void * th, const void * got, size_t got_len) {
-  unsigned char want[GTLS_HASH_MAX];
+    const void * th, const void * got, size_t got_len, GTLS_MacScratch * m) {
   size_t hlen = gtls_hash_len(hash);
   GSEC_Result same;
   GTLS_Result result;
 
-  if (hlen == 0 || got == NULL) {
+  if (hlen == 0 || got == NULL || m == NULL) {
     return GTLS_ERR_INVALID;
   }
   if (got_len != hlen) {
     return GTLS_ERR_MISMATCH;
   }
-  result = gtls_binder_compute(hash, psk, psk_len, th, want);
-  if (result != GTLS_OK) {
-    return result;
-  }
+  result = gtls_binder_compute(hash, psk, psk_len, th, m->want, m);
+  if (result == GTLS_OK) {
 #ifdef GTLS_CT_TEST
-  /* As for Finished: tracking stops at the door of gsec_equal. */
-  VALGRIND_MAKE_MEM_DEFINED(want, hlen);
+    /* As for Finished: tracking stops at the door of gsec_equal. */
+    VALGRIND_MAKE_MEM_DEFINED(m->want, hlen);
 #endif
-  same = gsec_equal(want, got, hlen);
-  (void)gsec_wipe(want, sizeof want);
-  if (same == GSEC_OK) {
-    return GTLS_OK;
+    same = gsec_equal(m->want, got, hlen);
+    result = same == GSEC_OK ? GTLS_OK
+        : (same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same));
   }
-  return same == GSEC_ERR_MISMATCH ? GTLS_ERR_MISMATCH : gtls_from_gsec(same);
+  (void)gsec_wipe(m->want, sizeof m->want);
+  return result;
 }
 
 GTLS_Result gtls_binder_transcript(const GTLS_Transcript * t, const void * trunc,
@@ -559,54 +552,50 @@ void gtls_schedule_wipe(GTLS_Schedule * s) {
 }
 
 GTLS_Result gtls_finished_verify_data(GTLS_Hash hash, const void * base_key,
-    const void * th, void * out) {
-  unsigned char key[GTLS_HASH_MAX];
+    const void * th, void * out, GTLS_MacScratch * m) {
   size_t hlen = gtls_hash_len(hash);
   GTLS_Result result;
 
-  if (hlen == 0 || base_key == NULL || th == NULL || out == NULL) {
+  if (hlen == 0 || base_key == NULL || th == NULL || out == NULL || m == NULL) {
     return GTLS_ERR_INVALID;
   }
   result = gtls_hkdf_expand_label(hash, base_key, hlen, "finished", NULL, 0,
-      key, hlen);
+      m->fkey, hlen);
   if (result == GTLS_OK) {
-    result = gtls_from_gsec(gsec_hmac(hkdf_id(hash), key, hlen, th, hlen, out));
+    result = gtls_from_gsec(gsec_hmac(hkdf_id(hash), m->fkey, hlen, th, hlen, out));
   }
-  (void)gsec_wipe(key, sizeof key);
+  (void)gsec_wipe(m->fkey, sizeof m->fkey);
   return result;
 }
 
 GTLS_Result gtls_finished_check(GTLS_Hash hash, const void * base_key,
-    const void * th, const void * got, size_t got_len) {
-  unsigned char want[GTLS_HASH_MAX];
+    const void * th, const void * got, size_t got_len, GTLS_MacScratch * m) {
   size_t hlen = gtls_hash_len(hash);
   GSEC_Result same;
   GTLS_Result result;
 
-  if (hlen == 0 || got == NULL) {
+  if (hlen == 0 || got == NULL || m == NULL) {
     return GTLS_ERR_INVALID;
   }
   /* The length is public. The bytes are compared without branching on them. */
   if (got_len != hlen) {
     return GTLS_ERR_FINISHED;
   }
-  result = gtls_finished_verify_data(hash, base_key, th, want);
-  if (result != GTLS_OK) {
-    return result;
-  }
+  result = gtls_finished_verify_data(hash, base_key, th, m->want, m);
+  if (result == GTLS_OK) {
 #ifdef GTLS_CT_TEST
-  /* Tracking stops at the door of gsec_equal. Everything up to here, the
-   * label encoding, the HKDF expansion and the HMAC under the poisoned key,
-   * has been watched for a branch or an index that depends on the key. The
-   * comparison itself is gsec_equal's, which security's own check-ct watches
-   * with its own marks; here it would report its verdict branch, which is
-   * the answer and is public. */
-  VALGRIND_MAKE_MEM_DEFINED(want, hlen);
+    /* Tracking stops at the door of gsec_equal. Everything up to here, the
+     * label encoding, the HKDF expansion and the HMAC under the poisoned key,
+     * has been watched for a branch or an index that depends on the key. The
+     * comparison itself is gsec_equal's, which security's own check-ct watches
+     * with its own marks; here it would report its verdict branch, which is
+     * the answer and is public. */
+    VALGRIND_MAKE_MEM_DEFINED(m->want, hlen);
 #endif
-  same = gsec_equal(want, got, hlen);
-  (void)gsec_wipe(want, sizeof want);
-  if (same == GSEC_OK) {
-    return GTLS_OK;
+    same = gsec_equal(m->want, got, hlen);
+    result = same == GSEC_OK ? GTLS_OK
+        : (same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same));
   }
-  return same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same);
+  (void)gsec_wipe(m->want, sizeof m->want);
+  return result;
 }

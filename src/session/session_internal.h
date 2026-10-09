@@ -59,6 +59,9 @@
 /** Smallest ticket this library could have sealed: anything shorter is not one. */
 #define GTLS_TICKET_MIN (GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN + 1u + 2u + 1u + 32u + 4u + 8u + 4u + 1u + 1u + GTLS_TICKET_TAG_LEN)
 
+/** Work area for sealing and opening a ticket; the caller owns it so a test can see it is left zero. */
+#define GTLS_TICKET_AAD_MAX (22u + GTLS_TICKET_KEY_NAME_LEN + GTLS_TICKET_NONCE_LEN)
+
 /** What a ticket holds. */
 typedef struct GTLS_TicketPlain {
   uint32_t suite;
@@ -73,6 +76,19 @@ typedef struct GTLS_TicketPlain {
   unsigned char sni[255];
   size_t sni_len;
 } GTLS_TicketPlain;
+
+/**
+ * The temporaries of ::gtls_ticket_seal and ::gtls_ticket_open: the state in
+ * the clear, the additional data, and the state as it is decoded. The state is
+ * @c GTLS_TICKET_PLAIN_MAX bytes and a ticket's tail is read up to 256 bytes
+ * past its end by the decoder, so the array carries that much slack and is
+ * zero beyond what was decrypted (it is zero between calls).
+ */
+typedef struct GTLS_TicketScratch {
+  unsigned char plain[GTLS_TICKET_PLAIN_MAX + 256u];
+  unsigned char aad[GTLS_TICKET_AAD_MAX];
+  GTLS_TicketPlain decoded;
+} GTLS_TicketScratch;
 
 /**
  * The key that seals at @p now: of the keys valid then, the one whose window
@@ -91,7 +107,7 @@ const GTLS_TicketKey * gtls_ticket_sealing_key(const GTLS_TicketKey * keys,
  */
 GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
     int64_t now, const unsigned char * nonce, const GTLS_TicketPlain * p,
-    unsigned char * out, size_t cap, size_t * out_len);
+    unsigned char * out, size_t cap, size_t * out_len, GTLS_TicketScratch * w);
 
 /**
  * Open a ticket: find the key by its name among those not expired at
@@ -103,7 +119,8 @@ GTLS_Result gtls_ticket_seal(const GTLS_TicketKey * keys, size_t count,
  *   back to a full handshake; nothing here is an attack on the connection.
  */
 GTLS_Result gtls_ticket_open(const GTLS_TicketKey * keys, size_t count,
-    int64_t now, const unsigned char * ticket, size_t len, GTLS_TicketPlain * out);
+    int64_t now, const unsigned char * ticket, size_t len, GTLS_TicketPlain * out,
+    GTLS_TicketScratch * w);
 
 /**
  * 1 when a ticket issued at @p p->issued, presented at @p now with the

@@ -40,13 +40,55 @@ inline unsigned & visited() {
   return mask;
 }
 
-inline void note(const GTLS_Conn * c) {
-  visited() |= 1u << static_cast<unsigned>(gtls_conn_state(c));
-}
-
 inline void die(const char * what) {
   std::fprintf(stderr, "invariant broken: %s\n", what);
   std::abort();
+}
+
+/**
+ * Called after each call into a connection: records the state it reached,
+ * and requires that the call left nothing secret in the connection's scratch,
+ * whatever the input was and however the call ended.
+ */
+inline void note(const GTLS_Conn * c) {
+  visited() |= 1u << static_cast<unsigned>(gtls_conn_state(c));
+  if (!gtls_conn_scratch_is_wiped(c)) {
+    die("a call into a connection left a secret in its scratch");
+  }
+}
+
+/** The ticket calls with a work area that must be zero when they return, however they end. */
+inline bool zero_bytes(const void * p, size_t n) {
+  const unsigned char * b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; i++) {
+    if (b[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline GTLS_Result f_ticket_open(const GTLS_TicketKey * keys, size_t count, int64_t now,
+    const unsigned char * ticket, size_t len, GTLS_TicketPlain * out) {
+  GTLS_TicketScratch w;
+  std::memset(&w, 0, sizeof w);
+  GTLS_Result r = gtls_ticket_open(keys, count, now, ticket, len, out, &w);
+  if (!zero_bytes(&w, sizeof w)) {
+    die("gtls_ticket_open left its work area");
+  }
+  return r;
+}
+
+inline GTLS_Result f_ticket_seal(const GTLS_TicketKey * keys, size_t count, int64_t now,
+    const unsigned char * nonce, const GTLS_TicketPlain * p, unsigned char * out, size_t cap,
+    size_t * out_len) {
+  GTLS_TicketScratch w;
+  std::memset(&w, 0, sizeof w);
+  GTLS_Result r = gtls_ticket_seal(keys, count, now, nonce, p, out, cap, out_len, &w);
+  if (!zero_bytes(&w, sizeof w)) {
+    die("gtls_ticket_seal left its work area");
+  }
+  return r;
 }
 
 inline Bytes from_hex(const std::string & text) {
@@ -1515,13 +1557,13 @@ inline int session_one(const uint8_t * data, size_t size) {
     }
     case 1: {
       GTLS_TicketPlain p;
-      if (gtls_ticket_open(&key, 1, 100, body, len, &p) == GTLS_OK) {
+      if (f_ticket_open(&key, 1, 100, body, len, &p) == GTLS_OK) {
         die("arbitrary bytes opened as a ticket");
       }
       /* The same bytes behind the key's own name, which is the one thing a forger has. */
       Bytes named(key.name, key.name + sizeof key.name);
       named.insert(named.end(), body, body + len);
-      if (gtls_ticket_open(&key, 1, 100, named.data(), named.size(), &p) == GTLS_OK) {
+      if (f_ticket_open(&key, 1, 100, named.data(), named.size(), &p) == GTLS_OK) {
         die("bytes behind a key's name opened as a ticket");
       }
       break;
@@ -1547,11 +1589,11 @@ inline int session_one(const uint8_t * data, size_t size) {
       unsigned char ticket[GTLS_TICKET_MAX];
       size_t n = 0;
       GTLS_TicketPlain back;
-      if (gtls_ticket_seal(&key, 1, 500, nonce, &p, ticket, sizeof ticket, &n) != GTLS_OK ||
+      if (f_ticket_seal(&key, 1, 500, nonce, &p, ticket, sizeof ticket, &n) != GTLS_OK ||
           n > GTLS_TICKET_MAX || n < GTLS_TICKET_MIN) {
         die("a state could not be sealed");
       }
-      if (gtls_ticket_open(&key, 1, 500, ticket, n, &back) != GTLS_OK || back.suite != p.suite ||
+      if (f_ticket_open(&key, 1, 500, ticket, n, &back) != GTLS_OK || back.suite != p.suite ||
           back.psk_len != p.psk_len || std::memcmp(back.psk, p.psk, p.psk_len) != 0 ||
           back.age_add != p.age_add || back.issued != p.issued || back.lifetime != p.lifetime ||
           back.max_early_data != p.max_early_data ||
@@ -1560,7 +1602,7 @@ inline int session_one(const uint8_t * data, size_t size) {
         die("a sealed state does not open to itself");
       }
       ticket[(len * 7u) % n] ^= static_cast<unsigned char>(1u << (opt & 7u));
-      if (gtls_ticket_open(&key, 1, 500, ticket, n, &back) == GTLS_OK) {
+      if (f_ticket_open(&key, 1, 500, ticket, n, &back) == GTLS_OK) {
         die("a ticket with a bit changed opened");
       }
       /* Freshness never throws or loops, whatever the clocks. */

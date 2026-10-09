@@ -150,6 +150,84 @@ struct EmptyTrust {
   ~EmptyTrust() { gcert_trust_free(store); }
 };
 
+/*
+ * The functions that take a work area the caller owns, with one that is checked:
+ * zero going in (a state the library promises between calls) and zero coming
+ * out, whatever the call returned. A wipe taken out of one of them fails here.
+ */
+inline bool all_zero(const void * p, size_t n) {
+  const unsigned char * b = static_cast<const unsigned char *>(p);
+  for (size_t i = 0; i < n; i++) {
+    if (b[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline GTLS_Result t_finished_verify_data(GTLS_Hash hash, const void * base, const void * th, void * out) {
+  GTLS_MacScratch m;
+  std::memset(&m, 0, sizeof m);
+  GTLS_Result r = gtls_finished_verify_data(hash, base, th, out, &m);
+  EXPECT_TRUE(all_zero(&m, sizeof m)) << "gtls_finished_verify_data left its work area";
+  return r;
+}
+
+inline GTLS_Result t_finished_check(GTLS_Hash hash, const void * base, const void * th, const void * got, size_t got_len) {
+  GTLS_MacScratch m;
+  std::memset(&m, 0, sizeof m);
+  GTLS_Result r = gtls_finished_check(hash, base, th, got, got_len, &m);
+  EXPECT_TRUE(all_zero(&m, sizeof m)) << "gtls_finished_check left its work area";
+  return r;
+}
+
+inline GTLS_Result t_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len, const void * th, void * out) {
+  GTLS_MacScratch m;
+  std::memset(&m, 0, sizeof m);
+  GTLS_Result r = gtls_binder_compute(hash, psk, psk_len, th, out, &m);
+  EXPECT_TRUE(all_zero(&m, sizeof m)) << "gtls_binder_compute left its work area";
+  return r;
+}
+
+inline GTLS_Result t_binder_check(GTLS_Hash hash, const void * psk, size_t psk_len, const void * th, const void * got, size_t got_len) {
+  GTLS_MacScratch m;
+  std::memset(&m, 0, sizeof m);
+  GTLS_Result r = gtls_binder_check(hash, psk, psk_len, th, got, got_len, &m);
+  EXPECT_TRUE(all_zero(&m, sizeof m)) << "gtls_binder_check left its work area";
+  return r;
+}
+
+inline GTLS_Result t_record_next_secret(uint32_t suite, const void * secret, void * out) {
+  unsigned char tmp[GTLS_HASH_MAX];
+  std::memset(tmp, 0, sizeof tmp);
+  GTLS_Result r = gtls_record_next_secret(suite, secret, out, tmp);
+  EXPECT_TRUE(all_zero(tmp, sizeof tmp)) << "gtls_record_next_secret left its work area";
+  return r;
+}
+
+inline GTLS_Result t_ticket_open(const GTLS_TicketKey * keys, size_t count, int64_t now,
+    const unsigned char * ticket, size_t len, GTLS_TicketPlain * out) {
+  GTLS_TicketScratch w;
+  std::memset(&w, 0, sizeof w);
+  GTLS_Result r = gtls_ticket_open(keys, count, now, ticket, len, out, &w);
+  EXPECT_TRUE(all_zero(&w, sizeof w)) << "gtls_ticket_open left its work area";
+  return r;
+}
+
+inline GTLS_Result t_ticket_seal(const GTLS_TicketKey * keys, size_t count, int64_t now,
+    const unsigned char * nonce, const GTLS_TicketPlain * p, unsigned char * out, size_t cap,
+    size_t * out_len) {
+  GTLS_TicketScratch w;
+  std::memset(&w, 0, sizeof w);
+  GTLS_Result r = gtls_ticket_seal(keys, count, now, nonce, p, out, cap, out_len, &w);
+  EXPECT_TRUE(all_zero(&w, sizeof w)) << "gtls_ticket_seal left its work area";
+  return r;
+}
+
+/** After any call into a connection, failed or not: nothing secret is left in its scratch. */
+#define EXPECT_SCRATCH_WIPED(conn) \
+  EXPECT_TRUE(gtls_conn_scratch_is_wiped(conn)) << "a connection call left a secret in its scratch"
+
 } /* namespace gtlstest */
 
 #endif /* GHOTI_IO_GTLS_TEST_HELPERS_H */

@@ -1070,7 +1070,9 @@ struct Staged {
   }
   GTLS_Result feed(const Bytes & b) {
     size_t used = 0;
-    return gtls_conn_stream_feed(e.p.s.conn, b.data(), b.size(), e.p.now, &used);
+    GTLS_Result r = gtls_conn_stream_feed(e.p.s.conn, b.data(), b.size(), e.p.now, &used);
+    EXPECT_SCRATCH_WIPED(e.p.s.conn);
+    return r;
   }
   const GTLS_Conn * server() const { return e.p.s.conn; }
 };
@@ -1196,11 +1198,14 @@ struct Ended {
   }
   GTLS_Result feed(const Bytes & b) {
     size_t used = 0;
-    return gtls_conn_stream_feed(e.p.s.conn, b.data(), b.size(), e.p.now, &used);
+    GTLS_Result r = gtls_conn_stream_feed(e.p.s.conn, b.data(), b.size(), e.p.now, &used);
+    EXPECT_SCRATCH_WIPED(e.p.s.conn);
+    return r;
   }
 };
 
 void expect_failed_with(const GTLS_Conn * c, GTLS_Result result, unsigned alert) {
+  EXPECT_SCRATCH_WIPED(c);
   EXPECT_TRUE(gtls_conn_is_failed(c));
   EXPECT_EQ(gtls_conn_failure(c), result);
   EXPECT_EQ(gtls_conn_alert(c), alert);
@@ -1388,7 +1393,9 @@ struct MsgEnded {
     fin = MessagePair::pending(m.c, GTLS_EPOCH_HANDSHAKE);
   }
   GTLS_Result feed(GTLS_Epoch e, const Bytes & b) {
-    return gtls_conn_feed(m.s.conn, e, b.data(), b.size(), m.now);
+    GTLS_Result r = gtls_conn_feed(m.s.conn, e, b.data(), b.size(), m.now);
+    EXPECT_SCRATCH_WIPED(m.s.conn);
+    return r;
   }
 };
 
@@ -1949,7 +1956,7 @@ Bytes two_identity_hello(const Bytes & record, const GTLS_Session * s, bool vali
   EXPECT_EQ(gtls_transcript_init(&t), GTLS_OK);
   EXPECT_EQ(gtls_transcript_select(&t, hash), GTLS_OK);
   EXPECT_EQ(gtls_binder_transcript(&t, out.data(), cut, th), GTLS_OK);
-  EXPECT_EQ(gtls_binder_compute(hash, s->psk, s->psk_len, th, binder), GTLS_OK);
+  EXPECT_EQ(t_binder_compute(hash, s->psk, s->psk_len, th, binder), GTLS_OK);
   gtls_transcript_wipe(&t);
   std::memcpy(out.data() + cut + 2 + 1 + (valid_first ? 0 : 33), binder, 32);
 

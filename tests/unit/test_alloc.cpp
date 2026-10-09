@@ -21,8 +21,13 @@ namespace {
 /** Run one whole handshake with the Nth allocation failing. Returns whether N was reached. */
 bool run_with_failure_at(long n, bool hrr, bool alpn, TestAlloc & alloc, GTLS_Result * result) {
   alloc.count = 0;
-  alloc.fail_at = n;
+  alloc.fail_at = -1;   /* setup is counted but never fails */
   World w;
+  /* The trust store takes its allocator from here, and the chain check allocates
+   * through the store's, so a failure of that sweep reaches inside `certificate`. */
+  w.trust.reset(new Trust({w.pki.root}, &alloc.a));
+  alloc.count = 0;
+  alloc.fail_at = n;
   w.allocator = &alloc.a;
   if (alpn) {
     w.alpn = {"h2"};
@@ -103,6 +108,112 @@ INSTANTIATE_TEST_SUITE_P(Flows, AllocationSweep,
           (std::get<1>(info.param) ? "Alpn" : "NoAlpn");
     });
 
+/* The chain check is `certificate`'s, and what it allocates it allocates from the
+ * trust store's allocator (gcert_chain_build keeps nothing in the library's
+ * default). That is the one door into its allocations from here, and these
+ * tests go through it with an allocator of their own: first that there is
+ * something to fail (a sweep over nothing passes), then that failing each
+ * of them is reported as out-of-memory by a connection that is failed and
+ * wiped, and that nothing is left in either allocator. */
+
+namespace {
+
+struct CertRun {
+  long allocations = 0;     /* certificate's, during the run */
+  GTLS_Result result = GTLS_OK;
+  bool failed = false;
+  bool wiped = false;
+  unsigned alert = 0;
+  long live_lib = 0;
+  long live_cert = 0;
+};
+
+CertRun message_run_failing_cert_at(long n) {
+  CertRun out;
+  TestAlloc cert;
+  TestAlloc lib;
+  {
+    World w;
+    w.trust.reset(new Trust({w.pki.root}, &cert.a));
+    cert.count = 0;
+    cert.fail_at = n;
+    w.allocator = &lib.a;
+    w.build();
+    SimServer s(w.server_options());
+    out.result = w.run(s);
+    out.failed = gtls_conn_is_failed(w.conn);
+    out.wiped = gtls_conn_secrets_are_wiped(w.conn);
+    out.alert = gtls_conn_alert(w.conn);
+    out.allocations = cert.count;
+  }
+  out.live_lib = lib.live;
+  out.live_cert = cert.live;
+  return out;
+}
+
+}  // namespace
+
+TEST(CertificateAllocation, TheChainCheckAllocatesAndFailingEachOfItsAllocationsIsOom) {
+  CertRun clean = message_run_failing_cert_at(-1);
+  ASSERT_EQ(clean.result, GTLS_OK);
+  EXPECT_EQ(clean.live_cert, 0);
+  EXPECT_EQ(clean.live_lib, 0);
+  /* The denominator: with a chain of a leaf and an intermediate the check
+   * makes at least the pool it builds paths from. */
+  ASSERT_GE(clean.allocations, 1) << "no allocation of certificate's was reached, so the sweep below sweeps nothing";
+  ASSERT_LT(clean.allocations, 50);
+  for (long n = 0; n < clean.allocations; n++) {
+    SCOPED_TRACE(n);
+    CertRun r = message_run_failing_cert_at(n);
+    EXPECT_EQ(r.result, GTLS_ERR_OOM) << gtls_result_string(r.result);
+    EXPECT_TRUE(r.failed);
+    EXPECT_TRUE(r.wiped);
+    EXPECT_EQ(r.alert, GTLS_ALERT_INTERNAL_ERROR) << "a failure of memory is ours, not the certificate's";
+    EXPECT_EQ(r.live_cert, 0) << "certificate's allocation leaked";
+    EXPECT_EQ(r.live_lib, 0);
+  }
+  CertRun past = message_run_failing_cert_at(clean.allocations);
+  EXPECT_EQ(past.result, GTLS_OK) << "one past the last allocation fails nothing";
+}
+
+TEST(CertificateAllocation, OverALoopbackTheClientsChainCheckFailsTheSameWay) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  long total = 0;
+  for (long n = -1; n <= total; n++) {
+    SCOPED_TRACE(n);
+    TestAlloc cert;
+    TestAlloc lib;
+    bool connected = false;
+    GTLS_Result client_failure = GTLS_OK;
+    {
+      Pair p(*cred);
+      p.trust.reset(new Trust({cred->root}, &cert.a));
+      cert.count = 0;
+      cert.fail_at = n;
+      p.allocator = &lib.a;
+      ASSERT_EQ(p.build(), GTLS_OK);
+      p.run();
+      connected = p.connected();
+      client_failure = gtls_conn_failure(p.c.conn);
+      if (n < 0) {
+        total = cert.count;
+        ASSERT_GE(total, 1);
+      } else if (n < total) {
+        EXPECT_TRUE(gtls_conn_is_failed(p.c.conn));
+        EXPECT_TRUE(gtls_conn_secrets_are_wiped(p.c.conn));
+      }
+    }
+    if (n >= 0 && n < total) {
+      EXPECT_FALSE(connected);
+      EXPECT_EQ(client_failure, GTLS_ERR_OOM);
+    } else {
+      EXPECT_TRUE(connected);
+    }
+    EXPECT_EQ(cert.live, 0);
+    EXPECT_EQ(lib.live, 0);
+  }
+}
+
 /* The same, for the server role, the record layer and everything the stream
  * interface allocates: both contexts (one with identities), both
  * connections, the handshake, data both ways, a key update, and a close. */
@@ -119,8 +230,12 @@ struct StreamRun {
 StreamRun stream_with_failure_at(long n, TestAlloc & alloc, Cred & cred, bool retry) {
   StreamRun out;
   alloc.count = 0;
-  alloc.fail_at = n;
+  alloc.fail_at = -1;   /* setup is counted but never fails */
   Pair p(cred);
+  /* As above: the chain check's allocations go through the sweep's allocator. */
+  p.trust.reset(new Trust({cred.root}, &alloc.a));
+  alloc.count = 0;
+  alloc.fail_at = n;
   p.allocator = &alloc.a;
   p.calpn = {"h2"};
   p.salpn = {"h2", "http/1.1"};

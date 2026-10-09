@@ -542,7 +542,7 @@ Bytes crafted_hello(const Env & e, const GTLS_Session * session, const GTLS_Suit
     EXPECT_EQ(gtls_transcript_init(&t), GTLS_OK);
     EXPECT_EQ(gtls_transcript_select(&t, hash), GTLS_OK);
     EXPECT_EQ(gtls_binder_transcript(&t, hello.data() + 5, cut - 5, th), GTLS_OK);
-    EXPECT_EQ(gtls_binder_compute(hash, session->psk, session->psk_len, th, binder), GTLS_OK);
+    EXPECT_EQ(t_binder_compute(hash, session->psk, session->psk_len, th, binder), GTLS_OK);
     gtls_transcript_wipe(&t);
     std::memcpy(hello.data() + hello.size() - binder_len, binder, session->psk_len);
   }
@@ -770,7 +770,7 @@ TEST(Resume, ABinderOfTheWrongLengthForTheTicketIsAlsoABadBinder) {
     ASSERT_EQ(gtls_transcript_init(&t), GTLS_OK);
     ASSERT_EQ(gtls_transcript_select(&t, GTLS_HASH_SHA256), GTLS_OK);
     ASSERT_EQ(gtls_binder_transcript(&t, hello.data() + 5, cut - 5, th), GTLS_OK);
-    ASSERT_EQ(gtls_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
+    ASSERT_EQ(t_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
     gtls_transcript_wipe(&t);
     std::memcpy(hello.data() + hello.size() - 48, binder, 32);
     Next m(e);
@@ -791,7 +791,7 @@ TEST(Resume, ABinderOfTheWrongLengthForTheTicketIsAlsoABadBinder) {
     ASSERT_EQ(gtls_transcript_init(&t), GTLS_OK);
     ASSERT_EQ(gtls_transcript_select(&t, GTLS_HASH_SHA256), GTLS_OK);
     ASSERT_EQ(gtls_binder_transcript(&t, good.data() + 5, good.size() - 5 - GTLS_PSK_BINDERS_TAIL(32), th), GTLS_OK);
-    ASSERT_EQ(gtls_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
+    ASSERT_EQ(t_binder_compute(GTLS_HASH_SHA256, h.s->psk, 32, th, binder), GTLS_OK);
     gtls_transcript_wipe(&t);
     std::memcpy(good.data() + good.size() - 32, binder, 32);
     Next k(e);

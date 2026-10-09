@@ -102,7 +102,25 @@ typedef struct GTLS_Schedule {
   int has_res;
   unsigned char c_e[GTLS_HASH_MAX];   /* client_early_traffic_secret, once the ClientHello is in the transcript */
   int has_e;
+  /**
+   * Work area: the "derived" secret that salts the next Extract. It is in the
+   * schedule, not on the stack, so a test can see it is zero when a stage
+   * function returns (and it is wiped with the rest).
+   */
+  unsigned char derived[GTLS_HASH_MAX];
 } GTLS_Schedule;
+
+/**
+ * The temporaries of the MAC computations (a Finished, a binder), kept by the
+ * caller instead of on the stack so a test can look at them when the call
+ * returns. Every function that takes one leaves it zero, on every path.
+ */
+typedef struct GTLS_MacScratch {
+  unsigned char fkey[GTLS_HASH_MAX];  /* the finished key */
+  unsigned char bkey[GTLS_HASH_MAX];  /* a binder's key, from which the finished key is made */
+  unsigned char want[GTLS_HASH_MAX];  /* the MAC a received one is compared with */
+  GTLS_Schedule schedule;             /* a binder's early stage, built from the PSK */
+} GTLS_MacScratch;
 
 /** Begin: Early Secret = HKDF-Extract(0, 0^Hash.length), no PSK. */
 GTLS_Result gtls_schedule_early(GTLS_Schedule * s, GTLS_Hash hash);
@@ -173,11 +191,11 @@ GTLS_Result gtls_schedule_binder_key(const GTLS_Schedule * s, void * out);
 /**
  * The binder for @p psk over @p th, the transcript hash of everything the
  * binder covers (section 4.2.11.2): HMAC(finished_key(binder_key), th).
- * Self-contained: the Early Secret is derived and wiped here. @p out is one
- * digest.
+ * Self-contained: the Early Secret is derived in @p m and wiped there. @p out
+ * is one digest.
  */
 GTLS_Result gtls_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len,
-    const void * th, void * out);
+    const void * th, void * out, GTLS_MacScratch * m);
 
 /**
  * Check a received binder without branching on it. A binder of the wrong
@@ -185,7 +203,7 @@ GTLS_Result gtls_binder_compute(GTLS_Hash hash, const void * psk, size_t psk_len
  * ::GTLS_ERR_MISMATCH too.
  */
 GTLS_Result gtls_binder_check(GTLS_Hash hash, const void * psk, size_t psk_len,
-    const void * th, const void * got, size_t got_len);
+    const void * th, const void * got, size_t got_len, GTLS_MacScratch * m);
 
 /**
  * The transcript hash a binder covers: @p t as it stands with the truncated
@@ -205,7 +223,7 @@ void gtls_schedule_wipe(GTLS_Schedule * s);
  * @p out is one digest.
  */
 GTLS_Result gtls_finished_verify_data(GTLS_Hash hash, const void * base_key,
-    const void * th, void * out);
+    const void * th, void * out, GTLS_MacScratch * m);
 
 /**
  * Check a received verify_data without branching on it.
@@ -214,6 +232,6 @@ GTLS_Result gtls_finished_verify_data(GTLS_Hash hash, const void * base_key,
  *   length, or another failure of the primitives.
  */
 GTLS_Result gtls_finished_check(GTLS_Hash hash, const void * base_key,
-    const void * th, const void * got, size_t got_len);
+    const void * th, const void * got, size_t got_len, GTLS_MacScratch * m);
 
 #endif /* GHOTI_IO_GTLS_SRC_SCHEDULE_SCHEDULE_INTERNAL_H */

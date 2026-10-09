@@ -141,7 +141,7 @@ TEST(Binder, TheBinderKeyAndTheBinderAreTheRfcs) {
   EXPECT_EQ(key, v["client.calculate-psk-binder.prk"]);
   gtls_schedule_wipe(&s);
 
-  ASSERT_EQ(gtls_binder_compute(GTLS_HASH_SHA256, v["client.extract-secret-early.ikm"].data(),
+  ASSERT_EQ(t_binder_compute(GTLS_HASH_SHA256, v["client.extract-secret-early.ikm"].data(),
                 32, th.data(), binder.data()),
       GTLS_OK);
   EXPECT_EQ(binder, v["client.calculate-psk-binder.finished"]);
@@ -163,31 +163,31 @@ TEST(Binder, TheCheckAcceptsTheRfcsAndRefusesEveryFlippedBit) {
   const Bytes th = v["client.calculate-psk-binder.binder-hash"];
   Bytes good = v["client.calculate-psk-binder.finished"];
 
-  ASSERT_EQ(gtls_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 32),
+  ASSERT_EQ(t_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 32),
       GTLS_OK);
   for (size_t byte = 0; byte < good.size(); byte++) {
     for (int bit = 0; bit < 8; bit++) {
       Bytes bad = good;
       bad[byte] ^= static_cast<unsigned char>(1u << bit);
-      ASSERT_EQ(gtls_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), bad.data(), 32),
+      ASSERT_EQ(t_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), bad.data(), 32),
           GTLS_ERR_MISMATCH) << byte << ":" << bit;
     }
   }
-  EXPECT_EQ(gtls_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 31),
+  EXPECT_EQ(t_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 31),
       GTLS_ERR_MISMATCH);
-  EXPECT_EQ(gtls_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 33),
+  EXPECT_EQ(t_binder_check(GTLS_HASH_SHA256, psk.data(), 32, th.data(), good.data(), 33),
       GTLS_ERR_MISMATCH);
   const Bytes th48(48, 1);
   const Bytes got48(48, 2);
-  EXPECT_EQ(gtls_binder_check(GTLS_HASH_SHA384, psk.data(), 32, th48.data(), got48.data(), 48),
+  EXPECT_EQ(t_binder_check(GTLS_HASH_SHA384, psk.data(), 32, th48.data(), got48.data(), 48),
       GTLS_ERR_INVALID) << "a PSK of the wrong hash";
   Bytes other_th = th;
   other_th[0] ^= 1;
-  EXPECT_EQ(gtls_binder_check(GTLS_HASH_SHA256, psk.data(), 32, other_th.data(), good.data(), 32),
+  EXPECT_EQ(t_binder_check(GTLS_HASH_SHA256, psk.data(), 32, other_th.data(), good.data(), 32),
       GTLS_ERR_MISMATCH) << "the binder covers the transcript";
   Bytes other_psk = psk;
   other_psk[31] ^= 1;
-  EXPECT_EQ(gtls_binder_check(GTLS_HASH_SHA256, other_psk.data(), 32, th.data(), good.data(), 32),
+  EXPECT_EQ(t_binder_check(GTLS_HASH_SHA256, other_psk.data(), 32, th.data(), good.data(), 32),
       GTLS_ERR_MISMATCH) << "the binder is under the PSK";
 }
 
@@ -657,11 +657,11 @@ TEST(Ticket, SealedStateComesBackExactlyAndOnlyUnderTheRightKey) {
     size_t n = 0;
     GTLS_TicketPlain back;
 
-    ASSERT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(7).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+    ASSERT_EQ(t_ticket_seal(keys, 1, 500, nonce12(7).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
     EXPECT_EQ(n, 16u + 12u + (1u + 2u + 1u + p.psk_len + 4u + 8u + 4u + 1u + 2u + 1u + 12u) + 16u);
     EXPECT_EQ(Bytes(ticket, ticket + 16), Bytes(keys[0].name, keys[0].name + 16)) << "the name leads";
     EXPECT_EQ(Bytes(ticket + 16, ticket + 28), nonce12(7)) << "then the nonce";
-    ASSERT_EQ(gtls_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
+    ASSERT_EQ(t_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
     EXPECT_EQ(back.suite, p.suite);
     EXPECT_EQ(back.psk_len, p.psk_len);
     EXPECT_EQ(Bytes(back.psk, back.psk + back.psk_len), Bytes(p.psk, p.psk + p.psk_len));
@@ -679,16 +679,16 @@ TEST(Ticket, SealedStateComesBackExactlyAndOnlyUnderTheRightKey) {
       for (int bit = 0; bit < 8; bit += 7) {
         Bytes bad(ticket, ticket + n);
         bad[i] ^= static_cast<unsigned char>(1u << bit);
-        ASSERT_EQ(gtls_ticket_open(keys, 1, 500, bad.data(), bad.size(), &back), GTLS_ERR_MISMATCH)
+        ASSERT_EQ(t_ticket_open(keys, 1, 500, bad.data(), bad.size(), &back), GTLS_ERR_MISMATCH)
             << i << ":" << bit;
       }
     }
-    EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, n - 1, &back), GTLS_ERR_MISMATCH);
-    EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, GTLS_TICKET_MIN - 1, &back), GTLS_ERR_MISMATCH);
+    EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, n - 1, &back), GTLS_ERR_MISMATCH);
+    EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, GTLS_TICKET_MIN - 1, &back), GTLS_ERR_MISMATCH);
     Bytes longer(ticket, ticket + n);
     longer.push_back(0);
-    EXPECT_EQ(gtls_ticket_open(keys, 1, 500, longer.data(), longer.size(), &back), GTLS_ERR_MISMATCH);
-    EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, GTLS_TICKET_MAX + 1, &back), GTLS_ERR_MISMATCH);
+    EXPECT_EQ(t_ticket_open(keys, 1, 500, longer.data(), longer.size(), &back), GTLS_ERR_MISMATCH);
+    EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, GTLS_TICKET_MAX + 1, &back), GTLS_ERR_MISMATCH);
   }
 }
 
@@ -701,22 +701,22 @@ TEST(Ticket, TheKeyIsFoundByNameAndMustNotHaveExpired) {
   size_t n = 0;
   GTLS_TicketPlain back;
 
-  ASSERT_EQ(gtls_ticket_seal(both, 2, 300, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+  ASSERT_EQ(t_ticket_seal(both, 2, 300, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
   EXPECT_EQ(Bytes(ticket, ticket + 16), Bytes(b.name, b.name + 16)) << "the later start seals";
-  EXPECT_EQ(gtls_ticket_open(both, 2, 300, ticket, n, &back), GTLS_OK);
+  EXPECT_EQ(t_ticket_open(both, 2, 300, ticket, n, &back), GTLS_OK);
   const GTLS_TicketKey only_a[] = {a};
-  EXPECT_EQ(gtls_ticket_open(only_a, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH) << "not ours";
+  EXPECT_EQ(t_ticket_open(only_a, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH) << "not ours";
   const GTLS_TicketKey only_b[] = {b};
-  EXPECT_EQ(gtls_ticket_open(only_b, 1, 1999, ticket, n, &back), GTLS_OK);
-  EXPECT_EQ(gtls_ticket_open(only_b, 1, 2000, ticket, n, &back), GTLS_ERR_MISMATCH) << "expired exactly then";
-  EXPECT_EQ(gtls_ticket_open(only_b, 1, 100, ticket, n, &back), GTLS_OK)
+  EXPECT_EQ(t_ticket_open(only_b, 1, 1999, ticket, n, &back), GTLS_OK);
+  EXPECT_EQ(t_ticket_open(only_b, 1, 2000, ticket, n, &back), GTLS_ERR_MISMATCH) << "expired exactly then";
+  EXPECT_EQ(t_ticket_open(only_b, 1, 100, ticket, n, &back), GTLS_OK)
       << "a key that has not begun still opens: it only does not seal";
   const GTLS_TicketKey renamed_key[] = {[]() { GTLS_TicketKey k = key_named(2, 200, 2000); k.key[5] ^= 1; return k; }()};
-  EXPECT_EQ(gtls_ticket_open(renamed_key, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH) << "another key, same name";
+  EXPECT_EQ(t_ticket_open(renamed_key, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH) << "another key, same name";
   const GTLS_TicketKey other_name[] = {[]() { GTLS_TicketKey k = key_named(2, 200, 2000); k.name[0] ^= 1; return k; }()};
-  EXPECT_EQ(gtls_ticket_open(other_name, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH)
+  EXPECT_EQ(t_ticket_open(other_name, 1, 300, ticket, n, &back), GTLS_ERR_MISMATCH)
       << "the same key bytes under another name is not the key that sealed it";
-  EXPECT_EQ(gtls_ticket_open(nullptr, 0, 300, ticket, n, &back), GTLS_ERR_MISMATCH);
+  EXPECT_EQ(t_ticket_open(nullptr, 0, 300, ticket, n, &back), GTLS_ERR_MISMATCH);
 
   /* The sealing key: the newest start that is valid now; none when none is. */
   EXPECT_EQ(gtls_ticket_sealing_key(both, 2, 150), &both[0]);
@@ -728,7 +728,7 @@ TEST(Ticket, TheKeyIsFoundByNameAndMustNotHaveExpired) {
   EXPECT_EQ(gtls_ticket_sealing_key(reversed, 2, 250), &reversed[0]) << "the order of the list does not matter";
   const GTLS_TicketKey tie[] = {key_named(3, 100, 1000), key_named(4, 100, 1000)};
   EXPECT_EQ(gtls_ticket_sealing_key(tie, 2, 500), &tie[0]) << "the first listed among equals";
-  EXPECT_EQ(gtls_ticket_seal(only_a, 1, 5000, nonce12(1).data(), &p, ticket, sizeof ticket, &n),
+  EXPECT_EQ(t_ticket_seal(only_a, 1, 5000, nonce12(1).data(), &p, ticket, sizeof ticket, &n),
       GTLS_ERR_INVALID) << "no valid key, no ticket";
 }
 
@@ -738,33 +738,33 @@ TEST(Ticket, SealingRefusesWhatItCannotEncode) {
   size_t n = 0;
   GTLS_TicketPlain p = plain_for(0x1301);
 
-  EXPECT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, 50, &n), GTLS_ERR_LIMIT);
+  EXPECT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, 50, &n), GTLS_ERR_LIMIT);
   p.psk_len = 31;
-  EXPECT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID)
+  EXPECT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID)
       << "a PSK is a digest long";
   p = plain_for(0x1301);
   p.suite = 0x1234;
-  EXPECT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
+  EXPECT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
   p = plain_for(0x1301);
   p.lifetime = GTLS_TICKET_LIFETIME_MAX + 1;
-  EXPECT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
+  EXPECT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
   p = plain_for(0x1301);
   p.sni_len = 256;
-  EXPECT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
+  EXPECT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_ERR_INVALID);
   p = plain_for(0x1302);
   p.alpn_len = 255;
   p.sni_len = 255;
-  ASSERT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK)
+  ASSERT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK)
       << "the largest state";
   EXPECT_EQ(n, GTLS_TICKET_MAX - 4 - (GTLS_HASH_MAX - 48)) << "a state with no allowance is the one it always was";
   GTLS_TicketPlain back;
-  EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
+  EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
   EXPECT_EQ(back.max_early_data, 0u);
   p.max_early_data = 0xfffffffeu;
-  ASSERT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK)
+  ASSERT_EQ(t_ticket_seal(keys, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &n), GTLS_OK)
       << "the largest state with an allowance";
   EXPECT_EQ(n, GTLS_TICKET_MAX - (GTLS_HASH_MAX - 48)) << "four bytes more";
-  EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
+  EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
   EXPECT_EQ(back.max_early_data, 0xfffffffeu);
 }
 
@@ -820,7 +820,7 @@ TEST(Ticket, AStateTheSealerWouldNotHaveWrittenIsNotOpened) {
     ticket.insert(ticket.end(), ct.begin(), ct.end());
     ticket.insert(ticket.end(), tag.begin(), tag.end());
     GTLS_TicketPlain back;
-    GTLS_Result r = gtls_ticket_open(keys, 1, 500, ticket.data(), ticket.size(), &back);
+    GTLS_Result r = t_ticket_open(keys, 1, 500, ticket.data(), ticket.size(), &back);
     if (std::string(c.what) == "the good one") {
       EXPECT_EQ(r, GTLS_OK) << "the harness builds a real ticket";
     } else {
@@ -881,7 +881,7 @@ GTLS_Result open_bytes(const GTLS_TicketKey & key, const Bytes & ticket, int64_t
   if (!ticket.empty()) {
     std::memcpy(copy.get(), ticket.data(), ticket.size());
   }
-  return gtls_ticket_open(&key, 1, now, copy.get(), ticket.size(), &back);
+  return t_ticket_open(&key, 1, now, copy.get(), ticket.size(), &back);
 }
 
 }  // namespace
@@ -894,14 +894,14 @@ TEST(Ticket, TheEarlyDataAllowanceIsInTheSealedStateAndAStateWithoutOneIsStillTh
   size_t some_len = 0;
   GTLS_TicketPlain back;
 
-  ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &none_len), GTLS_OK);
-  ASSERT_EQ(gtls_ticket_open(&key, 1, 500, ticket, none_len, &back), GTLS_OK);
+  ASSERT_EQ(t_ticket_seal(&key, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &none_len), GTLS_OK);
+  ASSERT_EQ(t_ticket_open(&key, 1, 500, ticket, none_len, &back), GTLS_OK);
   EXPECT_EQ(back.max_early_data, 0u);
   for (uint32_t allowance : {1u, 16384u, 0xffffffffu}) {
     p.max_early_data = allowance;
-    ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &some_len), GTLS_OK);
+    ASSERT_EQ(t_ticket_seal(&key, 1, 500, nonce12(1).data(), &p, ticket, sizeof ticket, &some_len), GTLS_OK);
     EXPECT_EQ(some_len, none_len + 4) << "the allowance is four bytes of the state";
-    ASSERT_EQ(gtls_ticket_open(&key, 1, 500, ticket, some_len, &back), GTLS_OK);
+    ASSERT_EQ(t_ticket_open(&key, 1, 500, ticket, some_len, &back), GTLS_OK);
     EXPECT_EQ(back.max_early_data, allowance);
     EXPECT_EQ(back.age_add, p.age_add) << "and the fields after it did not move";
     EXPECT_EQ(back.alpn_len, p.alpn_len);
@@ -909,7 +909,7 @@ TEST(Ticket, TheEarlyDataAllowanceIsInTheSealedStateAndAStateWithoutOneIsStillTh
   }
   /* The allowance is authenticated with the rest. */
   ticket[some_len - 1] ^= 1;
-  EXPECT_EQ(gtls_ticket_open(&key, 1, 500, ticket, some_len, &back), GTLS_ERR_MISMATCH);
+  EXPECT_EQ(t_ticket_open(&key, 1, 500, ticket, some_len, &back), GTLS_ERR_MISMATCH);
 }
 
 TEST(Ticket, AVersionTwoStateIsRefusedAtEveryLengthShortOfItsEndAndOtherVersionsNot) {
@@ -1007,9 +1007,9 @@ TEST(Ticket, TheLengthBoundsAreExactAndALongTicketIsRefusedBeforeItIsRead) {
     unsigned char ticket[GTLS_TICKET_MAX];
     size_t n = 0;
     GTLS_TicketPlain back;
-    ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+    ASSERT_EQ(t_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
     ASSERT_EQ(n, GTLS_TICKET_MIN);
-    EXPECT_EQ(gtls_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the minimum";
+    EXPECT_EQ(t_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the minimum";
   }
   /* ... and the longest (SHA-384, both strings at 255) does too, and is exactly the maximum. */
   {
@@ -1020,9 +1020,9 @@ TEST(Ticket, TheLengthBoundsAreExactAndALongTicketIsRefusedBeforeItIsRead) {
     size_t n = 0;
     GTLS_TicketPlain back;
     p.max_early_data = 100;   /* with an allowance: the longest state there is */
-    ASSERT_EQ(gtls_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+    ASSERT_EQ(t_ticket_seal(&key, 1, 500, nonce12(2).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
     ASSERT_EQ(n, GTLS_TICKET_MAX);
-    EXPECT_EQ(gtls_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the maximum";
+    EXPECT_EQ(t_ticket_open(&key, 1, 500, ticket, n, &back), GTLS_OK) << "exactly the maximum";
   }
   /* One byte either side, authentic and sealed with the real key, and the same at every length from nothing. */
   const Bytes shortest = state_of(0x1301, "", "");
@@ -1166,13 +1166,13 @@ TEST(Ticket, TheAdditionalDataBindsTheLabelTheNameAndTheNonce) {
   GTLS_TicketPlain p = plain_for(0x1301);
   unsigned char ticket[GTLS_TICKET_MAX];
   size_t n = 0;
-  ASSERT_EQ(gtls_ticket_seal(keys, 1, 500, nonce12(9).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
+  ASSERT_EQ(t_ticket_seal(keys, 1, 500, nonce12(9).data(), &p, ticket, sizeof ticket, &n), GTLS_OK);
   Bytes state(n - 44);
   GTLS_TicketPlain back;
   ASSERT_EQ(gsec_aes_gcm_decrypt(keys[0].key, 32, ticket + 16, 12, nullptr, 0, ticket + 28, state.size(),
                 state.data(), ticket + 28 + state.size(), 16), GSEC_ERR_MISMATCH)
       << "the tag covers more than the ciphertext";
-  EXPECT_EQ(gtls_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
+  EXPECT_EQ(t_ticket_open(keys, 1, 500, ticket, n, &back), GTLS_OK);
 }
 
 TEST(Ticket, AgeAndLifetimeAreMillisecondsThatCannotOverflow) {

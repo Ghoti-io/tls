@@ -441,16 +441,16 @@ TEST(Records, TheNextSecretIsHkdfExpandLabelOfTrafficUpd) {
                   secret.data(), hlen, info.data(), info.size(), want.data(), hlen),
         GSEC_OK);
     Bytes got(hlen);
-    ASSERT_EQ(gtls_record_next_secret(suite, secret.data(), got.data()), GTLS_OK);
+    ASSERT_EQ(t_record_next_secret(suite, secret.data(), got.data()), GTLS_OK);
     EXPECT_EQ(got, want);
     /* in place */
     Bytes inplace = secret;
-    ASSERT_EQ(gtls_record_next_secret(suite, inplace.data(), inplace.data()), GTLS_OK);
+    ASSERT_EQ(t_record_next_secret(suite, inplace.data(), inplace.data()), GTLS_OK);
     EXPECT_EQ(inplace, want);
     EXPECT_NE(got, secret);
   }
   Bytes out(32);
-  EXPECT_EQ(gtls_record_next_secret(static_cast<uint32_t>(0), out.data(), out.data()), GTLS_ERR_INVALID);
+  EXPECT_EQ(t_record_next_secret(static_cast<uint32_t>(0), out.data(), out.data()), GTLS_ERR_INVALID);
 }
 
 TEST(Records, WipingAKeyZeroesEveryByteOfIt) {

@@ -279,7 +279,8 @@ comes) and `gtls_conn_peer_certificate` is empty for it.
 **Wiping.** The PSK and every secret after it live in the connection's secret
 block, wiped on failure and on free; a session is wiped when freed; a failed
 connection frees its sessions and the offer; the ticket's plaintext, the PSK
-on the server's stack and the binder keys are wiped on every path.
+the server holds while it issues and the binder keys are wiped on every path
+(see "What is wiped, and what can be seen").
 
 ## Early data
 
@@ -530,7 +531,9 @@ that struct too. A retried key share wipes the first. `gtls_conn_secret` refuses
 after failure. The comparison of `Finished` is `gsec_equal`; `check-ct` runs
 the code from the key to that call under Valgrind with the key marked
 undefined and requires it silent, and requires a planted branch to be reported.
-`tools/check-secret.py` rejects `memcmp` and `printf` anywhere under `src/`.
+`tools/check-secret.py` rejects `memcmp`, `strcmp`, `printf` and the output calls
+(`puts`, `fputs`, `write`) under `src/`, `include/` and `examples/` (a file under
+`examples/` may waive a name once, with a reason).
 
 Ephemeral private keys are drawn by rejection sampling (zero and values at or
 above the curve order are refused, compared without a branch on the value).
@@ -539,6 +542,50 @@ list (X25519 by default); a server that wants another answers with a
 HelloRetryRequest, whose second ClientHello is the first with the key_share
 replaced, the cookie echoed before psk_key_exchange_modes (or last), and the
 padding recomputed.
+
+## What is wiped, and what can be seen
+
+A wipe that no test can see is a wipe that can be deleted. A secret on the stack
+cannot be looked at once the function has returned (a scan of the stack finds mostly
+the callees' own copies), so the temporaries that hold or derive a secret are not on
+the stack: they are members of an object the caller of the function owns, and a test
+asks whether that object is zero after the call.
+
+- **`GTLS_Scratch`, in the connection**: the transcript hashes, the (EC)DHE shared
+  secret, the binder and Finished this end computed, the keys and traffic secret
+  copied for a look at a record, the next traffic secret of a key update, the server's
+  flight (`ecdhe`, `th`, `verify`, the CertificateVerify content and signature, the
+  hash through the ClientHello), what the opened ticket gave, and the ticket being
+  issued (its state, its wire form, its nonce and `age_add`). **`rec_scratch`**
+  is the plaintext of one record, allocated when the first protected record is read
+  and wiped after each. `gtls_conn_scratch_is_wiped` is true between any two calls
+  into a connection, whether the call failed or not, and `gtls_conn_fail` deliberately
+  does not wipe it: a wipe that only a failure's blanket would have made would not
+  be seen. Every test that drives a connection (the loopback, the simulated server,
+  the stream and message pairs) asks after each call, and so does each fuzzer after
+  each input.
+- **Work areas of the pure functions**, owned by their callers: `GTLS_MacScratch`
+  (finished key, binder key, expected MAC, a binder's early stage), `GTLS_TicketScratch`
+  (a ticket's state in the clear, its additional data, the state as decoded), the
+  `derived` secret in `GTLS_Schedule`, the nonce in `GTLS_RecordKeys` and the
+  `tmp` of `gtls_record_next_secret`. The tests call these through wrappers that
+  require the area to be zero going in and coming out.
+- **No temporary at all** where one can be avoided: `gtls_record_seal` copies the
+  plaintext into the output buffer and seals it there; `gtls_record_keys_from_secret`
+  derives the key and IV into the structure that keeps them.
+- Each function that uses a member wipes it in **one** place, which every path out
+  of it reaches (a wrapper around the handler where it has several exits). A second
+  wipe of the same bytes would hide the first from a test, so there is not one.
+
+What is still on the stack, and is not claimed to be seen: values that are not secrets
+(hello parameters and key shares, the hash of nothing, the all-zero IKM, the
+CertificateVerify content and the hash it covers, the SHA-256 of a ticket identity, a
+session blob's digest, the known-answer values of the self test), hash states over
+handshake messages (`gtls_transcript_snapshot` and `gtls_binder_transcript` copy one
+and wipe the copy; the transcript is the handshake's bytes, so neither is key material),
+the HKDF label buffer, and whatever `security` and `certificate` keep inside their own
+calls. The cost of this arrangement is a few kilobytes per connection and one 16 KB
+buffer per stream connection that has read a protected record.
 
 ## Known answers and the seams
 

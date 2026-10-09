@@ -59,6 +59,11 @@ static void wipe_buf(GTLS_Buf * b) {
 }
 
 void gtls_stream_free(GTLS_Conn * c) {
+  if (c->rec_scratch != NULL) {
+    (void)gsec_wipe(c->rec_scratch, GTLS_RECORD_CIPHERTEXT_MAX);
+    gcu_allocator_free(c->allocator, c->rec_scratch);
+    c->rec_scratch = NULL;
+  }
   wipe_buf(&c->rbuf);
   wipe_buf(&c->wire);
   wipe_buf(&c->app_in);
@@ -126,7 +131,8 @@ static GTLS_Result install_keys(GTLS_Conn * c, GTLS_Epoch epoch, int write) {
 static GTLS_Result rotate(GTLS_Conn * c, int write) {
   unsigned char * secret = write ? c->sec.wr_secret : c->sec.rd_secret;
   GTLS_RecordKeys * keys = write ? &c->sec.wr : &c->sec.rd;
-  GTLS_Result result = gtls_record_next_secret((uint32_t)c->suite, secret, secret);
+  GTLS_Result result = gtls_record_next_secret((uint32_t)c->suite, secret, secret,
+      c->scratch.next);
 
   if (result == GTLS_OK) {
     result = gtls_record_keys_from_secret(keys, (uint32_t)c->suite, secret,
@@ -408,11 +414,8 @@ static GTLS_Result skip_early(GTLS_Conn * c, size_t body_len) {
  * EndOfEarlyData that must come first, which is unexpected_message and not a
  * bad MAC. The keys are a copy for this one look and are wiped.
  */
-static int opens_under_handshake(const GTLS_Conn * c, const unsigned char * header,
+static int opens_under_handshake(GTLS_Conn * c, const unsigned char * header,
     const unsigned char * body, size_t blen) {
-  GTLS_RecordKeys keys;
-  unsigned char secret[GTLS_HASH_MAX];
-  unsigned char plain[GTLS_RECORD_CIPHERTEXT_MAX];
   size_t plain_len = 0;
   unsigned inner = 0;
   int opened = 0;
@@ -420,14 +423,14 @@ static int opens_under_handshake(const GTLS_Conn * c, const unsigned char * head
   if (c->sec.schedule.stage < 2) {
     return 0;
   }
-  memcpy(secret, c->sec.schedule.c_hs, c->sec.schedule.hlen);
-  if (gtls_record_keys_from_secret(&keys, (uint32_t)c->suite, secret, 0) == GTLS_OK) {
-    opened = gtls_record_open(&keys, header, body, blen, c->limits.max_record_padding,
-        plain, &plain_len, &inner) == GTLS_OK;
+  memcpy(c->scratch.secret, c->sec.schedule.c_hs, c->sec.schedule.hlen);
+  if (gtls_record_keys_from_secret(&c->scratch.keys, (uint32_t)c->suite, c->scratch.secret, 0) == GTLS_OK) {
+    /* The plaintext goes to the record buffer, which process_record wipes. */
+    opened = gtls_record_open(&c->scratch.keys, header, body, blen, c->limits.max_record_padding,
+        c->rec_scratch, &plain_len, &inner) == GTLS_OK;
   }
-  (void)gsec_wipe(&keys, sizeof keys);
-  (void)gsec_wipe(secret, sizeof secret);
-  (void)gsec_wipe(plain, sizeof plain);
+  (void)gsec_wipe(&c->scratch.keys, sizeof c->scratch.keys);
+  (void)gsec_wipe(c->scratch.secret, sizeof c->scratch.secret);
   return opened;
 }
 
@@ -456,13 +459,13 @@ static GTLS_Result on_early_data(GTLS_Conn * c, const unsigned char * pt, size_t
 }
 
 /** One whole record is in rbuf. */
-static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
+static GTLS_Result process_record_inner(GTLS_Conn * c, int64_t now) {
   const unsigned char * header = c->rbuf.data;
   const unsigned char * body = header + GTLS_RECORD_HEADER;
   size_t blen = c->rbuf.len - GTLS_RECORD_HEADER;
   unsigned type = header[0];
   GTLS_Epoch epoch = gtls_conn_expected_epoch(c->state);
-  unsigned char scratch[GTLS_RECORD_CIPHERTEXT_MAX];
+  unsigned char * scratch;
   const unsigned char * pt;
   size_t pt_len;
   unsigned inner;
@@ -499,22 +502,26 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
         return result;
       }
     }
+    if (c->rec_scratch == NULL) {
+      c->rec_scratch = gcu_allocator_calloc(c->allocator, 1, GTLS_RECORD_CIPHERTEXT_MAX);
+      if (c->rec_scratch == NULL) {
+        return gtls_conn_fail(c, GTLS_ERR_OOM, GTLS_ALERT_INTERNAL_ERROR);
+      }
+    }
+    scratch = c->rec_scratch;
     result = gtls_record_open(&c->sec.rd, header, body, blen,
         c->limits.max_record_padding, scratch, &pt_len, &inner);
     if (result == GTLS_ERR_MISMATCH && c->early_skip && type == GTLS_CT_APPLICATION_DATA) {
       /* Early data, which was offered and not accepted, is encrypted under a
        * key this server never had: a record that does not open is skipped
        * (RFC 8446 section 4.2.10). The counter did not move. */
-      (void)gsec_wipe(scratch, sizeof scratch);
       return skip_early(c, blen);
     }
     if (result == GTLS_ERR_MISMATCH && c->state == GTLS_STATE_S_WAIT_EOED &&
         opens_under_handshake(c, header, body, blen)) {
-      (void)gsec_wipe(scratch, sizeof scratch);
       return gtls_conn_unexpected(c); /* the Finished, with no EndOfEarlyData before it */
     }
     if (result != GTLS_OK) {
-      (void)gsec_wipe(scratch, sizeof scratch);
       return open_failed(c, result);
     }
     c->early_skip = 0; /* a record that opens ends the early data */
@@ -553,7 +560,17 @@ static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
       result = gtls_conn_unexpected(c);
       break;
   }
-  (void)gsec_wipe(scratch, sizeof scratch);
+  return result;
+}
+
+/** One whole record is in rbuf. */
+static GTLS_Result process_record(GTLS_Conn * c, int64_t now) {
+  GTLS_Result result = process_record_inner(c, now);
+
+  /* The one place the plaintext of a record is wiped, on every path out. */
+  if (c->rec_scratch != NULL) {
+    (void)gsec_wipe(c->rec_scratch, GTLS_RECORD_CIPHERTEXT_MAX);
+  }
   return result;
 }
 

@@ -525,28 +525,27 @@ static uint32_t obfuscated_age(const GTLS_Session * s, int64_t now) {
  * HelloRetryRequest for the second) and the hello cut before the binders
  * list, and write it in place.
  */
-static GTLS_Result patch_binder(const GTLS_Conn * c, const GTLS_Transcript * base,
+static GTLS_Result patch_binder(GTLS_Conn * c, const GTLS_Transcript * base,
     GTLS_Buf * hello) {
   const GTLS_Session * o = c->offer;
   GTLS_Hash hash = gtls_suite_hash(o->suite);
   size_t hlen = o->psk_len;
-  unsigned char th[GTLS_HASH_MAX];
-  unsigned char binder[GTLS_HASH_MAX];
   GTLS_Result result;
 
   if (hello->len < GTLS_PSK_BINDERS_TAIL(hlen)) {
     return GTLS_ERR_INTERNAL;
   }
   result = gtls_binder_transcript(base, hello->data,
-      hello->len - GTLS_PSK_BINDERS_TAIL(hlen), th);
+      hello->len - GTLS_PSK_BINDERS_TAIL(hlen), c->scratch.th);
   if (result == GTLS_OK) {
-    result = gtls_binder_compute(hash, o->psk, hlen, th, binder);
+    result = gtls_binder_compute(hash, o->psk, hlen, c->scratch.th, c->scratch.binder,
+        &c->scratch.mac);
   }
   if (result == GTLS_OK) {
-    memcpy(hello->data + hello->len - hlen, binder, hlen);
+    memcpy(hello->data + hello->len - hlen, c->scratch.binder, hlen);
   }
-  (void)gsec_wipe(th, sizeof th);
-  (void)gsec_wipe(binder, sizeof binder);
+  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);
+  (void)gsec_wipe(c->scratch.binder, sizeof c->scratch.binder);
   return result;
 }
 
@@ -558,17 +557,16 @@ static GTLS_Result patch_binder(const GTLS_Conn * c, const GTLS_Transcript * bas
 static GTLS_Result begin_early(GTLS_Conn * c) {
   const GTLS_Session * o = c->offer;
   GTLS_Hash hash = gtls_suite_hash(o->suite);
-  unsigned char th[GTLS_HASH_MAX];
   GTLS_Result result;
 
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
   if (result == GTLS_OK) {
     result = gtls_schedule_early_psk(&c->sec.schedule, hash, o->psk, o->psk_len);
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_early_traffic(&c->sec.schedule, th);
+    result = gtls_schedule_early_traffic(&c->sec.schedule, c->scratch.th);
   }
-  (void)gsec_wipe(th, sizeof th);
+  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
@@ -833,14 +831,12 @@ static GTLS_Result on_hrr(GTLS_Conn * c, const GTLS_ServerHello * sh,
   return GTLS_OK;
 }
 
-static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
+static GTLS_Result on_server_hello_inner(GTLS_Conn * c, const unsigned char * msg,
     size_t msg_len, int64_t now) {
   const unsigned char * body = msg + 4;
   size_t len = msg_len - 4u;
   GTLS_ServerHello sh;
   GTLS_Result result;
-  unsigned char ecdhe[GTLS_KX_MAX];
-  unsigned char th[GTLS_HASH_MAX];
   size_t ecdhe_len = 0;
   GTLS_Hash hash;
 
@@ -900,9 +896,8 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   c->suite = (GTLS_Suite)sh.suite;
   c->group = (GTLS_Group)sh.group;
   result = gtls_conn_shared_secret(c, c->group, sh.key_exchange, sh.key_exchange_len,
-      ecdhe, &ecdhe_len);
+      c->scratch.ecdhe, &ecdhe_len);
   if (result != GTLS_OK) {
-    (void)gsec_wipe(ecdhe, sizeof ecdhe);
     return gtls_conn_illegal(c);
   }
   if (!c->retried) {
@@ -912,7 +907,7 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
     result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   }
   if (result == GTLS_OK) {
-    result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+    result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
   }
   if (result == GTLS_OK) {
     const GTLS_Session * psk = c->resumed ? c->offer : NULL;
@@ -926,10 +921,8 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
     }
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_handshake(&c->sec.schedule, ecdhe, ecdhe_len, th);
+    result = gtls_schedule_handshake(&c->sec.schedule, c->scratch.ecdhe, ecdhe_len, c->scratch.th);
   }
-  (void)gsec_wipe(ecdhe, sizeof ecdhe);
-  (void)gsec_wipe(th, sizeof th);
   gtls_conn_wipe_kx(c);
   /* The offered PSK has done its work, or been passed over. */
   gtls_session_free(c->offer);
@@ -939,6 +932,16 @@ static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
   }
   c->state = GTLS_STATE_WAIT_EE;
   return GTLS_OK;
+}
+
+static GTLS_Result on_server_hello(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len, int64_t now) {
+  GTLS_Result result = on_server_hello_inner(c, msg, msg_len, now);
+
+  /* The one place the shared secret and the hash are wiped, on every path out. */
+  (void)gsec_wipe(c->scratch.ecdhe, sizeof c->scratch.ecdhe);
+  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);
+  return result;
 }
 
 /** Extensions an EncryptedExtensions message may carry, RFC 8446 section 4.2. */
@@ -996,11 +999,13 @@ static GTLS_Result on_encrypted_extensions(GTLS_Conn * c,
   if (c->early_status == GTLS_EARLY_PENDING) {
     if (!ee.has_early_data) {
       reject_early(c);
-    } else if (!c->resumed || c->suite != c->early_suite ||
+    } else if (c->suite != c->early_suite ||
         c->alpn_selected_len != c->early_alpn_len ||
         gsec_equal(c->alpn_selected, c->early_alpn, c->early_alpn_len) != GSEC_OK) {
-      /* Accepted without the PSK, or with another suite or protocol than the
-       * ticket's (section 4.2.10): the server must not have. */
+      /* Accepted with another suite or protocol than the ticket's (section
+       * 4.2.10): the server must not have. (Accepted without the PSK is not
+       * asked: the offer is still open only if the ServerHello selected it,
+       * and a ServerHello that did not rejected the early data there.) */
       return gtls_conn_illegal(c);
     } else {
       c->early_status = GTLS_EARLY_ACCEPTED;
@@ -1121,31 +1126,27 @@ static GTLS_Result on_certificate_verify(GTLS_Conn * c,
   return GTLS_OK;
 }
 
-static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
+static GTLS_Result on_finished_inner(GTLS_Conn * c, const unsigned char * msg,
     size_t msg_len) {
   GTLS_Hash hash = gtls_suite_hash((uint32_t)c->suite);
   size_t hlen = gtls_hash_len(hash);
-  unsigned char th[GTLS_HASH_MAX];
-  unsigned char verify[GTLS_HASH_MAX];
-  unsigned char fin[4 + GTLS_HASH_MAX];
   GTLS_Result result;
 
-  result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+  result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
   if (result == GTLS_OK) {
-    result = gtls_finished_check(hash, c->sec.schedule.s_hs, th, msg + 4,
-        msg_len - 4u);
+    result = gtls_finished_check(hash, c->sec.schedule.s_hs, c->scratch.th, msg + 4,
+        msg_len - 4u, &c->scratch.mac);
   }
   if (result != GTLS_OK) {
-    (void)gsec_wipe(th, sizeof th);
     return gtls_conn_fail(c, result, result == GTLS_ERR_FINISHED
         ? GTLS_ALERT_DECRYPT_ERROR : GTLS_ALERT_INTERNAL_ERROR);
   }
   result = gtls_transcript_update(&c->sec.transcript, msg, msg_len);
   if (result == GTLS_OK) {
-    result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+    result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_master(&c->sec.schedule, th);
+    result = gtls_schedule_master(&c->sec.schedule, c->scratch.th);
   }
   /* Accepted early data is ended before the Finished, under the early key,
    * and it is part of what the Finished covers (section 4.5). The application
@@ -1165,7 +1166,6 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
       result = gtls_conn_queue(c, GTLS_EPOCH_EARLY, eoed.data, eoed.len);
       if (result != GTLS_OK) {
         gtls_buf_free(&eoed);
-        (void)gsec_wipe(th, sizeof th);
         return result; /* gtls_conn_queue() has already failed the connection */
       }
     }
@@ -1175,7 +1175,6 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
        * have them installed before the secret they come from is wiped. */
       result = gtls_stream_pin_early(c);
       if (result != GTLS_OK) {
-        (void)gsec_wipe(th, sizeof th);
         return result; /* the installer has already failed the connection */
       }
     }
@@ -1183,43 +1182,51 @@ static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
     (void)gsec_wipe(c->sec.schedule.c_e, sizeof c->sec.schedule.c_e);
     c->sec.schedule.has_e = 0;
     if (result == GTLS_OK) {
-      result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+      result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
     }
   }
   /* The client's Finished is over the transcript through the server's. */
   if (result == GTLS_OK) {
-    result = gtls_finished_verify_data(hash, c->sec.schedule.c_hs, th, verify);
+    result = gtls_finished_verify_data(hash, c->sec.schedule.c_hs, c->scratch.th,
+        c->scratch.verify, &c->scratch.mac);
   }
   if (result == GTLS_OK) {
-    fin[0] = GTLS_HS_FINISHED;
-    fin[1] = 0;
-    fin[2] = 0;
-    fin[3] = (unsigned char)hlen;
-    memcpy(fin + 4, verify, hlen);
-    result = gtls_transcript_update(&c->sec.transcript, fin, 4u + hlen);
+    c->scratch.fin[0] = GTLS_HS_FINISHED;
+    c->scratch.fin[1] = 0;
+    c->scratch.fin[2] = 0;
+    c->scratch.fin[3] = (unsigned char)hlen;
+    memcpy(c->scratch.fin + 4, c->scratch.verify, hlen);
+    result = gtls_transcript_update(&c->sec.transcript, c->scratch.fin, 4u + hlen);
   }
   /* The resumption secret is over the transcript through this Finished. */
   if (result == GTLS_OK) {
-    result = gtls_transcript_snapshot(&c->sec.transcript, hash, th);
+    result = gtls_transcript_snapshot(&c->sec.transcript, hash, c->scratch.th);
   }
   if (result == GTLS_OK) {
-    result = gtls_schedule_keep_resumption(&c->sec.schedule, th);
+    result = gtls_schedule_keep_resumption(&c->sec.schedule, c->scratch.th);
   }
   if (result == GTLS_OK) {
-    result = gtls_conn_queue(c, GTLS_EPOCH_HANDSHAKE, fin, 4u + hlen);
+    result = gtls_conn_queue(c, GTLS_EPOCH_HANDSHAKE, c->scratch.fin, 4u + hlen);
     if (result != GTLS_OK) {
-      (void)gsec_wipe(th, sizeof th);
-      (void)gsec_wipe(verify, sizeof verify);
       return result; /* gtls_conn_queue() has already failed the connection */
     }
   }
-  (void)gsec_wipe(th, sizeof th);
-  (void)gsec_wipe(verify, sizeof verify);
   if (result != GTLS_OK) {
     return gtls_conn_fail(c, result, GTLS_ALERT_INTERNAL_ERROR);
   }
   c->state = GTLS_STATE_CONNECTED;
   return GTLS_OK;
+}
+
+static GTLS_Result on_finished(GTLS_Conn * c, const unsigned char * msg,
+    size_t msg_len) {
+  GTLS_Result result = on_finished_inner(c, msg, msg_len);
+
+  /* The one place the temporaries of the handler are wiped, on every path out. */
+  (void)gsec_wipe(c->scratch.th, sizeof c->scratch.th);
+  (void)gsec_wipe(c->scratch.verify, sizeof c->scratch.verify);
+  (void)gsec_wipe(c->scratch.fin, sizeof c->scratch.fin);
+  return result;
 }
 
 /** Keep the session a NewSessionTicket makes. */
@@ -1671,19 +1678,35 @@ GTLS_Result gtls_conn_debug_secret(const GTLS_Conn * c, GTLS_SecretId id,
   return GTLS_OK;
 }
 
-int gtls_conn_secrets_are_wiped(const GTLS_Conn * c) {
-  const unsigned char * p;
+static unsigned or_bytes(const void * mem, size_t n) {
+  const unsigned char * p = mem;
   unsigned acc = 0;
   size_t i;
 
+  for (i = 0; i < n; i++) {
+    acc |= p[i];
+  }
+  return acc;
+}
+
+int gtls_conn_scratch_is_wiped(const GTLS_Conn * c) {
   if (c == NULL) {
     return 1;
   }
-  p = (const unsigned char *)&c->sec;
-  for (i = 0; i < sizeof c->sec; i++) {
-    acc |= p[i];
+  /* The work areas that sit inside the secrets, which a live connection fills
+   * with keys: the schedule's "derived" secret and the record keys' nonces. */
+  return (or_bytes(&c->scratch, sizeof c->scratch) |
+      (c->rec_scratch != NULL ? or_bytes(c->rec_scratch, GTLS_RECORD_CIPHERTEXT_MAX) : 0u) |
+      or_bytes(c->sec.schedule.derived, sizeof c->sec.schedule.derived) |
+      or_bytes(c->sec.rd.nonce, sizeof c->sec.rd.nonce) |
+      or_bytes(c->sec.wr.nonce, sizeof c->sec.wr.nonce)) == 0;
+}
+
+int gtls_conn_secrets_are_wiped(const GTLS_Conn * c) {
+  if (c == NULL) {
+    return 1;
   }
-  return acc == 0;
+  return or_bytes(&c->sec, sizeof c->sec) == 0 && gtls_conn_scratch_is_wiped(c);
 }
 
 GTLS_Result gtls_conn_debug_transcript(const GTLS_Conn * c, void * out,
