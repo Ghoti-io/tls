@@ -22,6 +22,13 @@ two-byte extension types edited in the RFC's ClientHello to take the server
 down each of its refusals, and a few seven-byte plaintext records (a
 change_cipher_spec, an alert) that need no key.
 `--check` fails if a committed seed differs from what this writes.
+
+The ticket seeds are the one place content is written here that no vector
+holds: a ticket is sealed with a key the fuzz harness holds (session_one's, and
+server_one's), because no mutation of a byte can make an authentic one, and a
+server that never opens one never reaches the checks on what is inside. The
+sealing is AES-256-GCM, written out below (the standard library has none) and
+checked against two published test vectors before it is used.
 """
 
 import hashlib
@@ -41,6 +48,134 @@ def load(name):
             key, value = line.split(" ", 1)
             out[key] = bytes.fromhex(value)
     return out
+
+
+# ---------------------------------------------------------------- AES-256-GCM
+
+def _sbox():
+    box = [0] * 256
+    p = q = 1
+    while True:
+        p = (p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)) & 0xFF
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+
+        def rotl(x, s):
+            return ((x << s) | (x >> (8 - s))) & 0xFF
+
+        box[p] = q ^ rotl(q, 1) ^ rotl(q, 2) ^ rotl(q, 3) ^ rotl(q, 4) ^ 0x63
+        if p == 1:
+            break
+    box[0] = 0x63
+    return box
+
+
+_S = _sbox()
+assert _S[0x00] == 0x63 and _S[0x01] == 0x7C and _S[0x53] == 0xED
+
+
+def _xtime(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else a << 1
+
+
+def _round_keys(key):
+    assert len(key) == 32
+    w = [list(key[4 * i:4 * i + 4]) for i in range(8)]
+    rcon = 1
+    for i in range(8, 60):
+        t = list(w[i - 1])
+        if i % 8 == 0:
+            t = [_S[b] for b in t[1:] + t[:1]]
+            t[0] ^= rcon
+            rcon = _xtime(rcon)
+        elif i % 8 == 4:
+            t = [_S[b] for b in t]
+        w.append([w[i - 8][j] ^ t[j] for j in range(4)])
+    return [sum(w[4 * r:4 * r + 4], []) for r in range(15)]
+
+
+def _encrypt_block(rk, block):
+    s = [b ^ k for b, k in zip(block, rk[0])]
+    for r in range(1, 15):
+        s = [_S[b] for b in s]
+        s = [s[4 * ((c + row) % 4) + row] for c in range(4) for row in range(4)]
+        if r != 14:
+            out = []
+            for c in range(4):
+                a = s[4 * c:4 * c + 4]
+                out += [_xtime(a[0]) ^ (_xtime(a[1]) ^ a[1]) ^ a[2] ^ a[3],
+                        a[0] ^ _xtime(a[1]) ^ (_xtime(a[2]) ^ a[2]) ^ a[3],
+                        a[0] ^ a[1] ^ _xtime(a[2]) ^ (_xtime(a[3]) ^ a[3]),
+                        (_xtime(a[0]) ^ a[0]) ^ a[1] ^ a[2] ^ _xtime(a[3])]
+            s = out
+        s = [b ^ k for b, k in zip(s, rk[r])]
+    return bytes(s)
+
+
+def _gmul(x, y):
+    z = 0
+    v = y
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= v
+        v = (v >> 1) ^ (0xE1 << 120) if v & 1 else v >> 1
+    return z
+
+
+def gcm_seal(key, iv, aad, plain):
+    """AES-256-GCM with a 96-bit IV: (ciphertext, 16-byte tag)."""
+    assert len(iv) == 12
+    rk = _round_keys(key)
+    h = int.from_bytes(_encrypt_block(rk, bytes(16)), "big")
+    counter = int.from_bytes(iv + b"\x00\x00\x00\x02", "big")
+    ct = b""
+    for off in range(0, len(plain), 16):
+        ks = _encrypt_block(rk, counter.to_bytes(16, "big"))
+        chunk = plain[off:off + 16]
+        ct += bytes(a ^ b for a, b in zip(chunk, ks))
+        counter = (counter & ~0xFFFFFFFF) | (((counter & 0xFFFFFFFF) + 1) & 0xFFFFFFFF)
+
+    def pad(b):
+        return b + bytes(-len(b) % 16)
+
+    data = pad(aad) + pad(ct) + struct.pack(">QQ", len(aad) * 8, len(ct) * 8)
+    g = 0
+    for off in range(0, len(data), 16):
+        g = _gmul(g ^ int.from_bytes(data[off:off + 16], "big"), h)
+    j0 = _encrypt_block(rk, iv + b"\x00\x00\x00\x01")
+    tag = (int.from_bytes(j0, "big") ^ g).to_bytes(16, "big")
+    return ct, tag
+
+
+# McGrew and Viega's test cases 13 and 14 (AES-256, a zero key and IV).
+assert gcm_seal(bytes(32), bytes(12), b"", b"")[1].hex() == "530f8afbc74536b9a963b4f1c4cb738b"
+_c, _t = gcm_seal(bytes(32), bytes(12), b"", bytes(16))
+assert _c.hex() == "cea7403d4d606b6e074ec5d3baf39d18" and _t.hex() == "d0d1c8a799996bf0265b98b5d48ab919"
+
+
+def ticket_state(suite=0x1301, psk_len=None, age_add=0, issued=1700000000 - 4, lifetime=3600,
+                 alpn=b"", sni=b"server", version=1, alpn_len=None, sni_len=None, tail=b""):
+    """The state a ticket seals (session/ticket.c), with any field made wrong on request."""
+    hlen = 48 if suite == 0x1302 else 32
+    n = hlen if psk_len is None else psk_len
+    st = bytes([version]) + struct.pack(">H", suite) + bytes([n]) + bytes([0x55]) * n
+    st += struct.pack(">IqI", age_add, issued, lifetime)
+    st += bytes([len(alpn) if alpn_len is None else alpn_len]) + alpn
+    st += bytes([len(sni) if sni_len is None else sni_len]) + sni
+    return st + tail
+
+
+def seal_ticket(name_byte, key_byte, state, nonce_seed=1):
+    """A ticket as the library writes it: name, nonce, ciphertext, tag."""
+    name = bytes([name_byte]) * 16
+    nonce = bytes((nonce_seed + i) & 0xFF for i in range(12))
+    aad = b"ghoti.io tls ticket v1" + name + nonce
+    ct, tag = gcm_seal(bytes([key_byte]) * 32, nonce, aad, state)
+    return name + nonce + ct + tag
 
 
 def segment(epoch, data):
@@ -257,6 +392,66 @@ def main():
     srv["ccs-after-hello"] = bytes([0]) + c_ch + bytes.fromhex("140303000101") + c_fin
     srv["refuse-wrong-size-alert"] = bytes([0]) + c_ch + bytes.fromhex("150303000301 0000".replace(" ", ""))
 
+    # Tickets, for the server. server_one's keyring is one key whose name and
+    # bytes are all 0x6b, and the clock is 1700000000; a ticket sealed under it
+    # is authentic, so the checks on what it says are reached (a binder that is
+    # wrong ends each of these that qualifies). The RFC's hello names "server".
+    def hs_fix(record, hs):
+        hs = hs[:1] + struct.pack(">I", len(hs) - 4)[1:] + hs[4:]
+        return record[:3] + struct.pack(">H", len(hs)) + hs
+
+    def set_suites(record, suites):
+        hs = record[5:]
+        at = 4 + 2 + 32
+        at += 1 + hs[at]
+        old = struct.unpack(">H", hs[at:at + 2])[0]
+        new = b"".join(struct.pack(">H", x) for x in suites)
+        return hs_fix(record, hs[:at] + struct.pack(">H", len(new)) + new + hs[at + 2 + old:])
+
+    def replace_ext(record, ext_type, body):
+        hs = record[5:]
+        at = 4 + 2 + 32
+        at += 1 + hs[at]
+        at += 2 + struct.unpack(">H", hs[at:at + 2])[0]
+        at += 1 + hs[at]
+        ext_len = struct.unpack(">H", hs[at:at + 2])[0]
+        exts = hs[at + 2:at + 2 + ext_len]
+        out, k, found = b"", 0, False
+        while k < len(exts):
+            t, n = struct.unpack(">HH", exts[k:k + 4])
+            if t == ext_type:
+                out += struct.pack(">HH", t, len(body)) + body
+                found = True
+            else:
+                out += exts[k:k + 4 + n]
+            k += 4 + n
+        assert found
+        return hs_fix(record, hs[:at] + struct.pack(">H", len(out)) + out)
+
+    def psk_ticket(ticket, binder_len=32):
+        ids = struct.pack(">H", len(ticket)) + ticket + b"\x00\x00\x12\x34"
+        bnd = bytes([binder_len]) + bytes([0x60]) * binder_len
+        return struct.pack(">H", len(ids)) + ids + struct.pack(">H", len(bnd)) + bnd
+
+    def server_ticket(suite):
+        return seal_ticket(0x6b, 0x6b, ticket_state(suite=suite))
+
+    p256_share = struct.pack(">H", 2 + 2 + 65) + struct.pack(">HH", 0x0017, 65) + b"\x04" + bytes(range(64))
+    srv["ticket-resumes-binder-wrong"] = bytes([0]) + with_ext(c_ch, 0x29, psk_ticket(server_ticket(0x1301)))
+    srv["ticket-suite-not-offered"] = bytes([0]) + with_ext(set_suites(c_ch, [0x1301]), 0x29, psk_ticket(server_ticket(0x1303)))
+    srv["ticket-suite-not-in-context"] = bytes([0x08]) + with_ext(c_ch, 0x29, psk_ticket(server_ticket(0x1302)))
+    srv["ticket-issue-limit"] = bytes([0x08]) + c_ch + c_fin
+    srv["ticket-retry-other-suite"] = bytes([0x10]) + with_ext(c_ch, 0x29, psk_body(1, 1)) + \
+        with_ext(replace_ext(c_ch, 0x33, p256_share), 0x29, psk_ticket(server_ticket(0x1303)))
+    srv["ticket-retry-same-suite"] = bytes([0x10]) + with_ext(c_ch, 0x29, psk_body(1, 1)) + \
+        with_ext(replace_ext(c_ch, 0x33, p256_share), 0x29, psk_ticket(server_ticket(0x1301)))
+    srv["ticket-for-another-name"] = bytes([0]) + with_ext(c_ch, 0x29, psk_ticket(
+        seal_ticket(0x6b, 0x6b, ticket_state(sni=b"other"))))
+    srv["ticket-expired"] = bytes([0]) + with_ext(c_ch, 0x29, psk_ticket(
+        seal_ticket(0x6b, 0x6b, ticket_state(issued=1700000000 - 100000))))
+    srv["ticket-of-an-unknown-key"] = bytes([0]) + with_ext(c_ch, 0x29, psk_ticket(
+        seal_ticket(0x6b, 0x6a, ticket_state())))
+
     # The client, fed the RFC's server records.
     s_sh = simple["server.send-handshake-record.complete-record"]
     s_flight = simple["server.send-handshake-record@2.complete-record"]
@@ -346,6 +541,10 @@ def main():
     rs["flip-retry-second-hello"] = bytes([0x1f]) + flip(0, 700, 1)
     rs["flip-retry-second-binder"] = bytes([0x1f]) + flip(0, 1000, 1)
     rs["flip-two"] = bytes([0x0f]) + flip(0, 300, 1) + flip(1, 200, 2)
+    # The suite of the first record the server sends (a ServerHello that selects the
+    # PSK, or the retry) made the one whose hash is not the PSK's: 0x1301 to 0x1302.
+    rs["flip-server-hello-suite-hash"] = bytes([0x0f]) + flip(1, 45, 0x03)
+    rs["retry-names-another-hash"] = bytes([0x1f]) + flip(1, 45, 0x03)
 
     # The session blob and the ticket. The blob is the format in session.h:
     # version 1, the fields, the ticket and PSK, and a SHA-256 of all of it.
@@ -373,6 +572,30 @@ def main():
     se["seal-sha256"] = bytes([0x72]) + bytes(range(1, 120))
     se["seal-sha384"] = bytes([0x76]) + bytes(range(1, 90))
     se["seal-chacha-empty-names"] = bytes([0x7a])
+    se["blob-bigger-than-the-limit-allows"] = bytes([0x00]) + blob(ticket=b"\x22" * 700)
+    se["blob-time-too-late"] = bytes([0x70]) + blob(received=2 ** 63 - 1)
+    se["blob-last-time-that-fits"] = bytes([0x70]) + blob(received=2 ** 63 - 1 - 7200)
+    # Tickets sealed under session_one's key (name 0x42, bytes 0x24) with a state
+    # the sealer would not write: each fails a different check of the decode.
+    def bad_ticket(state):
+        return bytes([0x71]) + seal_ticket(0x42, 0x24, state)
+    se["ticket-state-version"] = bad_ticket(ticket_state(version=2))
+    se["ticket-state-unknown-suite"] = bad_ticket(ticket_state(suite=0x1234, psk_len=32))
+    se["ticket-state-psk-wrong-size"] = bad_ticket(ticket_state(suite=0x1301, psk_len=48))
+    se["ticket-state-short-for-sha384"] = bad_ticket(ticket_state(suite=0x1302)[:54])
+    se["ticket-state-lifetime-over"] = bad_ticket(ticket_state(lifetime=604801))
+    se["ticket-state-alpn-overruns"] = bad_ticket(ticket_state(alpn_len=200))
+    se["ticket-state-sni-length"] = bad_ticket(ticket_state(sni_len=9))
+    se["ticket-state-trailing"] = bad_ticket(ticket_state(tail=b"\x00"))
+    # The freshness of a ticket from words of the input: lifetime and age_add, the
+    # second it was issued, the clock, the age and the window.
+    def fresh(lifetime, age_add, issued, now, age, window):
+        return bytes([0x82]) + struct.pack(">IIqqII", lifetime, age_add, issued, now, age, window)
+    se["fresh-ok"] = fresh(3600, 0, 0, 5, 5000, 10000)
+    se["fresh-lifetime-over"] = fresh(604801, 0, 1000, 1000, 0, 10000)
+    se["fresh-from-the-future"] = fresh(3600, 0, 1000000, 0, 0, 10000)
+    se["fresh-age-short-of-the-clock"] = fresh(3600, 0, 0, 1000, 0, 100000000)
+    se["fresh-expired"] = fresh(3600, 0, 0, 4000, 4000000, 10000)
     se["serialise"] = bytes([0x73]) + bytes(range(1, 150))
     se["serialise-sha384"] = bytes([0x77]) + bytes(range(1, 30))
 
