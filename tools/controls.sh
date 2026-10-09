@@ -79,7 +79,7 @@ key-update-after-close	src/client/stream.c	c->ku_queued == 0 \&\& !c->local_clos
 key-update-run-reset	src/client/stream.c	c->ku_run = 0; /* data between updates: they are not a flood */	(void)0;	testEdges
 key-update-queued-count	src/client/stream.c	      if (c->ku_queued > 0) {\n        c->ku_queued--;\n      }	      if (c->ku_queued > 0) {\n      }	testEdges
 key-update-answer-once	src/client/stream.c	if (request == 1u \&\& c->ku_queued == 0 \&\& !c->local_closed) {	if (request == 1u \&\& !c->local_closed) {	testEdges
-server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN \|\|\n          c->state == GTLS_STATE_S_WAIT_EOED)) {	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	testEdges
+server-alert-key	src/client/stream.c	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN \|\|\n          c->state == GTLS_STATE_S_WAIT_EOED)) {	(c->state == GTLS_STATE_CONNECTED \|\| c->state == GTLS_STATE_S_WAIT_FIN)) {	testEarly	EarlyClose.*
 client-dummy-record	src/client/stream.c	if (c->role == GTLS_ROLE_CLIENT \&\& c->context->middlebox_compat) {	if (0) {	testEdges
 alpn-bytes	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(o->alpn[k].p, x->alpn + off + 1u, n) == GSEC_OK	o->alpn[k].len == n	testEdges
 alpn-length	src/server/server.c	o->alpn[k].len == n \&\& gsec_equal(	gsec_equal(	testEdges

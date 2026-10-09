@@ -1274,7 +1274,7 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
       }
       early_sent = true;
     }
-    if (mode == 7 && gtls_conn_close(c) != GTLS_ERR_CLOSED) {
+    if (mode == 7 && early_sent && gtls_conn_close(c) != GTLS_ERR_CLOSED) {
       die("a close in the early window was not told to the caller");
     }
   }
@@ -1380,10 +1380,11 @@ inline int pump_core(const uint8_t * data, size_t size, bool resume) {
     (void)gtls_conn_early_status(s, &ss);
     if (!gtls_conn_is_connected(c) || !gtls_conn_is_connected(s) || cs != GTLS_EARLY_REJECTED ||
         ss != GTLS_EARLY_REJECTED || !got_early.empty() || replay.calls != 0 ||
-        gtls_conn_early_resend(c, back, sizeof back, &n) != GTLS_OK || n != early_bytes.size()) {
+        gtls_conn_early_resend(c, back, sizeof back, &n) != GTLS_OK ||
+        n != (early_sent ? early_bytes.size() : 0u)) {
       die("a server with early data off did not refuse it and hand it back");
     }
-  } else if (flips.empty() && mode == 7) {
+  } else if (flips.empty() && mode == 7 && early_sent) {
     if (!gtls_conn_is_failed(c) || gtls_conn_failure(c) != GTLS_ERR_CLOSED || gtls_conn_alert(c) != GTLS_ALERT_NONE) {
       die("a close in the early window did not end the connection");
     }
