@@ -287,6 +287,38 @@ TEST(ConnectionArguments, ASessionBlobThatCannotBeAllocatedIsOom) {
   EXPECT_EQ(alloc.live, 0);
 }
 
+TEST(ConnectionArguments, AWriteStopsAtTheOutputCapAndTheCloseStillHasItsRoom) {
+  std::unique_ptr<Cred> cred = ed_cred();
+  Pair p(*cred);
+  ASSERT_EQ(p.build(), GTLS_OK);
+  p.run();
+  ASSERT_TRUE(p.connected());
+  /* One big write: the records that fit go out and the call says how many bytes that was. */
+  const Bytes big = pattern(100000, 5);
+  size_t w = 0;
+  ASSERT_EQ(gtls_conn_write(p.c.conn, big.data(), big.size(), &w), GTLS_OK);
+  EXPECT_GT(w, 0u);
+  EXPECT_LT(w, big.size()) << "the output holds 65536 bytes of data and no more";
+  /* Then one byte at a time until not even a byte fits (a one-byte record is 23). */
+  size_t one = 1;
+  for (int i = 0; i < 4000 && one != 0; i++) {
+    one = 0;
+    ASSERT_EQ(gtls_conn_write(p.c.conn, "x", 1, &one), GTLS_OK);
+  }
+  ASSERT_EQ(one, 0u);
+  /* The buffer behind the output is larger than the cap on purpose (an alert and a
+   * KeyUpdate must always fit), so a close on a full output still closes. */
+  EXPECT_EQ(gtls_conn_close(p.c.conn), GTLS_OK);
+  EXPECT_FALSE(gtls_conn_is_failed(p.c.conn));
+  p.run();
+  EXPECT_TRUE(gtls_conn_peer_closed(p.s.conn));
+}
+
+TEST(ConnectionArguments, AnEarlyWriteWithNothingToWriteToIsRefused) {
+  size_t w = 0;
+  EXPECT_EQ(gtls_conn_write_early(nullptr, "x", 1, &w), GTLS_ERR_INVALID);
+}
+
 /* ---------------------------------------------------------------- contexts */
 
 TEST(ContextArguments, AContextRefusesWhatCannotBeRight) {

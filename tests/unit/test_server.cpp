@@ -469,6 +469,15 @@ TEST(ServerHello, EveryRefusalHasItsOwnResultAndAlert) {
           GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION},
       {"no key_share", [](HelloSpec & h) { h.has_key_share = false; },
           GTLS_ERR_PROTOCOL, GTLS_ALERT_MISSING_EXTENSION},
+      {"signature_algorithms whose list is a scheme and a half", [](HelloSpec & h) {
+            h.has_sigs = false;
+            h.extra.push_back(ext_of(GTLS_EXT_SIGNATURE_ALGORITHMS, Bytes{0, 3, 8, 4, 8}));
+          },
+          GTLS_ERR_CORRUPT, GTLS_ALERT_DECODE_ERROR},
+      {"a server_name that declares more than it holds", [](HelloSpec & h) {
+            h.extra.push_back(ext_of(GTLS_EXT_SERVER_NAME, Bytes{0, 9, 0, 0, 6, 'a', 'b'}));
+          },
+          GTLS_ERR_CORRUPT, GTLS_ALERT_DECODE_ERROR},
       {"compression other than null", [](HelloSpec & h) { h.compression = Bytes{1}; },
           GTLS_ERR_PROTOCOL, GTLS_ALERT_ILLEGAL_PARAMETER},
       {"two compression methods", [](HelloSpec & h) { h.compression = Bytes{0, 1}; },

@@ -423,6 +423,9 @@ set-session-failed	src/session/session.c	  if (c->state == GTLS_STATE_FAILED) {\
 cert-limit-alert	src/client/client.c	    case GTLS_ERR_LIMIT:\n      return GTLS_ALERT_DECODE_ERROR;	    case GTLS_ERR_LIMIT:\n      return GTLS_ALERT_INTERNAL_ERROR;	testArgs	ConnectionArguments.*
 record-seal-in-error	src/record/record.c	  if (out->err != GTLS_OK) {\n    return out->err;\n  }\n  inner_len	  inner_len	testArgs	InternalArguments.*
 session-parse-oom	src/session/session.c	  if (s == NULL) {\n    return GTLS_ERR_OOM;	  if (s == NULL) {\n    return GTLS_ERR_INTERNAL;	testArgs	ConnectionArguments.*
+server-sigs-list	src/server/server.c	  result = gtls_msg_parse_ch_u16_list(e, o->sigs, GTLS_CH_LIST_MAX, \&o->sig_count);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }	  result = gtls_msg_parse_ch_u16_list(e, o->sigs, GTLS_CH_LIST_MAX, \&o->sig_count);	testServer	ServerHello.EveryRefusal*
+server-sni-parse	src/server/server.c	    result = gtls_msg_parse_ch_server_name(e, \&o->host);\n    if (result != GTLS_OK) {\n      return gtls_conn_fail_parse(c, result);\n    }	    result = gtls_msg_parse_ch_server_name(e, \&o->host);	testServer	ServerHello.EveryRefusal*
+write-output-cap	src/client/stream.c	  while (len > 0 \&\& c->wire.len < c->limits.max_output_bytes) {\n    size_t n = len < GTLS_RECORD_PLAIN_MAX ? len : GTLS_RECORD_PLAIN_MAX;\n\n    /* The last number this key may use	  while (len > 0) {\n    size_t n = len < GTLS_RECORD_PLAIN_MAX ? len : GTLS_RECORD_PLAIN_MAX;\n\n    /* The last number this key may use	testArgs	ConnectionArguments.*
 PLANTS
 }
 
