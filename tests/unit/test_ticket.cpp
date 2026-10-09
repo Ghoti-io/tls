@@ -860,7 +860,9 @@ GTLS_Result open_bytes(const GTLS_TicketKey & key, const Bytes & ticket, int64_t
   GTLS_TicketPlain back;
   /* An exact-size heap copy, so that a read past the end is something a memory checker sees. */
   std::unique_ptr<unsigned char[]> copy(new unsigned char[ticket.size() == 0 ? 1 : ticket.size()]);
-  std::memcpy(copy.get(), ticket.data(), ticket.size());
+  if (!ticket.empty()) {
+    std::memcpy(copy.get(), ticket.data(), ticket.size());
+  }
   return gtls_ticket_open(&key, 1, now, copy.get(), ticket.size(), &back);
 }
 
@@ -1263,7 +1265,9 @@ Bytes signed_blob(const Bytes & body) {
 
 GTLS_Result parse_exact(const Bytes & blob, const GTLS_Limits * l = nullptr, GTLS_Session ** keep = nullptr) {
   std::unique_ptr<unsigned char[]> copy(new unsigned char[blob.size() == 0 ? 1 : blob.size()]);
-  std::memcpy(copy.get(), blob.data(), blob.size());
+  if (!blob.empty()) {
+    std::memcpy(copy.get(), blob.data(), blob.size());
+  }
   GTLS_Session * out = nullptr;
   GTLS_Result r = gtls_session_parse(nullptr, l, copy.get(), blob.size(), &out);
   if (r == GTLS_OK) {
