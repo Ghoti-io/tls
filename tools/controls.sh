@@ -32,9 +32,12 @@
 #
 # The result of each plant is one of: caught (the test fails with the check
 # removed), SURVIVED (it passes), or ERROR (the baseline fails, the text does
-# not apply exactly once, the planted copy does not build, or the test runs
-# for more than $CONTROLS_TIMEOUT seconds, 600 by default, which is counted as
-# caught: a planted loop is a failed test). The exit status is non-zero for
+# not apply exactly once, the planted copy does not build, the test runs for
+# more than $CONTROLS_TIMEOUT seconds (600 by default), it dies of a signal, or
+# it exits non-zero without any gtest test reporting FAILED, or only one outside
+# the plant's filter does: a broken scratch tree must not be credited with a
+# catch, so a hang or a crash is an ERROR, never a failed test). A caught plant
+# prints the test that caught it. The exit status is non-zero for
 # any SURVIVED or ERROR, and the last line says how many of each and how long
 # it took. CONTROLS_VERBOSE=N prints the first N failure lines of each caught plant.
 
@@ -44,12 +47,19 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 start=$(date +%s)
 
 # name, file, text removed, text put in its place, test binary; tab-separated
-# (a bar is part of the text a plant removes). Two optional fields follow: a
-# gtest filter, and "valgrind" to run the filtered test under Valgrind. The
-# second is for a check whose removal changes no result but lets the code read
+# (a bar is part of the text a plant removes). Three optional fields follow: a
+# gtest filter, and "valgrind" to run the filtered test under Valgrind; and a
+# last one, a gtest name glob that must be among the tests that fail (the
+# filter, when there is one, is the default), for a plant that runs a whole
+# binary. "valgrind" is for a check whose removal changes no result but lets the code read
 # past the end of its input (a later check refuses what was read), which only a
 # memory checker sees.
 plants() {
+  if [ -n "${CONTROLS_PLANTS_FILE:-}" ]; then
+    # For testing this runner itself: these rows, in the same format, instead.
+    cat "$CONTROLS_PLANTS_FILE"
+    return
+  fi
   cat <<'PLANTS'
 finished	src/schedule/schedule.c	        : (same == GSEC_ERR_MISMATCH ? GTLS_ERR_FINISHED : gtls_from_gsec(same));	        : GTLS_OK;	testNegative
 certificate-verify	src/client/client.c	if (verdict != GCERT_OK) {	if (verdict != GCERT_OK \&\& 0) {	testNegative
@@ -426,6 +436,8 @@ session-parse-oom	src/session/session.c	  if (s == NULL) {\n    return GTLS_ERR_
 server-sigs-list	src/server/server.c	  result = gtls_msg_parse_ch_u16_list(e, o->sigs, GTLS_CH_LIST_MAX, \&o->sig_count);\n  if (result != GTLS_OK) {\n    return gtls_conn_fail_parse(c, result);\n  }	  result = gtls_msg_parse_ch_u16_list(e, o->sigs, GTLS_CH_LIST_MAX, \&o->sig_count);	testServer	ServerHello.EveryRefusal*
 server-sni-parse	src/server/server.c	    result = gtls_msg_parse_ch_server_name(e, \&o->host);\n    if (result != GTLS_OK) {\n      return gtls_conn_fail_parse(c, result);\n    }	    result = gtls_msg_parse_ch_server_name(e, \&o->host);	testServer	ServerHello.EveryRefusal*
 write-output-cap	src/client/stream.c	  while (len > 0 \&\& c->wire.len < c->limits.max_output_bytes) {\n    size_t n = len < GTLS_RECORD_PLAIN_MAX ? len : GTLS_RECORD_PLAIN_MAX;\n\n    /* The last number this key may use	  while (len > 0) {\n    size_t n = len < GTLS_RECORD_PLAIN_MAX ? len : GTLS_RECORD_PLAIN_MAX;\n\n    /* The last number this key may use	testArgs	ConnectionArguments.*
+wipe-open-success-tail	src/record/record.c	  (void)gsec_wipe(pt + i - 1u, body - (i - 1u));\n  k->seq++;	  k->seq++;	testRecord	Records.AnOpenLeaves*
+wipe-open-padding-cap	src/record/record.c	    (void)gsec_wipe(pt, body);\n    return GTLS_ERR_LIMIT;	    return GTLS_ERR_LIMIT;	testRecord	Records.AnOpenThatFails*
 PLANTS
 }
 
@@ -468,6 +480,78 @@ open(path, "w").write(s.replace(old, new))
 PY
 }
 
+
+# What a failing run means. $1 exit status, $2 gtest filter, $3 mode, $4 the
+# output file. Prints "caught NAMES" or "error WHY"; the caller has already
+# dealt with a status of 0. A non-zero status alone is not a catch: a timeout
+# (124), a signal (128 and up: a crash, or the kill that follows a timeout), or
+# an exit with no gtest FAILED line (a tree that does not run, a missing
+# library, a harness that died) is a broken scratch tree, and crediting it
+# would let a broken tree "catch" every plant. A catch is a gtest test
+# reported FAILED, one that matches the plant's filter when it has one. A
+# Valgrind plant is caught by Valgrind reporting errors, since the test itself
+# passes.
+classify() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import fnmatch, re, sys
+rc, flt, mode, path = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+text = open(path, errors="replace").read()
+if rc == 124:
+    print("error timed out (a hang is not a failed test)")
+elif rc >= 128:
+    print("error killed by signal %d (a crash is not a failed test)" % (rc - 128))
+elif mode == "valgrind":
+    m = re.findall(r"ERROR SUMMARY: (\d+) errors", text)
+    if m and int(m[-1]) > 0:
+        print("caught valgrind (%s errors)" % m[-1])
+    else:
+        print("error exit %d with no Valgrind error reported" % rc)
+else:
+    failed = []
+    for line in text.splitlines():
+        m = re.match(r"\[  FAILED  \] (\S+\.\S+?)(?:,| \(|\s*$)", line)
+        if m and m.group(1) not in failed:
+            failed.append(m.group(1))
+    if not failed:
+        print("error exit %d with no gtest FAILED line" % rc)
+    else:
+        want = [f for f in flt.split("-")[0].split(":") if f] if flt else []
+        hit = [f for f in failed if not want or any(fnmatch.fnmatchcase(f, w) for w in want)]
+        if hit:
+            print("caught %s%s" % (hit[0], " (+%d more)" % (len(hit) - 1) if len(hit) > 1 else ""))
+        else:
+            print("error only tests outside the filter '%s' failed: %s" % (flt, failed[0]))
+PY
+}
+
+# classify() on made-up output: the runner's own gate, run with --anchors.
+classify_selftest() {
+  t=$(mktemp "${TMPDIR:-/tmp}/gtls-classify.XXXXXX")
+  bad=0
+  check() { # want-prefix rc filter mode text
+    printf '%s\n' "$5" >"$t"
+    got=$(classify "$2" "$3" "$4" "$t")
+    case "$got" in "$1"*) ;; *) echo "controls: classify($2,'$3','$4') said '$got', wanted '$1...'" >&2; bad=1 ;; esac
+  }
+  f='[  FAILED  ] Records.OpenWipes (3 ms)
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Records.OpenWipes'
+  check "caught Records.OpenWipes" 1 "" "" "$f"
+  check "caught Records.OpenWipes" 1 "Records.Open*" "" "$f"
+  check "caught Records.OpenWipes" 1 "Other.*:Records.Open*" "" "$f"
+  check "error only tests outside" 1 "Other.*" "" "$f"
+  check "error killed by signal 11" 139 "" "" "$f"
+  check "error killed by signal 9" 137 "" "" "$f"
+  check "error timed out" 124 "" "" "$f"
+  check "error exit 1 with no gtest" 1 "" "" "error while loading shared libraries"
+  check "error exit 1 with no gtest" 1 "" "" "[  PASSED  ] 4 tests."
+  check "caught valgrind" 1 "" valgrind "==1== ERROR SUMMARY: 3 errors from 2 contexts"
+  check "error exit 1 with no Valgrind" 1 "" valgrind "==1== ERROR SUMMARY: 0 errors from 0 contexts"
+  check "error killed" 139 "" valgrind "==1== ERROR SUMMARY: 3 errors from 2 contexts"
+  rm -f "$t"
+  return $bad
+}
+
 # The object a source file builds into, in the release tree.
 object_of() {
   echo "build/linux/release/objects/${1#src/}" | sed 's/\.c$/.o/'
@@ -498,8 +582,10 @@ if n < 40:
     bad = 1
 print("controls: %d plants, each applying exactly once" % n)
 sys.exit(bad)
-' "$root"
-  exit $?
+' "$root" || exit 1
+  classify_selftest || exit 1
+  echo "controls: the verdict on a run (caught, or an error for a crash, a timeout, no FAILED line, a failure outside the filter) holds on made-up output"
+  exit 0
 fi
 
 : "${PREFIX:?set PREFIX to the prefix holding cutil, security and certificate}"
@@ -513,11 +599,11 @@ want="$*"
 us=$(printf '\037')
 
 # Which plants run, and which distinct tests they need.
-plants | tr '\t' '\037' | while IFS="$us" read -r name file from to test filter mode; do
+plants | tr '\t' '\037' | while IFS="$us" read -r name file from to test filter mode expect; do
   if [ -n "$want" ] && ! echo " $want " | grep -q " $name "; then
     continue
   fi
-  printf '%s\n' "$name$us$file$us$from$us$to$us$test$us${filter:-}$us${mode:-}"
+  printf '%s\n' "$name$us$file$us$from$us$to$us$test$us${filter:-}$us${mode:-}$us${expect:-}"
 done >"$scratch/selected"
 count=$(grep -c . "$scratch/selected")
 if [ "$count" -eq 0 ]; then
@@ -553,7 +639,7 @@ done <"$scratch/tests"
 caught=0
 survived=0
 errors=0
-while IFS="$us" read -r name file from to test filter mode; do
+while IFS="$us" read -r name file from to test filter mode expect; do
   if grep -qxF "$test$us$filter$us$mode" "$scratch/bad-baselines"; then
     errors=$((errors + 1))
     continue
@@ -587,15 +673,18 @@ while IFS="$us" read -r name file from to test filter mode; do
     echo "controls: $name: $test still PASSES with the check removed" >&2
     survived=$((survived + 1))
   else
+    verdict=$(classify "$rc" "${expect:-$filter}" "$mode" "$scratch/out.txt")
     if [ -n "${CONTROLS_VERBOSE:-}" ]; then
       grep -E "Failure|FAILED|Segmentation|Expected|Which is|actual" "$scratch/out.txt" | head -${CONTROLS_VERBOSE} >&2
     fi
-    if [ "$rc" -eq 124 ]; then
-      echo "controls: $name: $test timed out with the check removed (counted as failing)"
-    else
-      echo "controls: $name: $test fails with the check removed, and passes with it"
-    fi
-    caught=$((caught + 1))
+    case "$verdict" in
+      caught*)
+        echo "controls: $name: $test fails with the check removed, and passes with it: ${verdict#caught }"
+        caught=$((caught + 1)) ;;
+      *)
+        echo "controls: $name: ERROR, $test ${verdict#error }, so this is not a catch" >&2
+        errors=$((errors + 1)) ;;
+    esac
   fi
 done <"$scratch/selected"
 
