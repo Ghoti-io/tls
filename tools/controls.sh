@@ -413,6 +413,16 @@ wipe-ticket-open-decoded	src/session/ticket.c	  (void)gsec_wipe(w->plain, sizeof
 cert-oom-mapped	src/client/verify.c	    case GCERT_ERR_OOM:\n      return GTLS_ERR_OOM;	    case GCERT_ERR_OOM:\n      return GTLS_ERR_CERT_INVALID;	testAlloc	CertificateAllocation.*
 early-flush-keys-guard	src/client/stream.c	    if (c->wr_epoch != GTLS_EPOCH_EARLY) {\n      /* The client installed them	    if (0) {\n      /* The client installed them	testEarly	EarlyInternal.*
 early-accept-callback	src/server/server.c	r->index != 0 \|\| x->anti_replay == NULL \|\|	r->index != 0 \|\|	testEarly	EarlyRejected.*
+ctx-dup-group	src/client/context.c	if (config->groups[j] == config->groups[i]) {	if (0) {	testArgs	ContextArguments.*
+ctx-dup-sigalg	src/client/context.c	if (config->sig_algs[j] == config->sig_algs[i]) {	if (0) {	testArgs	ContextArguments.*
+ctx-null-alpn	src/client/context.c	if (config->alpn[i] == NULL) {	if (0) {	testArgs	ContextArguments.*
+ctx-role	src/client/context.c	if (config->role != GTLS_ROLE_CLIENT \&\& config->role != GTLS_ROLE_SERVER) {	if (0) {	testArgs	ContextArguments.*
+ctx-null-name	src/client/context.c	if (in->names[i] == NULL) {	if (0) {	testArgs	ContextArguments.*
+server-start-failed	src/server/server.c	GTLS_Result gtls_server_start(GTLS_Conn * c) {\n  if (c->state == GTLS_STATE_FAILED) {	GTLS_Result gtls_server_start(GTLS_Conn * c) {\n  if (0) {	testArgs	ConnectionArguments.*
+set-session-failed	src/session/session.c	  if (c->state == GTLS_STATE_FAILED) {\n    return GTLS_ERR_FAILED;\n  }\n  if (c->role != GTLS_ROLE_CLIENT \|\| c->state != GTLS_STATE_NEW	  if (c->role != GTLS_ROLE_CLIENT \|\| c->state != GTLS_STATE_NEW	testArgs	ConnectionArguments.*
+cert-limit-alert	src/client/client.c	    case GTLS_ERR_LIMIT:\n      return GTLS_ALERT_DECODE_ERROR;	    case GTLS_ERR_LIMIT:\n      return GTLS_ALERT_INTERNAL_ERROR;	testArgs	ConnectionArguments.*
+record-seal-in-error	src/record/record.c	  if (out->err != GTLS_OK) {\n    return out->err;\n  }\n  inner_len	  inner_len	testArgs	InternalArguments.*
+session-parse-oom	src/session/session.c	  if (s == NULL) {\n    return GTLS_ERR_OOM;	  if (s == NULL) {\n    return GTLS_ERR_INTERNAL;	testArgs	ConnectionArguments.*
 PLANTS
 }
 
@@ -494,14 +504,17 @@ limit=${CONTROLS_TIMEOUT:-600}
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/gtls-controls.XXXXXX")
 trap 'rm -rf "$scratch"' EXIT
 want="$*"
-tab=$(printf '\t')
+# Fields are separated by a tab in plants() but read with a separator the shell
+# does not collapse: a tab is IFS whitespace, so two in a row (an empty field)
+# would read as one and shift every field after it.
+us=$(printf '\037')
 
 # Which plants run, and which distinct tests they need.
-plants | while IFS="$tab" read -r name file from to test filter mode; do
+plants | tr '\t' '\037' | while IFS="$us" read -r name file from to test filter mode; do
   if [ -n "$want" ] && ! echo " $want " | grep -q " $name "; then
     continue
   fi
-  printf '%s\n' "$name$tab$file$tab$from$tab$to$tab$test$tab${filter:-}$tab${mode:-}"
+  printf '%s\n' "$name$us$file$us$from$us$to$us$test$us${filter:-}$us${mode:-}"
 done >"$scratch/selected"
 count=$(grep -c . "$scratch/selected")
 if [ "$count" -eq 0 ]; then
@@ -511,7 +524,7 @@ fi
 
 copy_tree
 # One build of every test binary the selected plants run.
-cut -f5 "$scratch/selected" | sort -u >"$scratch/binaries"
+cut -d "$us" -f5 "$scratch/selected" | sort -u >"$scratch/binaries"
 for b in $(cat "$scratch/binaries"); do
   if ! build_test "$b"; then
     echo "controls: the unplanted tree does not build $b, so nothing was measured" >&2
@@ -524,11 +537,11 @@ mkdir -p "$scratch/src" "$scratch/obj"
     | xargs -0 -I{} cp -p --parents {} "$scratch/obj/")
 
 # The unplanted run of each distinct test.
-cut -f5-7 "$scratch/selected" | sort -u >"$scratch/tests"
+cut -d "$us" -f5-7 "$scratch/selected" | sort -u >"$scratch/tests"
 : >"$scratch/bad-baselines"
-while IFS="$tab" read -r test filter mode; do
+while IFS="$us" read -r test filter mode; do
   if ! run_test "$test" "$filter" "$mode"; then
-    printf '%s\n' "$test$tab$filter$tab$mode" >>"$scratch/bad-baselines"
+    printf '%s\n' "$test$us$filter$us$mode" >>"$scratch/bad-baselines"
     echo "controls: $test ${filter:+($filter) }${mode:+[$mode] }fails BEFORE any plant, so nothing was measured for it" >&2
     tail -5 "$scratch/out.txt" >&2
   fi
@@ -537,8 +550,8 @@ done <"$scratch/tests"
 caught=0
 survived=0
 errors=0
-while IFS="$tab" read -r name file from to test filter mode; do
-  if grep -qxF "$test$tab$filter$tab$mode" "$scratch/bad-baselines"; then
+while IFS="$us" read -r name file from to test filter mode; do
+  if grep -qxF "$test$us$filter$us$mode" "$scratch/bad-baselines"; then
     errors=$((errors + 1))
     continue
   fi
@@ -592,8 +605,8 @@ for b in $(cat "$scratch/binaries"); do
     errors=$((errors + 1))
   fi
 done
-while IFS="$tab" read -r test filter mode; do
-  if grep -qxF "$test$tab$filter$tab$mode" "$scratch/bad-baselines"; then
+while IFS="$us" read -r test filter mode; do
+  if grep -qxF "$test$us$filter$us$mode" "$scratch/bad-baselines"; then
     continue
   fi
   if ! run_test "$test" "$filter" "$mode"; then
