@@ -789,7 +789,15 @@ TEST(Ticket, AStateTheSealerWouldNotHaveWrittenIsNotOpened) {
   }
   std::vector<Case> cases;
   cases.push_back({"the good one", good});
-  { Bytes b = good; b[0] = 2; cases.push_back({"another version", b}); }
+  { Bytes b = good; b[0] = 2; cases.push_back({"version 2 with the body of version 1", b}); }
+  /* Versions this code never wrote. The body is exactly version 1's, so only
+   * the version byte can be what refuses them (the case above is refused by
+   * its length, which is why it never measured the version check). */
+  for (unsigned v : {0u, 3u, 4u, 0x80u, 0xffu}) {
+    Bytes b = good;
+    b[0] = static_cast<unsigned char>(v);
+    cases.push_back({"an unknown state version", b});
+  }
   { Bytes b = good; b[1] = 0x12; cases.push_back({"an unknown suite", b}); }
   { Bytes b = good; b[3] = 31; cases.push_back({"a PSK the wrong length for the hash", b}); }
   { Bytes b = good; b.push_back(0); cases.push_back({"a byte too many", b}); }
@@ -816,7 +824,7 @@ TEST(Ticket, AStateTheSealerWouldNotHaveWrittenIsNotOpened) {
     if (std::string(c.what) == "the good one") {
       EXPECT_EQ(r, GTLS_OK) << "the harness builds a real ticket";
     } else {
-      EXPECT_EQ(r, GTLS_ERR_MISMATCH) << c.what;
+      EXPECT_EQ(r, GTLS_ERR_MISMATCH) << c.what << " (version byte " << unsigned(c.state[0]) << ")";
     }
   }
 }
